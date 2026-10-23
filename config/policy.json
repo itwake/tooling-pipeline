@@ -1,0 +1,47 @@
+{
+  "_comment": "合并候选策略。deny_* 在 strict 模式下直接失败，在 warn 模式下降级为警告并继续；硬性错误（坐标无法识别、同路径 class 字节不同）在任何模式下都失败。",
+
+  "deny_groups": {
+    "org.springframework": "Spring Framework / Boot / Security 等模块必须版本一致，版本由 Boot BOM 统一管理，冻结进 bundle 会破坏对齐",
+    "com.fasterxml.jackson": "Jackson 家族模块必须版本一致，且通过 SPI 注册模块",
+    "io.netty": "Netty 家族模块必须版本一致，并带平台原生库",
+    "io.micrometer": "Micrometer 家族模块必须版本一致",
+    "org.apache.tomcat": "Tomcat 内嵌容器家族必须版本一致",
+    "org.eclipse.jetty": "Jetty 家族必须版本一致",
+    "org.apache.logging.log4j": "Log4j2 家族必须版本一致，且有自定义组件元数据",
+    "ch.qos.logback": "日志 provider 需要与 SLF4J API 配套",
+    "org.slf4j": "SLF4J API 与 provider / bridge 需要配套",
+    "org.jetbrains.kotlin": "Kotlin 标准库家族必须版本一致",
+    "org.jetbrains.kotlinx": "Kotlin 协程 / 序列化家族必须版本一致",
+    "io.projectreactor": "Reactor 家族必须版本一致",
+    "org.hibernate": "Hibernate 家族必须版本一致",
+    "org.bouncycastle": "JCE provider 在 Oracle JDK 上必须保持签名",
+    "io.grpc": "gRPC 家族必须版本一致",
+    "com.google.protobuf": "protobuf 运行时与生成代码版本耦合"
+  },
+
+  "deny_artifacts": {},
+
+  "warn_groups": {
+    "jakarta": "Jakarta API jar 通常由 Boot BOM 管理版本，合并后升级 Boot 时不会跟随",
+    "javax": "javax API jar 通常由 Boot BOM 管理版本，合并后升级 Boot 时不会跟随"
+  },
+
+  "refuse_signed_jars": true,
+  "warn_native_libs": true,
+  "warn_nested_jars": true,
+
+  "equivalence": {
+    "_comment": "应用等价性比对时忽略的非依赖条目（重新打包必然变化的文件）",
+    "ignore_app_entries": [
+      "META-INF/MANIFEST.MF",
+      "META-INF/maven/**",
+      "META-INF/build-info.properties",
+      "BOOT-INF/classpath.idx",
+      "BOOT-INF/layers.idx",
+      "BOOT-INF/classes/META-INF/build-info.properties",
+      "BOOT-INF/classes/git.properties",
+      "git.properties"
+    ]
+  }
+}
