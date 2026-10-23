@@ -213,7 +213,7 @@ def main() -> None:
     # ---- summary + settings ---------------------------------------------------------------
     print("[summary]")
     run("write_summary.py", "--out-dir", out)
-    ok("summary written", (out / "SUMMARY.md").is_file() and "bundle 校验" in (out / "SUMMARY.md").read_text(encoding="utf-8"))
+    ok("summary written", (out / "SUMMARY.md").is_file() and "Bundle verification: passed" in (out / "SUMMARY.md").read_text(encoding="utf-8"))
     run("gen_maven_settings.py", "--mirror-url", "https://nexus.example.com/repository/maven-public/", "--out", work / "settings.xml")
     ok("settings with mirror", "<mirrorOf>*</mirrorOf>" in (work / "settings.xml").read_text(encoding="utf-8"))
     run("gen_maven_settings.py", "--out", work / "settings-plain.xml")

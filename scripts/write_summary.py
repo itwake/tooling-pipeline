@@ -15,7 +15,7 @@ def load(path: Path):
 
 
 def checks_table(checks):
-    lines = ["| 检查 | 结果 | 说明 |", "|---|---|---|"]
+    lines = ["| Check | Result | Detail |", "|---|---|---|"]
     for c in checks:
         lines.append("| %s | %s | %s |" % (c["check"], c["status"].upper(), (c.get("detail") or "").replace("|", "\\|")[:300]))
     return "\n".join(lines)
@@ -36,48 +36,51 @@ def main() -> None:
     patch = load(out / "consumer-patch.json")
     equivalence = load(out / "equivalence.json")
 
-    md = ["# 运行摘要", ""]
+    md = ["# Run summary", ""]
     if source:
-        md += ["## 输入", "", "- 类型：%s" % source["type"], "- 引用：`%s`" % source["ref"]]
+        md += ["## Input", "", "- Type: %s" % source["type"], "- Reference: `%s`" % source["ref"]]
         if source.get("app_path"):
-            md.append("- 镜像内路径：`%s`" % source["app_path"])
+            md.append("- Path inside the image: `%s`" % source["app_path"])
         if source.get("digest"):
-            md.append("- 镜像摘要：`%s`" % source["digest"])
+            md.append("- Image digest: `%s`" % source["digest"])
         if source.get("sha256"):
-            md.append("- 制品 SHA-256：`%s`" % source["sha256"])
+            md.append("- Artifact SHA-256: `%s`" % source["sha256"])
         md.append("")
     if inventory:
         app = inventory["app"]
-        md += ["## 应用清点", "", "- 布局：%s" % app["layout"], "- Spring Boot：%s" % (app.get("spring_boot_version") or "未检测到"),
-               "- 依赖 jar 数量：%d" % app["dependency_count"]]
+        md += ["## Application inventory", "", "- Layout: %s" % app["layout"], "- Spring Boot: %s" % (app.get("spring_boot_version") or "not detected"),
+               "- Dependency jars: %d" % app["dependency_count"]]
         unknown = [d["name"] for d in inventory["dependencies"] if not d.get("gav")]
         if unknown:
-            md.append("- 无法识别坐标：%s" % ", ".join(unknown))
+            md.append("- Unidentified coordinates: %s" % ", ".join(unknown))
         md.append("")
     if selection:
-        md += ["## 选择与策略（%s 模式）" % selection["policy_mode"], ""]
+        md += ["## Selection and policy (%s mode)" % selection["policy_mode"], ""]
         for d in selection["selected"]:
-            md.append("- `%s` ← %s" % (gav_str(d["gav"]), d["name"]))
+            md.append("- `%s` from %s" % (gav_str(d["gav"]), d["name"]))
         md.append("")
         if selection["findings"]:
-            md += ["| 级别 | 代码 | 说明 |", "|---|---|---|"]
+            md += ["| Level | Code | Message |", "|---|---|---|"]
             for f in selection["findings"]:
                 md.append("| %s | %s | %s |" % (f["level"].upper(), f["code"], f["message"].replace("|", "\\|")))
             md.append("")
     if manifest:
-        md += ["## bundle", "", "- 坐标：`%s`" % manifest["coordinate"], "- 内容：`%s`" % manifest["contents_attr"],
-               "- 来源：%s" % manifest["source_desc"], "- 发布：%s" % ("已发布到 Nexus" if args.published == "true" else "未发布（仅构建与校验）"), ""]
+        md += ["## Bundle", "", "- Coordinates: `%s`" % manifest["coordinate"], "- Contents: `%s`" % manifest["contents_attr"],
+               "- Source: %s" % manifest["source_desc"],
+               "- Publishing: %s" % ("deployed to Nexus" if args.published == "true" else "not published (build and verification only)"), ""]
     if verification:
-        md += ["## bundle 校验：%s" % ("通过" if verification["ok"] else "失败"), "", checks_table(verification["checks"]), ""]
+        md += ["## Bundle verification: %s" % ("passed" if verification["ok"] else "FAILED"), "", checks_table(verification["checks"]), ""]
         if verification.get("promoted_dependencies"):
-            md.append("发布 POM 中保留的传递依赖：" + ", ".join("`%s:%s:%s`" % (d.get("groupId"), d.get("artifactId"), d.get("version")) for d in verification["promoted_dependencies"]))
+            md.append("Transitive dependencies kept in the published POM: " + ", ".join("`%s:%s:%s`" % (d.get("groupId"), d.get("artifactId"), d.get("version")) for d in verification["promoted_dependencies"]))
             md.append("")
     if patch:
-        md += ["## 消费方修改建议", "", "见 consumer-patch.md。%s" % ("已按依赖树生成逐模块清单。" if patch.get("tree_provided") else "未提供消费方依赖树，只有通用说明。"), ""]
+        md += ["## Consumer patch proposal", "", "See consumer-patch.md. %s" % (
+            "Exact per-module change list derived from the dependency tree." if patch.get("tree_provided")
+            else "No consumer dependency tree was provided; generic instructions only."), ""]
     if equivalence:
-        md += ["## 应用等价性校验：%s" % ("通过" if equivalence["ok"] else "失败"), "",
-               "- 原应用：`%s`" % equivalence["old"], "- 新应用：`%s`" % equivalence["new"],
-               "- bundle：%s" % equivalence["bundle"]["file"], "", checks_table(equivalence["checks"]), ""]
+        md += ["## Application equivalence: %s" % ("passed" if equivalence["ok"] else "FAILED"), "",
+               "- Old build: `%s`" % equivalence["old"], "- New build: `%s`" % equivalence["new"],
+               "- Bundle: %s" % equivalence["bundle"]["file"], "", checks_table(equivalence["checks"]), ""]
 
     (out / "SUMMARY.md").write_text("\n".join(md) + "\n", encoding="utf-8")
     log("Summary written to %s" % (out / "SUMMARY.md"))

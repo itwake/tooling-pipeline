@@ -1,10 +1,13 @@
-// dep-bundle-pipeline —— 从运行中的 Spring Boot 制品（镜像或 jar）提取指定第三方依赖，
-// 用 maven-shade-plugin 合并成一个新坐标的 bundle，校验后发布到 Nexus，并生成消费方 POM 修改建议。
+// dep-bundle-pipeline: extract selected third-party dependencies from a running Spring Boot artifact
+// (container image or jar), merge them with maven-shade-plugin into a bundle under new coordinates,
+// verify it, publish it to Nexus and propose the consumer's POM change.
 //
-// Agent 要求（Linux）：JDK 17+、Maven 3.6+、Python 3.8+；镜像输入还需要 docker（可访问 daemon）或 crane。
-// 站点相关配置只在下面的 environment 块里改一次。
+// Agent requirements (Linux): JDK 17+, Maven 3.6+, Python 3.8+; for image sources either docker
+// (with a reachable daemon) or crane.
+// Site-specific settings live in the `environment` block below and are edited once.
 //
-// Job 配置：Pipeline script from SCM，Script Path = Jenkinsfile。第一次运行只是注册参数，之后用 "Build with Parameters"。
+// Job setup: "Pipeline script from SCM", Script Path = Jenkinsfile. The first run only registers
+// the parameters; use "Build with Parameters" afterwards.
 
 def withNexusCredentials(Closure body) {
     if (env.NEXUS_CREDENTIALS_ID?.trim()) {
@@ -19,7 +22,7 @@ def withNexusCredentials(Closure body) {
 }
 
 pipeline {
-    agent any            // 或 agent { label 'maven-docker' }
+    agent any            // or: agent { label 'maven-docker' }
 
     options {
         disableConcurrentBuilds()
@@ -29,35 +32,35 @@ pipeline {
 
     parameters {
         choice(name: 'SOURCE_TYPE', choices: ['image', 'jar'],
-               description: 'image：容器镜像；jar：可执行 jar/war 的 http(s) 地址或 agent 本地路径')
+               description: 'image: container image; jar: http(s) URL or agent-local path of an executable jar/war')
         string(name: 'SOURCE_REF', defaultValue: '',
-               description: '镜像引用（registry.example.com/team/app:1.2.3）或 jar 地址')
+               description: 'Image reference (registry.example.com/team/app:1.2.3) or jar location')
         string(name: 'APP_PATH', defaultValue: '/app/app.jar',
-               description: '镜像内应用路径：fat jar 文件；或解包目录（buildpacks 镜像为 /workspace，Jib 镜像为 /app）')
-        string(name: 'IMAGE_PLATFORM', defaultValue: '', description: '镜像平台，例如 linux/amd64；留空用默认')
-        choice(name: 'IMAGE_TOOL', choices: ['auto', 'docker', 'crane'], description: '镜像提取工具')
+               description: 'Application path inside the image: a fat jar file, or an exploded directory (/workspace for buildpacks images, /app for Jib images)')
+        string(name: 'IMAGE_PLATFORM', defaultValue: '', description: 'Image platform, e.g. linux/amd64; empty uses the default')
+        choice(name: 'IMAGE_TOOL', choices: ['auto', 'docker', 'crane'], description: 'Tool used to read the image')
         text(name: 'SELECT', defaultValue: 'commons-io:commons-io',
-             description: '要合并的依赖，一行一个：artifactId | groupId:artifactId | groupId:artifactId:version')
-        string(name: 'OUT_GROUP_ID', defaultValue: 'com.company.platform', description: 'bundle 的 groupId')
-        string(name: 'OUT_ARTIFACT_ID', defaultValue: 'thirdparty-bundle', description: 'bundle 的 artifactId')
-        string(name: 'OUT_VERSION', defaultValue: '1.0.0-SNAPSHOT', description: 'bundle 的 version；-SNAPSHOT 发布到 snapshot 仓库')
+             description: 'Dependencies to merge, one per line: artifactId | groupId:artifactId | groupId:artifactId:version')
+        string(name: 'OUT_GROUP_ID', defaultValue: 'com.company.platform', description: 'groupId of the bundle')
+        string(name: 'OUT_ARTIFACT_ID', defaultValue: 'thirdparty-bundle', description: 'artifactId of the bundle')
+        string(name: 'OUT_VERSION', defaultValue: '1.0.0-SNAPSHOT', description: 'version of the bundle; -SNAPSHOT goes to the snapshot repository')
         choice(name: 'POLICY_MODE', choices: ['strict', 'warn'],
-               description: 'strict：策略拒绝（家族依赖、签名 jar 等）即失败；warn：降级为警告继续。坐标无法识别、同路径 class 字节不同等硬性错误在两种模式下都失败')
-        booleanParam(name: 'CREATE_SOURCES_JAR', defaultValue: true, description: '同时生成 -sources.jar，IDE 里能看到源码')
-        booleanParam(name: 'PUBLISH', defaultValue: false, description: '校验通过后 mvn deploy 到 Nexus；false 只构建与校验')
+               description: 'strict: policy denials (version-aligned families, signed jars, ...) fail the build; warn: they become warnings. Hard errors (unidentifiable coordinates, same class path with different bytes) fail in both modes')
+        booleanParam(name: 'CREATE_SOURCES_JAR', defaultValue: true, description: 'Also build a -sources.jar so IDEs show the merged sources')
+        booleanParam(name: 'PUBLISH', defaultValue: false, description: 'mvn deploy to Nexus after verification; false builds and verifies only')
         string(name: 'CONSUMER_GIT_URL', defaultValue: '',
-               description: '可选：消费方工程 git 地址。提供后会跑 dependency:tree，生成逐路径的 exclusion 建议')
-        string(name: 'CONSUMER_GIT_REF', defaultValue: 'main', description: '消费方分支、tag 或提交')
-        string(name: 'CONSUMER_MAVEN_ARGS', defaultValue: '', description: '消费方 dependency:tree 的附加参数，例如 -Pprod')
+               description: 'Optional: git URL of the consumer project. When set, dependency:tree runs there and the proposal lists exclusions per path')
+        string(name: 'CONSUMER_GIT_REF', defaultValue: 'main', description: 'Consumer branch, tag or commit')
+        string(name: 'CONSUMER_MAVEN_ARGS', defaultValue: '', description: 'Extra arguments for the consumer dependency:tree run, e.g. -Pprod')
     }
 
     environment {
-        // ---- 站点相关，改一次 ------------------------------------------------------------
+        // ---- site specific: edit once -------------------------------------------------------
         NEXUS_RELEASE_URL    = 'https://nexus.example.com/repository/maven-releases/'
         NEXUS_SNAPSHOT_URL   = 'https://nexus.example.com/repository/maven-snapshots/'
-        NEXUS_CREDENTIALS_ID = 'nexus-deploy'   // Jenkins 里的 username/password 凭据 ID；留空则匿名（无法发布）
-        MAVEN_MIRROR_URL     = ''               // 公司 Maven group 仓库，例如 https://nexus.example.com/repository/maven-public/ ；留空直接用 Maven Central
-        GIT_CREDENTIALS_ID   = ''               // 可选：检出 CONSUMER_GIT_URL 用的凭据 ID
+        NEXUS_CREDENTIALS_ID = 'nexus-deploy'   // Jenkins username/password credential ID; empty = anonymous (cannot publish)
+        MAVEN_MIRROR_URL     = ''               // company Maven group repository, e.g. https://nexus.example.com/repository/maven-public/ ; empty = Maven Central
+        GIT_CREDENTIALS_ID   = ''               // optional: credential ID for checking out CONSUMER_GIT_URL
         // -----------------------------------------------------------------------------------
         PY        = 'python3'
         MVN_FLAGS = '-B -ntp -s work/settings.xml'
@@ -166,10 +169,10 @@ pipeline {
             steps {
                 script {
                     if (!env.NEXUS_CREDENTIALS_ID?.trim()) {
-                        error 'PUBLISH=true 需要在 environment 里配置 NEXUS_CREDENTIALS_ID'
+                        error 'PUBLISH=true requires NEXUS_CREDENTIALS_ID in the environment block'
                     }
                     withNexusCredentials {
-                        // 可重复构建：deploy 重新打出的 jar 与刚校验过的字节一致
+                        // reproducible build: deploy rebuilds a jar with the bytes that were just verified
                         sh 'mvn $MVN_FLAGS -f work/bundle/pom.xml deploy'
                     }
                 }

@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import sys
 import xml.etree.ElementTree as ET
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -87,10 +87,7 @@ def analyse_trees(texts, embedded_ga):
             for node in tree["nodes"]:
                 if node["depth"] == 1 and ga_str(node) in module["exclusions"]:
                     module["exclusions"][ga_str(node)]["version"] = node.get("version")
-            if module["remove_direct"] or module["exclusions"] or module["paths"]:
-                modules.append(module)
-            else:
-                modules.append(module)  # keep: shows modules untouched
+            modules.append(module)  # untouched modules are kept so the report shows them
     return modules
 
 
@@ -145,79 +142,79 @@ def main() -> None:
 
     includes_arg = ",".join(sorted(embedded_ga))
     md = []
-    md.append("# 消费方 POM 修改建议：%s" % coord)
+    md.append("# Consumer POM change proposal: %s" % coord)
     md.append("")
-    md.append("bundle 内嵌的坐标：%s" % ", ".join(gav_str(g) for g in embedded))
+    md.append("Coordinates embedded in the bundle: %s" % ", ".join(gav_str(g) for g in embedded))
     md.append("")
-    md.append("Java 代码不需要修改，包名保持不变。需要做的只有三件事：删除被替换的直接依赖，加入 bundle 依赖，在仍会传递引入原坐标的每一条路径上加 exclusion。下面的 Enforcer 规则会在遗漏任何一条路径时让构建失败。")
+    md.append("No Java code changes; package names stay the same. Three things to do: delete the replaced direct dependencies, add the bundle dependency, and add an exclusion on every path that still brings an original coordinate transitively. The Enforcer rule below fails the build whenever a path is missed.")
     md.append("")
-    md.append("## 1. 加入 bundle 依赖")
+    md.append("## 1. Add the bundle dependency")
     md.append("")
     md.append("```xml\n%s\n```" % dependency_snippet(bundle))
     md.append("")
 
     if modules:
-        md.append("## 2. 按依赖树生成的修改清单")
+        md.append("## 2. Changes derived from the dependency tree")
         md.append("")
         for m in modules:
-            md.append("### 模块 %s" % m["module"])
+            md.append("### Module %s" % m["module"])
             md.append("")
             if not m["paths"]:
-                md.append("该模块的依赖树中没有出现被内嵌的坐标，无需修改。")
+                md.append("No embedded coordinate appears in this module's dependency tree; nothing to change.")
                 md.append("")
                 continue
             if m["remove_direct"]:
-                md.append("删除这些直接依赖：")
+                md.append("Delete these direct dependencies:")
                 md.append("")
                 for ga, info in m["remove_direct"].items():
-                    md.append("- `%s`（版本 %s，scope %s）" % (ga, info.get("version"), info.get("scope") or "compile"))
+                    md.append("- `%s` (version %s, scope %s)" % (ga, info.get("version"), info.get("scope") or "compile"))
                 md.append("")
             if m["exclusions"]:
-                md.append("在这些直接依赖上加 exclusion：")
+                md.append("Add exclusions on these direct dependencies:")
                 md.append("")
                 for direct, info in m["exclusions"].items():
                     md.append("```xml\n%s\n```" % exclusion_snippet(direct, info["targets"], info.get("version")))
                     md.append("")
-            md.append("<details><summary>依赖树中出现的路径（%d 条）</summary>\n" % len(m["paths"]))
+            md.append("<details><summary>Paths found in the dependency tree (%d)</summary>\n" % len(m["paths"]))
             for p in m["paths"]:
                 md.append("- %s" % p)
             md.append("\n</details>")
             md.append("")
     else:
-        md.append("## 2. 生成精确的修改清单")
+        md.append("## 2. Producing the exact change list")
         md.append("")
-        md.append("本次没有提供消费方工程的依赖树，无法给出逐路径的 exclusion。请在消费方工程根目录执行（多模块工程会把所有模块追加到同一个文件）：")
+        md.append("No dependency tree of the consumer project was provided, so exclusions cannot be listed per path. Run this in the root of the consumer project (a multi-module build appends every module to the same file):")
         md.append("")
         md.append("```bash\nmvn -B org.apache.maven.plugins:maven-dependency-plugin:3.7.1:tree -Dverbose -DoutputType=text -DoutputFile=\"$PWD/dependency-tree.txt\" -DappendOutput=true\n```")
         md.append("")
-        md.append("然后重新生成这份建议：")
+        md.append("Then regenerate this proposal:")
         md.append("")
         md.append("```bash\npython3 scripts/gen_consumer_patch.py --manifest out/bundle-manifest.json --tree dependency-tree.txt\n```")
         md.append("")
-        md.append("或者手工查看每一条引入原坐标的路径：")
+        md.append("Or inspect every path that brings an original coordinate by hand:")
         md.append("")
         md.append("```bash\nmvn dependency:tree -Dverbose -Dincludes=%s\n```" % includes_arg)
         md.append("")
 
-    md.append("## 3. Enforcer 门禁（放到父 POM 的 build/plugins，所有模块继承）")
+    md.append("## 3. Enforcer gate (put it in the parent POM's build/plugins so every module inherits it)")
     md.append("")
     md.append("```xml\n%s\n```" % (ENFORCER % ("\n".join("              <exclude>%s</exclude>" % ga for ga in sorted(embedded_ga)), coord, includes_arg)))
     md.append("")
-    md.append("## 4. bundle 发布 POM 仍然声明的传递依赖")
+    md.append("## 4. Transitive dependencies the bundle POM still declares")
     md.append("")
     if promoted:
-        md.append("这些依赖没有内嵌，消费方会继续通过 bundle 传递引入；版本以消费方 dependencyManagement（例如 Spring Boot BOM）为准：")
+        md.append("These are not embedded; consumers keep getting them transitively through the bundle. Their versions follow the consumer's dependencyManagement (for example the Spring Boot BOM):")
         md.append("")
         for d in promoted:
             md.append("- `%s:%s:%s`%s" % (d.get("groupId"), d.get("artifactId"), d.get("version"), (" (scope %s)" % d["scope"]) if d.get("scope") else ""))
     else:
-        md.append("无（或尚未构建 bundle，dependency-reduced POM 不存在）。")
+        md.append("None (or the bundle was not built yet and the dependency-reduced POM does not exist).")
     md.append("")
-    md.append("## 5. 验证")
+    md.append("## 5. Verification")
     md.append("")
-    md.append("1. 消费方 `mvn -B clean verify`：Enforcer 通过即说明没有路径再引入原坐标。")
-    md.append("2. 用 Jenkinsfile.verify 比对修改前后的 app.jar 或镜像：依赖 classpath 上的每个 class 和资源字节一致，只有被替换的 jar 消失、bundle 出现。")
-    md.append("3. 跑原有测试，重建镜像，做冒烟。")
+    md.append("1. Consumer `mvn -B clean verify`: a passing Enforcer check means no path brings the original coordinates back.")
+    md.append("2. Run Jenkinsfile.verify on the app.jar or image built before and after the change: every class and resource on the dependency classpath must be byte-identical, with only the replaced jars gone and the bundle added.")
+    md.append("3. Run the existing tests, rebuild the image, smoke-test it.")
     md.append("")
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
