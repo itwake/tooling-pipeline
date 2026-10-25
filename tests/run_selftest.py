@@ -22,7 +22,7 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(HERE))
 
 import make_fixture as fx  # noqa: E402
-from bundlelib import read_json  # noqa: E402
+from bundlelib import read_json, write_json  # noqa: E402
 
 PY = sys.executable
 passed = 0
@@ -159,6 +159,36 @@ def main() -> None:
     run("verify_bundle.py", "--manifest", out / "bundle-manifest.json", "--reduced-pom", target / "bad-reduced-pom.xml", "--out", out / "bv-pom.json", expect=1)
     ok("embedded coordinate still in reduced pom detected", any(c["check"] == "reduced-pom-drops-embedded" and c["status"] == "fail" for c in read_json(out / "bv-pom.json")["checks"]))
 
+    # ---- stage 8: publish (dry run) ------------------------------------------------------
+    print("[publish]")
+    (target / "thirdparty-bundle-1.0.0-sources.jar").write_bytes(b"PK\x05\x06" + b"\x00" * 18)  # empty zip
+    release, snapshot = "https://nexus.example.com/repository/maven-releases/", "https://nexus.example.com/repository/maven-snapshots/"
+    run("publish_bundle.py", "--manifest", out / "bundle-manifest.json", "--verification", out / "bundle-verification.json",
+        "--release-url", release, "--snapshot-url", snapshot, "--dry-run", "--out", out / "publish.json")
+    pub = read_json(out / "publish.json")
+    ok("publish uses deploy-file with the verified jar",
+       any(a.endswith(":deploy-file") for a in pub["command"])
+       and any(a.startswith("-Dfile=") and Path(a[len("-Dfile="):]).resolve() == good.resolve() for a in pub["command"])
+       and pub["url"] == release and pub["sources"] and pub["sha256"] == ver["sha256"])
+    ok("publish dry run uploads nothing", pub["dry_run"] and not pub["published"])
+    failed_ver = dict(ver, ok=False)
+    write_json(out / "bv-failed.json", failed_ver)
+    run("publish_bundle.py", "--manifest", out / "bundle-manifest.json", "--verification", out / "bv-failed.json",
+        "--release-url", release, "--dry-run", "--out", out / "publish-failed.json", expect=2)
+    ok("publish refuses a failed verification", not (out / "publish-failed.json").exists())
+    write_json(out / "bv-sha.json", dict(ver, sha256="0" * 64))
+    run("publish_bundle.py", "--manifest", out / "bundle-manifest.json", "--verification", out / "bv-sha.json",
+        "--release-url", release, "--dry-run", "--out", out / "publish-sha.json", expect=2)
+    ok("publish refuses changed bytes", not (out / "publish-sha.json").exists())
+    snap_man = dict(man, bundle=dict(man["bundle"], version="1.0.0-SNAPSHOT"), coordinate="com.company.platform:thirdparty-bundle:1.0.0-SNAPSHOT")
+    write_json(out / "manifest-snapshot.json", snap_man)
+    run("publish_bundle.py", "--manifest", out / "manifest-snapshot.json", "--verification", out / "bundle-verification.json",
+        "--release-url", release, "--snapshot-url", snapshot, "--dry-run", "--out", out / "publish-snapshot.json")
+    ok("snapshot versions go to the snapshot repository", read_json(out / "publish-snapshot.json")["url"] == snapshot)
+    run("publish_bundle.py", "--manifest", out / "manifest-snapshot.json", "--verification", out / "bundle-verification.json",
+        "--release-url", release, "--dry-run", "--out", out / "publish-nosnap.json", expect=2)
+    ok("missing snapshot repository is refused", not (out / "publish-nosnap.json").exists())
+
     # ---- stage 7: consumer patch ----------------------------------------------------------
     print("[consumer patch]")
     tree = work / "dependency-tree.txt"
@@ -175,6 +205,16 @@ def main() -> None:
     ok("markdown has enforcer rule", "<exclude>commons-io:commons-io</exclude>" in md and "bannedDependencies" in md)
     run("gen_consumer_patch.py", "--manifest", out / "bundle-manifest.json", "--out", out / "consumer-patch-notree.md", "--out-json", out / "consumer-patch-notree.json")
     ok("no-tree proposal explains how to get one", "dependency-tree.txt" in (out / "consumer-patch-notree.md").read_text(encoding="utf-8"))
+    run("gen_consumer_patch.py", "--bundle", "com.company.platform:thirdparty-bundle:1.0.0",
+        "--embedded", "commons-io:commons-io:2.16.1, org.springframework:spring-core:6.1.14", "--tree", tree,
+        "--out", out / "consumer-patch-standalone.md", "--out-json", out / "consumer-patch-standalone.json")
+    sa = {m["module"]: m for m in read_json(out / "consumer-patch-standalone.json")["modules"]}
+    ok("standalone consumer mode from explicit coordinates",
+       list(sa["com.example:app"]["remove_direct"]) == ["commons-io:commons-io"]
+       and sa["com.example:app"]["exclusions"]["org.springframework.boot:spring-boot-starter-web"]["targets"] == ["org.springframework:spring-core"]
+       and "<exclude>commons-io:commons-io</exclude>" in (out / "consumer-patch-standalone.md").read_text(encoding="utf-8"))
+    run("gen_consumer_patch.py", "--bundle", "bad-coordinates", "--embedded", "x:y:1", "--out", out / "cp-bad.md", "--out-json", out / "cp-bad.json", expect=2)
+    ok("standalone mode validates the bundle coordinates", not (out / "cp-bad.json").exists())
 
     # ---- verify pipeline: application equivalence ---------------------------------------
     print("[verify app equivalence]")

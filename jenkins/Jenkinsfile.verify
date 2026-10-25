@@ -3,7 +3,7 @@
 // jars disappear, the bundle appears, and the application's own classes are unchanged.
 //
 // Both inputs may be images or jars. Agent requirements: Python 3.8+; docker or crane for image sources.
-// Job setup: "Pipeline script from SCM", Script Path = Jenkinsfile.verify.
+// Job setup: "Pipeline script from SCM", Script Path = jenkins/Jenkinsfile.verify.
 
 pipeline {
     agent any

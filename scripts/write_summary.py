@@ -35,6 +35,7 @@ def main() -> None:
     verification = load(out / "bundle-verification.json")
     patch = load(out / "consumer-patch.json")
     equivalence = load(out / "equivalence.json")
+    publish = load(out / "publish.json")
 
     md = ["# Run summary", ""]
     if source:
@@ -65,9 +66,18 @@ def main() -> None:
                 md.append("| %s | %s | %s |" % (f["level"].upper(), f["code"], f["message"].replace("|", "\\|")))
             md.append("")
     if manifest:
+        if publish and publish.get("published"):
+            publishing = "deployed to %s (sha256 `%s`)" % (publish["url"], publish["sha256"])
+        elif publish and publish.get("dry_run"):
+            publishing = "dry run only, nothing uploaded"
+        elif publish:
+            publishing = "deploy-file FAILED, see the build log"
+        elif args.published == "true":
+            publishing = "deployed to Nexus"
+        else:
+            publishing = "not published (build and verification only)"
         md += ["## Bundle", "", "- Coordinates: `%s`" % manifest["coordinate"], "- Contents: `%s`" % manifest["contents_attr"],
-               "- Source: %s" % manifest["source_desc"],
-               "- Publishing: %s" % ("deployed to Nexus" if args.published == "true" else "not published (build and verification only)"), ""]
+               "- Source: %s" % manifest["source_desc"], "- Publishing: %s" % publishing, ""]
     if verification:
         md += ["## Bundle verification: %s" % ("passed" if verification["ok"] else "FAILED"), "", checks_table(verification["checks"]), ""]
         if verification.get("promoted_dependencies"):

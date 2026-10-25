@@ -1,10 +1,13 @@
 // mvn-rebundle: extract selected third-party dependencies from a running Spring Boot artifact
 // (container image or jar), merge them with maven-shade-plugin into a bundle under new coordinates,
-// verify it, publish it to Nexus and propose the consumer's POM change.
+// verify the bundle byte for byte against the original jars and, on request, publish exactly those
+// bytes to Nexus.
+//
+// Companion jobs: jenkins/Jenkinsfile.consumer (POM change proposal for a consuming project) and
+// jenkins/Jenkinsfile.verify (equivalence check of the application before and after the change).
 //
 // Agent requirements (Linux): JDK 17+, Maven 3.6+, Python 3.8+; for image sources either docker
-// (with a reachable daemon) or crane.
-// Site-specific settings live in the `environment` block below and are edited once.
+// (with a reachable daemon) or crane. Site-specific settings live in the `environment` block below.
 //
 // Job setup: "Pipeline script from SCM", Script Path = Jenkinsfile. The first run only registers
 // the parameters; use "Build with Parameters" afterwards.
@@ -39,6 +42,8 @@ pipeline {
                description: 'Application path inside the image: a fat jar file, or an exploded directory (/workspace for buildpacks images, /app for Jib images)')
         string(name: 'IMAGE_PLATFORM', defaultValue: '', description: 'Image platform, e.g. linux/amd64; empty uses the default')
         choice(name: 'IMAGE_TOOL', choices: ['auto', 'docker', 'crane'], description: 'Tool used to read the image')
+        booleanParam(name: 'INVENTORY_ONLY', defaultValue: false,
+                     description: 'Stop after the inventory: lists every dependency jar with its coordinates so you can decide what to select')
         text(name: 'SELECT', defaultValue: 'commons-io:commons-io',
              description: 'Dependencies to merge, one per line: artifactId | groupId:artifactId | groupId:artifactId:version')
         string(name: 'OUT_GROUP_ID', defaultValue: 'com.company.platform', description: 'groupId of the bundle')
@@ -47,11 +52,8 @@ pipeline {
         choice(name: 'POLICY_MODE', choices: ['strict', 'warn'],
                description: 'strict: policy denials (version-aligned families, signed jars, ...) fail the build; warn: they become warnings. Hard errors (unidentifiable coordinates, same class path with different bytes) fail in both modes')
         booleanParam(name: 'CREATE_SOURCES_JAR', defaultValue: true, description: 'Also build a -sources.jar so IDEs show the merged sources')
-        booleanParam(name: 'PUBLISH', defaultValue: false, description: 'mvn deploy to Nexus after verification; false builds and verifies only')
-        string(name: 'CONSUMER_GIT_URL', defaultValue: '',
-               description: 'Optional: git URL of the consumer project. When set, dependency:tree runs there and the proposal lists exclusions per path')
-        string(name: 'CONSUMER_GIT_REF', defaultValue: 'main', description: 'Consumer branch, tag or commit')
-        string(name: 'CONSUMER_MAVEN_ARGS', defaultValue: '', description: 'Extra arguments for the consumer dependency:tree run, e.g. -Pprod')
+        booleanParam(name: 'PUBLISH', defaultValue: false,
+                     description: 'Upload the verified jar, its dependency-reduced POM and the sources jar to Nexus with deploy-file; false builds and verifies only')
     }
 
     environment {
@@ -60,7 +62,6 @@ pipeline {
         NEXUS_SNAPSHOT_URL   = 'https://nexus.example.com/repository/maven-snapshots/'
         NEXUS_CREDENTIALS_ID = 'nexus-deploy'   // Jenkins username/password credential ID; empty = anonymous (cannot publish)
         MAVEN_MIRROR_URL     = ''               // company Maven group repository, e.g. https://nexus.example.com/repository/maven-public/ ; empty = Maven Central
-        GIT_CREDENTIALS_ID   = ''               // optional: credential ID for checking out CONSUMER_GIT_URL
         // -----------------------------------------------------------------------------------
         PY        = 'python3'
         MVN_FLAGS = '-B -ntp -s work/settings.xml'
@@ -95,85 +96,67 @@ pipeline {
             }
         }
 
-        stage('Resolve selection & policy') {
-            steps {
-                sh '''
-                    "$PY" scripts/resolve_selection.py --inventory out/inventory.json --select-file work/select.txt \
-                        --policy config/policy.json --policy-mode "$POLICY_MODE" --out out/selection.json
-                '''
-            }
-        }
-
-        stage('Generate bundle project') {
-            steps {
-                sh '''
-                    "$PY" scripts/gen_bundle_project.py --selection out/selection.json --source out/source.json \
-                        --group-id "$OUT_GROUP_ID" --artifact-id "$OUT_ARTIFACT_ID" --version "$OUT_VERSION" \
-                        --release-url "$NEXUS_RELEASE_URL" --snapshot-url "$NEXUS_SNAPSHOT_URL" --server-id nexus \
-                        --sources-jar "$CREATE_SOURCES_JAR" --out work/bundle --manifest-out out/bundle-manifest.json
-                '''
-            }
-        }
-
-        stage('Build bundle') {
-            steps {
-                script {
-                    withNexusCredentials {
-                        sh 'mvn $MVN_FLAGS -f work/bundle/pom.xml clean verify'
+        stage('Bundle') {
+            when { expression { !params.INVENTORY_ONLY } }
+            stages {
+                stage('Resolve selection & policy') {
+                    steps {
+                        sh '''
+                            "$PY" scripts/resolve_selection.py --inventory out/inventory.json --select-file work/select.txt \
+                                --policy config/policy.json --policy-mode "$POLICY_MODE" --out out/selection.json
+                        '''
                     }
                 }
-            }
-        }
 
-        stage('Verify bundle') {
-            steps {
-                sh '"$PY" scripts/verify_bundle.py --manifest out/bundle-manifest.json --out out/bundle-verification.json'
-            }
-        }
+                stage('Generate bundle project') {
+                    steps {
+                        sh '''
+                            "$PY" scripts/gen_bundle_project.py --selection out/selection.json --source out/source.json \
+                                --group-id "$OUT_GROUP_ID" --artifact-id "$OUT_ARTIFACT_ID" --version "$OUT_VERSION" \
+                                --release-url "$NEXUS_RELEASE_URL" --snapshot-url "$NEXUS_SNAPSHOT_URL" --server-id nexus \
+                                --sources-jar "$CREATE_SOURCES_JAR" --out work/bundle --manifest-out out/bundle-manifest.json
+                        '''
+                    }
+                }
 
-        stage('Consumer dependency tree') {
-            when { expression { params.CONSUMER_GIT_URL?.trim() } }
-            steps {
-                dir('work/consumer') {
-                    checkout([$class: 'GitSCM',
-                              branches: [[name: params.CONSUMER_GIT_REF]],
-                              userRemoteConfigs: [[url: params.CONSUMER_GIT_URL,
-                                                   credentialsId: (env.GIT_CREDENTIALS_ID?.trim() ?: null)]]])
-                    script {
-                        withNexusCredentials {
-                            sh '''
-                                mvn -B -ntp -s "$WORKSPACE/work/settings.xml" \
-                                    org.apache.maven.plugins:maven-dependency-plugin:3.7.1:tree \
-                                    -Dverbose -DoutputType=text -DappendOutput=true \
-                                    -DoutputFile="$WORKSPACE/out/consumer-dependency-tree.txt" $CONSUMER_MAVEN_ARGS
-                            '''
+                stage('Build bundle') {
+                    steps {
+                        script {
+                            withNexusCredentials {
+                                sh 'mvn $MVN_FLAGS -f work/bundle/pom.xml clean verify'
+                            }
                         }
                     }
                 }
-            }
-        }
 
-        stage('Consumer patch proposal') {
-            steps {
-                sh '''
-                    TREE=""
-                    if [ -f out/consumer-dependency-tree.txt ]; then TREE="--tree out/consumer-dependency-tree.txt"; fi
-                    "$PY" scripts/gen_consumer_patch.py --manifest out/bundle-manifest.json $TREE \
-                        --out out/consumer-patch.md --out-json out/consumer-patch.json
-                '''
+                stage('Verify bundle') {
+                    steps {
+                        sh '"$PY" scripts/verify_bundle.py --manifest out/bundle-manifest.json --out out/bundle-verification.json'
+                    }
+                }
             }
         }
 
         stage('Publish to Nexus') {
-            when { expression { params.PUBLISH } }
+            when {
+                allOf {
+                    expression { params.PUBLISH }
+                    expression { !params.INVENTORY_ONLY }
+                }
+            }
             steps {
                 script {
                     if (!env.NEXUS_CREDENTIALS_ID?.trim()) {
                         error 'PUBLISH=true requires NEXUS_CREDENTIALS_ID in the environment block'
                     }
                     withNexusCredentials {
-                        // reproducible build: deploy rebuilds a jar with the bytes that were just verified
-                        sh 'mvn $MVN_FLAGS -f work/bundle/pom.xml deploy'
+                        // deploy-file uploads the jar that was just verified; nothing is rebuilt
+                        sh '''
+                            "$PY" scripts/publish_bundle.py --manifest out/bundle-manifest.json \
+                                --verification out/bundle-verification.json --settings work/settings.xml \
+                                --release-url "$NEXUS_RELEASE_URL" --snapshot-url "$NEXUS_SNAPSHOT_URL" --server-id nexus \
+                                --out out/publish.json
+                        '''
                     }
                 }
             }
@@ -182,7 +165,7 @@ pipeline {
 
     post {
         always {
-            sh '"$PY" scripts/write_summary.py --out-dir out --published "$PUBLISH" || true'
+            sh '"$PY" scripts/write_summary.py --out-dir out || true'
             archiveArtifacts artifacts: 'out/**, work/bundle/pom.xml, work/bundle/target/*.jar, work/bundle/target/dependency-reduced-pom.xml',
                              allowEmptyArchive: true, fingerprint: true
         }

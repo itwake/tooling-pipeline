@@ -19,7 +19,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bundlelib import ga_str, gav_str, log, parse_dependency_trees, read_json, write_json  # noqa: E402
+from bundlelib import fail, ga_str, gav_str, log, parse_dependency_trees, parse_selection_text, read_json, write_json  # noqa: E402
 
 ENFORCER = """<plugin>
   <groupId>org.apache.maven.plugins</groupId>
@@ -116,14 +116,38 @@ def exclusion_snippet(direct_ga: str, targets, version) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--manifest", default="out/bundle-manifest.json")
+    ap.add_argument("--manifest", default="out/bundle-manifest.json", help="bundle manifest written by gen_bundle_project.py")
+    ap.add_argument("--bundle", default="", help="instead of --manifest: groupId:artifactId:version of an existing bundle")
+    ap.add_argument("--embedded", default="", help="with --bundle: embedded coordinates g:a:v, comma or newline separated")
+    ap.add_argument("--embedded-file", default="", help="with --bundle: file holding the embedded coordinates")
     ap.add_argument("--tree", action="append", default=[], help="dependency:tree text output (repeatable)")
     ap.add_argument("--reduced-pom", help="dependency-reduced POM of the bundle (default from manifest)")
     ap.add_argument("--out", default="out/consumer-patch.md")
     ap.add_argument("--out-json", default="out/consumer-patch.json")
     args = ap.parse_args()
 
-    man = read_json(args.manifest)
+    if args.bundle:
+        parts = args.bundle.split(":")
+        if len(parts) != 3:
+            fail("--bundle must be groupId:artifactId:version")
+        text = args.embedded or ""
+        if args.embedded_file:
+            text += "\n" + Path(args.embedded_file).read_text(encoding="utf-8")
+        components = []
+        for tok in parse_selection_text(text):
+            p = tok.split(":")
+            if len(p) < 3:
+                fail("embedded coordinate '%s' must be groupId:artifactId:version" % tok)
+            gav = {"groupId": p[0], "artifactId": p[1], "version": p[2]}
+            if len(p) > 3 and p[3]:
+                gav["classifier"] = p[3]
+            components.append({"gav": gav})
+        if not components:
+            fail("--embedded (or --embedded-file) is required with --bundle")
+        man = {"bundle": {"groupId": parts[0], "artifactId": parts[1], "version": parts[2]},
+               "coordinate": args.bundle, "components": components, "reduced_pom": ""}
+    else:
+        man = read_json(args.manifest)
     bundle = man["bundle"]
     coord = man["coordinate"]
     embedded = [c["gav"] for c in man["components"]]
