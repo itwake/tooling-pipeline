@@ -46,7 +46,7 @@ def ok(name, cond, detail=""):
 
 
 def main() -> None:
-    work = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(tempfile.mkdtemp(prefix="dep-bundle-selftest-"))
+    work = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(tempfile.mkdtemp(prefix="mvn-rebundle-selftest-"))
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True)

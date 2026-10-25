@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared helpers for the dependency-bundle pipeline.
+"""Shared helpers for the mvn-rebundle pipeline.
 
 Standard library only, Python 3.8+. Every script in this directory adds its own
 directory to sys.path before importing this module, so the scripts also work when

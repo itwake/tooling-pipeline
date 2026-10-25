@@ -1,4 +1,6 @@
-# dep-bundle-pipeline
+# mvn-rebundle
+
+Re-bundle third-party dependencies from a deployed Spring Boot artifact into one Maven artifact, verified byte for byte.
 
 Extracts selected third-party dependencies from a running Spring Boot artifact (a container image or an executable jar), merges them with maven-shade-plugin into a bundle under new Maven coordinates, verifies the bundle, publishes it to Nexus and proposes the POM-only change for the consuming project. A second pipeline proves that the application rebuilt after the POM change is equivalent to the original one.
 
@@ -30,7 +32,7 @@ Design principles:
 ## Creating the Jenkins jobs
 
 1. Push this repository to your git server.
-2. Create a Pipeline job, Definition "Pipeline script from SCM", Script Path `Jenkinsfile`.
+2. Create a Pipeline job named `mvn-rebundle`, Definition "Pipeline script from SCM", Script Path `Jenkinsfile`.
 3. Edit the site settings in the `environment` block at the top of the `Jenkinsfile` once:
 
    | Variable | Meaning |
@@ -41,7 +43,7 @@ Design principles:
    | `GIT_CREDENTIALS_ID` | Optional, used to check out the consumer project |
 
 4. The first run only registers the parameters with Jenkins and fails or runs empty; that is expected. Use "Build with Parameters" afterwards.
-5. Create a second job the same way for the verification pipeline, Script Path `Jenkinsfile.verify`.
+5. Create a second job named `mvn-rebundle-verify` the same way for the verification pipeline, Script Path `Jenkinsfile.verify`.
 
 ## Parameters of the main pipeline
 

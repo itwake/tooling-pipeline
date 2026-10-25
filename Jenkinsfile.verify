@@ -1,4 +1,4 @@
-// dep-bundle-pipeline / verify: compare the Spring Boot artifacts built before and after the POM change.
+// mvn-rebundle / verify: compare the Spring Boot artifacts built before and after the POM change.
 // Proves that every class and resource on the dependency classpath is byte-identical: only the replaced
 // jars disappear, the bundle appears, and the application's own classes are unchanged.
 //

@@ -1,4 +1,4 @@
-// dep-bundle-pipeline: extract selected third-party dependencies from a running Spring Boot artifact
+// mvn-rebundle: extract selected third-party dependencies from a running Spring Boot artifact
 // (container image or jar), merge them with maven-shade-plugin into a bundle under new coordinates,
 // verify it, publish it to Nexus and propose the consumer's POM change.
 //

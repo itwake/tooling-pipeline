@@ -101,7 +101,7 @@ def extract_with_crane(ref: str, app_path: str, out_dir: Path, platform: str) ->
 
 
 def download(url: str, dest: Path) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": "dep-bundle-pipeline"})
+    req = urllib.request.Request(url, headers={"User-Agent": "mvn-rebundle"})
     user, pw = os.environ.get("SOURCE_USERNAME"), os.environ.get("SOURCE_PASSWORD")
     if user and pw:
         token = base64.b64encode(("%s:%s" % (user, pw)).encode()).decode()
