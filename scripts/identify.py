@@ -25,8 +25,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bundlelib import log, split_filename  # noqa: E402
 
 
+SYNTHETIC_GROUP = "rebundle.unidentified"
+
+
 def _local(tag: str) -> str:
     return tag.split("}", 1)[-1]
+
+
+def synthetic_coordinates(name: str, sha1: str) -> Tuple[dict, dict]:
+    """Coordinates that let an unidentifiable jar take part in the bundle build anyway.
+
+    Returns (gav, hint): the gav is unique per file content; the hint keeps the artifactId and
+    version read from the file name so the consumer side can find the real coordinates."""
+    base = name[:-4] if name.lower().endswith(".jar") else name
+    fn = split_filename(base)
+    a, v = (fn[0], fn[1]) if fn else (base, None)
+    return ({"groupId": SYNTHETIC_GROUP, "artifactId": a, "version": "%s-u%s" % (v or "0", sha1[:10])},
+            {"artifactId": a, "version": v})
+
+
+def synthetic_hint(gav: dict) -> Optional[dict]:
+    """Inverse of synthetic_coordinates for a gav read back from a bundle manifest."""
+    if not gav or gav.get("groupId") != SYNTHETIC_GROUP:
+        return None
+    version = gav.get("version", "")
+    hint_version = version.rsplit("-u", 1)[0] if "-u" in version else version
+    return {"artifactId": gav.get("artifactId"), "version": None if hint_version in ("", "0") else hint_version}
 
 
 class Repository:
@@ -194,8 +218,13 @@ class SpringBootBom:
 
 
 def identify_jar(name: str, sha1: str, manifest: Dict[str, str], repo: Optional[Repository],
-                 bom: Optional[SpringBootBom]) -> Tuple[Optional[dict], str, str, List[dict]]:
-    """(gav or None, source, note, candidates) for a jar without a usable pom.properties."""
+                 bom: Optional[SpringBootBom],
+                 declared_index: Optional[Dict[str, Set[Tuple[str, str]]]] = None) -> Tuple[Optional[dict], str, str, List[dict]]:
+    """(gav or None, source, note, candidates) for a jar without a usable pom.properties.
+
+    declared_index maps artifactId -> {(groupId, declaring jar)} collected from the embedded
+    pom.xml of the other jars in the application: a jar that is declared by another jar is
+    identified even without network access."""
     base = name[:-4] if name.lower().endswith(".jar") else name
     fn = split_filename(base)
     candidates: List[Tuple[dict, str]] = []
@@ -207,6 +236,13 @@ def identify_jar(name: str, sha1: str, manifest: Dict[str, str], repo: Optional[
                 if c:
                     gav["classifier"] = c
                 candidates.append((gav, "spring-boot-bom"))
+        groups = {g: jar for g, jar in (declared_index or {}).get(a, set())}
+        if len(groups) == 1:
+            g, jar = next(iter(groups.items()))
+            gav = {"groupId": g, "artifactId": a, "version": v}
+            if c:
+                gav["classifier"] = c
+            candidates.append((gav, "declared-by:%s" % jar))
         vendor = (manifest.get("Implementation-Vendor-Id") or "").strip()
         if vendor and "." in vendor and " " not in vendor:
             gav = {"groupId": vendor, "artifactId": a, "version": v}
@@ -234,4 +270,9 @@ def identify_jar(name: str, sha1: str, manifest: Dict[str, str], repo: Optional[
     for gav, src in unique:
         if src == "nexus-search":
             return gav, src, "found by checksum in the repository search", [g for g, _ in unique]
+    for gav, src in unique:
+        if src.startswith("declared-by:"):
+            note = "declared by %s; repository checksum %s" % (src[len("declared-by:"):],
+                                                                "not available" if not (repo and repo.enabled) else "differs from the repository artifact")
+            return gav, src, note, [g for g, _ in unique]
     return None, "unknown", "no candidate confirmed", [dict(g, source=s) for g, s in unique]

@@ -84,6 +84,7 @@ if [ "$mode" = "bundle" ]; then
         --group-id "$g" --artifact-id "$a" --version "$v" --release-url "$release_url" --snapshot-url "$snapshot_url" \
         --server-id nexus --sources-jar "$sources" --out work/bundle --manifest-out out/bundle-manifest.json
     if [ "$skip_maven" = false ]; then
+        "$PY" scripts/install_unidentified.py --manifest out/bundle-manifest.json --settings work/settings.xml
         mvn -B -ntp -s work/settings.xml -f work/bundle/pom.xml clean verify
         "$PY" scripts/verify_bundle.py --manifest out/bundle-manifest.json --out out/bundle-verification.json
         if [ "$publish" = true ]; then

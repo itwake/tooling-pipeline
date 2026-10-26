@@ -33,7 +33,7 @@ from bundlelib import (  # noqa: E402
     utc_now_iso,
     write_json,
 )
-from identify import Repository, SpringBootBom, identify_jar  # noqa: E402
+from identify import Repository, SpringBootBom, identify_jar, synthetic_coordinates  # noqa: E402
 
 
 def flag_summary(flags: dict) -> str:
@@ -90,6 +90,8 @@ def main() -> None:
             "candidates": [],
             "manifest": {},
             "declared_dependencies": [],
+            "synthetic": None,
+            "synthetic_hint": None,
             "flags": {},
             "error": None,
         }
@@ -108,26 +110,30 @@ def main() -> None:
 
     boot = spring_boot_version(deps)
     unknown = [d for d in deps if not d["gav"] and not d["error"]]
-    if unknown and args.repo_url and not args.no_lookup:
-        repo = Repository(args.repo_url, central=args.central)
-        bom = None
-        if boot:
-            bom = SpringBootBom(repo, boot)
-            if bom.load():
-                log("Loaded %d BOM(s) for Spring Boot %s: %s" % (len(bom.boms), boot, ", ".join(bom.boms)))
-            else:
-                log("Spring Boot BOM %s not available from %s" % (boot, args.repo_url))
+    if unknown:
+        # what the other jars declare in their own pom.xml identifies jars without a descriptor offline
+        declared_index = {}
+        for d in deps:
+            for dep in d.get("declared_dependencies", []):
+                declared_index.setdefault(dep["artifactId"], set()).add((dep["groupId"], d["name"]))
+        repo, bom = None, None
+        if args.repo_url and not args.no_lookup:
+            repo = Repository(args.repo_url, central=args.central)
+            if boot:
+                bom = SpringBootBom(repo, boot)
+                if bom.load():
+                    log("Loaded %d BOM(s) for Spring Boot %s: %s" % (len(bom.boms), boot, ", ".join(bom.boms)))
+                else:
+                    log("Spring Boot BOM %s not available from %s" % (boot, args.repo_url))
         for d in unknown:
-            gav, src, note, cands = identify_jar(d["name"], d["sha1"], d["manifest"], repo, bom)
-            d["identification_note"] = note
+            gav, src, note, cands = identify_jar(d["name"], d["sha1"], d["manifest"], repo, bom, declared_index)
+            d["identification_note"] = note if (repo or gav) else "no repository configured for checksum lookup (--repo-url)"
             if gav:
                 d["gav"], d["gav_source"] = gav, src
                 log("  identified %s as %s (%s)" % (d["name"], gav_str(gav), src))
             else:
                 d["candidates"] = (d["candidates"] or []) + [c for c in cands if c not in d["candidates"]]
-    elif unknown and not args.no_lookup:
-        for d in unknown:
-            d["identification_note"] = "no repository configured for checksum lookup (--repo-url)"
+                d["synthetic"], d["synthetic_hint"] = synthetic_coordinates(d["name"], d["sha1"])
 
     inventory = {
         "app": {
@@ -153,7 +159,8 @@ def main() -> None:
         log("  %-*s  %s  %s" % (width, d["name"], coord, flag_summary(d["flags"])))
     still_unknown = [d["name"] for d in deps if not d["gav"] and not d["error"]]
     if still_unknown:
-        log("Unidentified coordinates (select them as groupId:artifactId:version, or configure --repo-url): %s" % ", ".join(still_unknown))
+        log("Unidentified coordinates: %s" % ", ".join(still_unknown))
+        log("  they can still be bundled (under synthetic coordinates); select them as groupId:artifactId:version to name them, or configure --repo-url to look them up")
     broken = [d["name"] for d in deps if d["error"]]
     if broken:
         log("Unreadable jars: %s" % ", ".join(broken))

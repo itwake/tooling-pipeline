@@ -50,14 +50,33 @@ def parse_contents_attr(value: str):
     return out
 
 
+def parse_contents_file(text):
+    """BUNDLE-CONTENTS.txt lines 'coordinate  sha256  file' -> {coordinate: sha256}."""
+    out = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            out[parts[0]] = parts[1]
+    return out
+
+
 def load_jars(app: AppArtifact):
     jars = []
     for dj in app.dependency_jars():
         with dj.open() as zf:
             gav, _, cands = identify_gav(zf, dj.name)
             attrs = read_manifest(zf)
+            contents_sha = {}
+            if attrs.get(BUNDLE_CONTENTS_ATTR):
+                try:
+                    contents_sha = parse_contents_file(zf.read(THIRD_PARTY_DIR + "BUNDLE-CONTENTS.txt").decode("utf-8", "replace"))
+                except KeyError:
+                    contents_sha = {}
         jars.append({"dep": dj, "name": dj.name, "sha256": dj.sha256, "gav": gav, "candidates": cands,
-                     "contents_attr": attrs.get(BUNDLE_CONTENTS_ATTR)})
+                     "contents_attr": attrs.get(BUNDLE_CONTENTS_ATTR), "contents_sha": contents_sha})
     return jars
 
 
@@ -130,23 +149,28 @@ def main() -> None:
 
     old_by_key = {key(j): j for j in old_jars}
     new_by_key = {key(j): j for j in new_jars}
-    replaced = []
-    problems = []
+    old_by_sha = {j["sha256"]: j for j in old_jars}
+    embedded_sha = bundle.get("contents_sha") or {}   # coordinate -> sha256 from BUNDLE-CONTENTS.txt
+    replaced, replaced_keys, problems = [], set(), []
     for g in embedded:
         k = gav_str(g)
-        if k in old_by_key:
+        match = old_by_sha.get(embedded_sha.get(k, "")) or old_by_key.get(k)
+        if match is not None:
             replaced.append(k)
+            replaced_keys.add(key(match))
         else:
             same_ga = [kk for kk, j in old_by_key.items() if j["gav"] and ga_str(j["gav"]) == ga_str(g)]
             problems.append("%s not in old build%s" % (k, " (old has %s)" % ", ".join(same_ga) if same_ga else ""))
     check("embedded-coordinates-match-old-build", not problems, "; ".join(problems) if problems else ", ".join(replaced))
 
-    leftovers = [key(j) for j in new_jars if j["gav"] and ga_str(j["gav"]) in embedded_ga]
+    embedded_shas = set(embedded_sha.values())
+    leftovers = [key(j) for j in new_jars if j is not bundle
+                 and ((j["gav"] and ga_str(j["gav"]) in embedded_ga) or j["sha256"] in embedded_shas)]
     check("original-coordinates-removed", not leftovers,
           "still on the classpath: %s (exclusions incomplete)" % ", ".join(leftovers) if leftovers else "none of the embedded coordinates remain")
 
-    expected_new = (set(old_by_key) - set(replaced)) | {key(bundle)}
-    removed = sorted(set(old_by_key) - set(new_by_key) - set(replaced))
+    expected_new = (set(old_by_key) - replaced_keys) | {key(bundle)}
+    removed = sorted(set(old_by_key) - set(new_by_key) - replaced_keys)
     added = sorted(set(new_by_key) - set(old_by_key) - {key(bundle)})
     check("dependency-set-unchanged", not removed and not added,
           "removed: %s; added: %s" % (", ".join(removed) or "-", ", ".join(added) or "-") if removed or added

@@ -155,6 +155,8 @@ pipeline {
                     steps {
                         script {
                             withNexusCredentials {
+                                // jars without known coordinates are installed locally under synthetic coordinates first
+                                sh '"$PY" scripts/install_unidentified.py --manifest out/bundle-manifest.json --settings work/settings.xml'
                                 sh 'mvn $MVN_FLAGS -f work/bundle/pom.xml clean verify'
                             }
                         }

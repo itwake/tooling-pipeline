@@ -275,6 +275,7 @@ def main() -> None:
     app = AppArtifact(sel["app"]["local_path"])
     by_path = {j.path_in_app: j for j in app.dependency_jars()}
     components = []
+    unidentified = []
     for d in selected:
         dj = by_path.get(d["path_in_app"])
         if dj is None:
@@ -288,6 +289,14 @@ def main() -> None:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(zf.read(n))
                     copied.append(n)
+        synthetic = d.get("gav_source") == "synthetic"
+        if synthetic:
+            # the original file is installed into the local repository under the synthetic coordinates
+            target = out / "unidentified" / d["name"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(dj.data)
+            unidentified.append({"name": d["name"], "file": str(target), "gav": d["gav"], "hint": d.get("synthetic_hint"),
+                                 "sha1": d.get("sha1"), "sha256": d["sha256"]})
         components.append({
             "gav": d["gav"],
             "coordinate": gav_str(d["gav"]),
@@ -296,6 +305,8 @@ def main() -> None:
             "sha256": d["sha256"],
             "size": d["size"],
             "legal_files": copied,
+            "synthetic": synthetic,
+            "hint": d.get("synthetic_hint") if synthetic else None,
             "flags": d.get("flags", {}),
         })
     app.close()
@@ -313,6 +324,7 @@ def main() -> None:
         "source": source or sel.get("app"),
         "source_desc": source_desc,
         "components": components,
+        "unidentified": unidentified,
         "transformers": transformers,
         "spring_boot_version": boot_version,
         "shade_version": args.shade_version,
@@ -332,6 +344,9 @@ def main() -> None:
         ", append(%d)" % len(transformers.get("append", [])) if transformers.get("append") else "",
         ", props-merge(%d) via spring-boot-maven-plugin %s" % (len(transformers["props_merge"]), boot_version) if transformers.get("props_merge") else "",
         ", Multi-Release" if transformers.get("multi_release") else ""))
+    if unidentified:
+        log("  unidentified: %d jar(s) embedded under synthetic coordinates (%s); run install_unidentified.py before the build" % (
+            len(unidentified), ", ".join(u["name"] for u in unidentified)))
     log("  build      : mvn -f %s -B clean verify" % (out / "pom.xml"))
 
 

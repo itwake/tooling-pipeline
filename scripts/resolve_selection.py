@@ -131,7 +131,6 @@ def main() -> None:
     for d in deps:
         if d.get("gav"):
             by_ga[ga_str(d["gav"])].append(d)
-    related_unidentified = {}
     if not args.no_expand:
         changed = True
         while changed:
@@ -163,9 +162,10 @@ def main() -> None:
                     key = "%s:%s" % (dep["groupId"], dep["artifactId"])
                     targets = by_ga.get(key, [])
                     if not targets:
-                        for o in deps:
-                            if not o.get("gav") and any(c.get("artifactId") == dep["artifactId"] for c in o.get("candidates", [])):
-                                related_unidentified[o["name"]] = rec["name"]
+                        # a declared dependency whose jar could not be identified: still related, taken along
+                        targets = [o for o in deps if not o.get("gav") and not o.get("error")
+                                   and (any(c.get("artifactId") == dep["artifactId"] for c in o.get("candidates", []))
+                                        or (o.get("synthetic_hint") or {}).get("artifactId") == dep["artifactId"])]
                     for o in targets:
                         if o["path_in_app"] in selected or o.get("error"):
                             continue
@@ -176,18 +176,21 @@ def main() -> None:
                         if select(o, "declared dependency of %s" % rec["name"]):
                             changed = True
 
+    # ---- unidentified jars: embedded anyway, under synthetic coordinates -----------------
+    for d in selected.values():
+        if d.get("gav"):
+            continue
+        candidates = ", ".join("%s:%s:%s" % (c.get("groupId") or "?", c.get("artifactId"), c.get("version")) for c in d.get("candidates", [])) or "none"
+        if d.get("synthetic"):
+            d["gav"], d["gav_source"] = d["synthetic"], "synthetic"
+            add_finding("warn", "unidentified-synthetic", "%s: coordinates unknown%s; embedded under synthetic coordinates %s. Name it as groupId:artifactId:version in SELECT to use the real ones, or exclude it with -%s (candidates: %s)" % (
+                d["name"], (" (%s)" % d["identification_note"]) if d.get("identification_note") else "", gav_str(d["gav"]), d["name"][:-4], candidates), d["name"])
+        else:
+            add_finding("error", "unidentified", "%s: coordinates cannot be identified%s; select it as groupId:artifactId:version or exclude it with -%s (candidates: %s)" % (
+                d["name"], (" (%s)" % d["identification_note"]) if d.get("identification_note") else "", d["name"][:-4], candidates), d["name"])
+
     selected_list = sorted(selected.values(), key=lambda d: ga_str(d["gav"]) if d.get("gav") else d["name"])
     auto_added = [d for d in selected_list if not d["reasons"][0].startswith("selected:")]
-
-    # ---- unidentified jars --------------------------------------------------------------
-    for d in selected_list:
-        if not d.get("gav"):
-            add_finding("error", "unidentified", "%s: coordinates cannot be identified%s; select it as groupId:artifactId:version or exclude it with -%s (candidates: %s)" % (
-                d["name"], (" (%s)" % d["identification_note"]) if d.get("identification_note") else "", d["name"][:-4],
-                ", ".join("%s:%s:%s" % (c.get("groupId") or "?", c.get("artifactId"), c.get("version")) for c in d.get("candidates", [])) or "none"), d["name"])
-    for name, needed_by in related_unidentified.items():
-        if name not in {d["name"] for d in selected_list}:
-            add_finding("warn", "related-unidentified", "%s is declared by %s but its coordinates are unknown, so it was not added" % (name, needed_by), name)
 
     # ---- notes about the selection -------------------------------------------------------
     signed_note = policy.get("signed_jar_note", "signatures are stripped")

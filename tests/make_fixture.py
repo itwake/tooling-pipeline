@@ -105,6 +105,10 @@ def build_libs(libdir: Path) -> dict:
                                   ["org/springframework/boot/SpringApplication.class"],
                                   extra={"META-INF/spring.factories": b"org.springframework.boot.env.EnvironmentPostProcessor=\\\norg.springframework.boot.env.RandomValuePropertySourceEnvironmentPostProcessor\n"},
                                   deps=[("org.springframework", "spring-core", "compile"), ("org.yaml", "snakeyaml", "test")])
+    # a starter declares the Tomcat jars, which identifies them offline
+    libs["spring-boot-starter-tomcat"] = dep_jar(libdir, "org.springframework.boot", "spring-boot-starter-tomcat", "3.3.5", [],
+                                                 deps=[("org.apache.tomcat.embed", "tomcat-embed-core", "compile"),
+                                                       ("org.apache.tomcat.embed", "tomcat-embed-el", "compile")])
     libs["signed-lib"] = dep_jar(libdir, "com.vendor", "signed-lib", "1.0",
                                  ["com/vendor/signed/Impl.class"],
                                  extra={"META-INF/VENDOR.SF": b"Signature-Version: 1.0\n", "META-INF/VENDOR.RSA": b"\x30\x82"})
@@ -338,6 +342,7 @@ SAMPLE_TREE = """com.example:app:jar:1.0.0
 |  \\- org.springframework:spring-web:jar:6.1.14:compile
 |     \\- (org.springframework:spring-core:jar:6.1.14:compile - version managed from 6.1.13; omitted for duplicate)
 +- commons-io:commons-io:jar:2.16.1:compile
++- com.vendor:vendor-sdk:jar:2.0.0:compile
 +- org.yaml:snakeyaml:jar:2.2:compile
 \\- org.apache.commons:commons-text:jar:1.12.0:test
    \\- (commons-io:commons-io:jar:2.16.1:test - omitted for duplicate)

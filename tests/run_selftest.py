@@ -29,7 +29,7 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(HERE))
 
 import make_fixture as fx  # noqa: E402
-from bundlelib import read_json, write_json  # noqa: E402
+from bundlelib import gav_str, read_json, write_json  # noqa: E402
 
 PY = sys.executable
 passed = 0
@@ -129,8 +129,12 @@ def main() -> None:
            [(d["groupId"], d["artifactId"]) for d in by_name["codec-a-1.0.jar"]["declared_dependencies"]] == [("commons-io", "commons-io")]
            and [(d["artifactId"]) for d in by_name["spring-boot-3.3.5.jar"]["declared_dependencies"]] == ["spring-core"])
         unknown = sorted(d["name"] for d in inv["dependencies"] if not d["gav"])
-        ok("jars without pom.properties are unidentified offline",
-           unknown == ["bcprov-jdk15on-1.60.jar", "tomcat-embed-core-10.1.59.jar", "tomcat-embed-el-10.1.59.jar", "vendor-sdk-2.0.0.jar"])
+        ok("jars declared by another jar are identified offline, the rest get synthetic coordinates",
+           unknown == ["bcprov-jdk15on-1.60.jar", "vendor-sdk-2.0.0.jar"]
+           and by_name["tomcat-embed-core-10.1.59.jar"]["gav"] == {"groupId": "org.apache.tomcat.embed", "artifactId": "tomcat-embed-core", "version": "10.1.59"}
+           and by_name["tomcat-embed-core-10.1.59.jar"]["gav_source"] == "declared-by:spring-boot-starter-tomcat-3.3.5.jar"
+           and by_name["vendor-sdk-2.0.0.jar"]["synthetic"]["groupId"] == "rebundle.unidentified"
+           and by_name["vendor-sdk-2.0.0.jar"]["synthetic_hint"] == {"artifactId": "vendor-sdk", "version": "2.0.0"})
         f = by_name["commons-codec-1.17.1.jar"]["flags"]
         ok("flags: multi-release/module-info/spi", f["multi_release"] and f["module_info"] and f["services"] == ["org.apache.commons.codec.Codec"])
         ok("flags: signed", by_name["bcprov-jdk15on-1.60.jar"]["flags"]["signed"])
@@ -167,7 +171,9 @@ def main() -> None:
         ok("same group+version and declared dependencies are added", names(sel) == ["codec-a-1.0.jar", "codec-b-1.0.jar", "commons-io-2.16.1.jar"]
            and {a["name"]: a["reason"] for a in sel["auto_added"]}["commons-io-2.16.1.jar"] == "declared dependency of codec-a-1.0.jar")
         sel = selection("spring-core", "spring")
-        ok("family members are added", names(sel) == ["spring-boot-3.3.5.jar", "spring-core-6.1.14.jar", "spring-jcl-6.1.14.jar"]
+        ok("family members and their declared dependencies are added",
+           names(sel) == ["spring-boot-3.3.5.jar", "spring-boot-starter-tomcat-3.3.5.jar", "spring-core-6.1.14.jar", "spring-jcl-6.1.14.jar",
+                          "tomcat-embed-core-10.1.59.jar", "tomcat-embed-el-10.1.59.jar"]
            and any(f["code"] == "version-coupling" for f in sel["findings"]))
         sel = selection("tomcat-embed-core", "tomcat")
         ok("tomcat family completed", names(sel) == ["tomcat-embed-core-10.1.59.jar", "tomcat-embed-el-10.1.59.jar"])
@@ -181,10 +187,18 @@ def main() -> None:
         ok("conflicting class bytes are a hard error", any(f["code"] == "overlap-conflict" for f in sel["findings"]) and sel["overlaps"]["conflicts"][0]["path"] == "com/dup/Same.class")
         sel = selection("nope-lib", "missing", expect=1)
         ok("unknown token fails", any(f["code"] == "not-found" for f in sel["findings"]))
-        sel = selection("tomcat-embed-core", "offline-tomcat", expect=1, inventory=out / "inventory-offline.json")
-        ok("unidentified jar is an error offline", any(f["code"] == "unidentified" for f in sel["findings"]))
-        sel = selection("org.apache.tomcat.embed:tomcat-embed-core:10.1.59", "offline-explicit", inventory=out / "inventory-offline.json")
-        ok("explicit coordinates work offline", sel["ok"] and sel["selected"][0]["gav"]["groupId"] == "org.apache.tomcat.embed")
+        sel = selection("tomcat-embed-core", "offline-tomcat", inventory=out / "inventory-offline.json")
+        ok("tomcat selectable offline through the starter's declaration", sel["ok"] and names(sel) == ["tomcat-embed-core-10.1.59.jar", "tomcat-embed-el-10.1.59.jar"])
+        sel = selection("vendor-sdk", "offline-synthetic", inventory=out / "inventory-offline.json")
+        ok("unidentified jar is embedded under synthetic coordinates with a warning",
+           sel["ok"] and sel["selected"][0]["gav"]["groupId"] == "rebundle.unidentified" and sel["selected"][0]["gav_source"] == "synthetic"
+           and any(f["code"] == "unidentified-synthetic" for f in sel["findings"]))
+        sel = selection("org.bouncycastle:bcprov-jdk15on:1.60", "offline-explicit", inventory=out / "inventory-offline.json")
+        ok("explicit coordinates replace the synthetic ones", sel["ok"] and sel["selected"][0]["gav"]["groupId"] == "org.bouncycastle")
+        sel = selection("* -dup-y", "offline-all", inventory=out / "inventory-offline.json")
+        ok("star works offline, unidentified jars included",
+           sel["ok"] and len(sel["selected"]) == len(libs) - 1
+           and sorted(d["name"] for d in sel["selected"] if d["gav_source"] == "synthetic") == ["bcprov-jdk15on-1.60.jar", "vendor-sdk-2.0.0.jar"])
         sel = selection("codec-a\ncodec-b\ncommons-codec", "merge")
         ok("merge transformers detected", sel["transformers"]["props_merge"] == ["META-INF/spring.factories"]
            and sel["transformers"]["append"] == ["META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports"]
@@ -195,7 +209,7 @@ def main() -> None:
         selection_file = out / "sel-main.json"
         run("resolve_selection.py", "--inventory", out / "inventory.json", "--select", "commons-io\ncommons-codec\ncodec-a\nspring-core", "--out", selection_file)
         main_sel = read_json(selection_file)
-        ok("main selection expanded to 7 jars", len(main_sel["selected"]) == 7)
+        ok("main selection expanded to 10 jars", len(main_sel["selected"]) == 10)
         proj = work / "bundle"
         run("gen_bundle_project.py", "--selection", selection_file, "--source", out / "source.json", "--group-id", bundle["groupId"],
             "--artifact-id", bundle["artifactId"], "--version", bundle["version"], "--out", proj,
@@ -204,13 +218,14 @@ def main() -> None:
         pom = (proj / "pom.xml").read_text(encoding="utf-8")
         man = read_json(out / "bundle-manifest.json")
         ok("pom pins exact versions", "<artifactId>commons-io</artifactId>\n      <version>2.16.1</version>" in pom and "<version>6.1.14</version>" in pom)
-        ok("pom includes only the selected artifacts", pom.count("<include>") == 7 and "<include>org.springframework.boot:spring-boot</include>" in pom)
+        ok("pom includes only the selected artifacts", pom.count("<include>") == 10 and "<include>org.springframework.boot:spring-boot</include>" in pom)
         ok("pom configures Boot properties transformer", "PropertiesMergingResourceTransformer" in pom and "<version>3.3.5</version>" in pom)
         ok("pom sets Multi-Release and the Boot manifest attribute", "<Multi-Release>true</Multi-Release>" in pom and "<X-Dependency-Bundle-Spring-Boot>3.3.5</X-Dependency-Bundle-Spring-Boot>" in pom)
         ok("pom has distributionManagement", "<snapshotRepository>" in pom and "maven-releases" in pom)
         ok("legal files relocated", (proj / "src/main/resources/META-INF/third-party/commons-io-2.16.1/LICENSE.txt").is_file()
            and (proj / "src/main/resources/META-INF/third-party/BUNDLE-CONTENTS.txt").is_file())
-        ok("manifest lists 7 components", len(man["components"]) == 7 and man["contents_attr"].startswith("com.example.codec:codec-a:1.0,"))
+        ok("manifest lists 10 components", len(man["components"]) == 10 and man["contents_attr"].startswith("com.example.codec:codec-a:1.0,")
+           and not man["unidentified"])
 
         # ---- stage 6: bundle verification on a simulated Shade output ----------------------
         print("[verify bundle]")
@@ -307,6 +322,44 @@ def main() -> None:
         ok("standalone mode from explicit coordinates", list(sa["com.example:app"]["remove_direct"]) == ["commons-io:commons-io"])
         run("gen_consumer_patch.py", "--bundle", "bad-coordinates", "--embedded", "x:y:1", "--out", out / "cp-bad.md", "--out-json", out / "cp-bad.json", expect=2)
         ok("standalone mode validates the bundle coordinates", not (out / "cp-bad.json").exists())
+
+        # ---- unidentified jar end to end: synthetic coordinates ---------------------------
+        print("[synthetic coordinates]")
+        run("resolve_selection.py", "--inventory", out / "inventory-offline.json", "--select", "vendor-sdk", "--out", out / "sel-syn.json")
+        syn_bundle = {"groupId": bundle["groupId"], "artifactId": "syn-bundle", "version": "1.0.0"}
+        syn_proj = work / "bundle-syn"
+        run("gen_bundle_project.py", "--selection", out / "sel-syn.json", "--source", out / "source.json", "--group-id", syn_bundle["groupId"],
+            "--artifact-id", syn_bundle["artifactId"], "--version", syn_bundle["version"], "--out", syn_proj, "--manifest-out", out / "bundle-manifest-syn.json")
+        syn_man = read_json(out / "bundle-manifest-syn.json")
+        syn_gav = syn_man["unidentified"][0]["gav"]
+        ok("synthetic jar copied and declared in the project",
+           len(syn_man["unidentified"]) == 1 and Path(syn_man["unidentified"][0]["file"]).is_file()
+           and syn_gav["groupId"] == "rebundle.unidentified" and syn_gav["artifactId"] == "vendor-sdk" and syn_gav["version"].startswith("2.0.0-u")
+           and "<groupId>rebundle.unidentified</groupId>" in (syn_proj / "pom.xml").read_text(encoding="utf-8"))
+        text = run("install_unidentified.py", "--manifest", out / "bundle-manifest-syn.json", "--dry-run")
+        ok("install-file command prepared for the synthetic jar", "install-file" in text and "-DgroupId=rebundle.unidentified" in text and "-DartifactId=vendor-sdk" in text)
+        syn_jar = fx.simulate_shade(syn_proj, [libs["vendor-sdk"]], syn_bundle, syn_man["contents_attr"], source_attr, False,
+                                    syn_proj / "target" / "syn-bundle-1.0.0.jar", boot_version="3.3.5")
+        fx.write_reduced_pom(syn_proj / "target" / "dependency-reduced-pom.xml", syn_bundle, [])
+        run("verify_bundle.py", "--manifest", out / "bundle-manifest-syn.json", "--out", out / "bv-syn.json")
+        ok("bundle with a synthetic component verifies", read_json(out / "bv-syn.json")["ok"])
+        new_syn = fx.build_new_app(app, syn_jar, ["vendor-sdk-2.0.0.jar"], work / "new-syn.jar")
+        run("verify_app_equivalence.py", "--old", app, "--new", new_syn, "--out", out / "eq-syn.json")
+        eq_syn = read_json(out / "eq-syn.json")
+        ok("equivalence matches the unidentified jar by sha256", eq_syn["ok"] and eq_syn["replaced"] == [gav_str(syn_gav)])
+        new_syn_left = fx.build_new_app(app, syn_jar, ["vendor-sdk-2.0.0.jar"], work / "new-syn-left.jar", keep_replaced=True)
+        run("verify_app_equivalence.py", "--old", app, "--new", new_syn_left, "--out", out / "eq-syn-left.json", expect=1)
+        ok("leftover unidentified jar detected by sha256", any(c["check"] == "original-coordinates-removed" and c["status"] == "fail" for c in read_json(out / "eq-syn-left.json")["checks"]))
+        run("gen_consumer_patch.py", "--manifest", out / "bundle-manifest-syn.json", "--tree", tree, "--out", out / "cp-syn.md", "--out-json", out / "cp-syn.json")
+        cp_syn = read_json(out / "cp-syn.json")
+        ok("consumer tree resolves the real coordinates of the synthetic jar",
+           cp_syn["synthetic"][0]["resolved"] == "com.vendor:vendor-sdk" and "com.vendor:vendor-sdk" in cp_syn["banned"]
+           and "<exclude>com.vendor:vendor-sdk</exclude>" in (out / "cp-syn.md").read_text(encoding="utf-8")
+           and {m["module"]: m for m in cp_syn["modules"]}["com.example:app"]["remove_direct"].keys() == {"com.vendor:vendor-sdk"})
+        run("gen_consumer_patch.py", "--manifest", out / "bundle-manifest-syn.json", "--out", out / "cp-syn-notree.md", "--out-json", out / "cp-syn-notree.json")
+        ok("without a tree the proposal explains how to find the real coordinates",
+           read_json(out / "cp-syn-notree.json")["synthetic"][0]["resolved"] is None
+           and "artifactId `vendor-sdk`" in (out / "cp-syn-notree.md").read_text(encoding="utf-8"))
 
         # ---- verify pipeline: application equivalence ------------------------------------
         print("[verify app equivalence]")

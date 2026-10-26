@@ -39,6 +39,7 @@ from bundlelib import (  # noqa: E402
     read_manifest,
     write_json,
 )
+from identify import SYNTHETIC_GROUP, synthetic_hint  # noqa: E402
 
 ENFORCER = """<plugin>
   <groupId>org.apache.maven.plugins</groupId>
@@ -127,8 +128,11 @@ def boot_line_excludes(boot_version: str):
             "org.springframework.boot:spring-boot:[%d.%d,)" % (major, minor + 1)]
 
 
-def analyse_trees(texts, embedded_ga):
+def analyse_trees(texts, embedded_ga, hints=None, resolved=None):
+    """Modules with the changes they need. Nodes matching a synthetic hint (artifactId and, when
+    known, version) count as embedded too; their real coordinates are recorded in `resolved`."""
     modules = []
+    resolved = resolved if resolved is not None else {}
     for text in texts:
         for tree in parse_dependency_trees(text):
             root = tree["root"]
@@ -136,7 +140,11 @@ def analyse_trees(texts, embedded_ga):
             for node in tree["nodes"]:
                 ga = ga_str(node)
                 if ga not in embedded_ga:
-                    continue
+                    hit = next((h for h in (hints or []) if h["artifactId"] == node["artifactId"]
+                                and (not h.get("version") or h["version"] == node.get("version"))), None)
+                    if hit is None:
+                        continue
+                    resolved[hit["artifactId"]] = ga
                 path = node["path"]
                 module["paths"].append(" -> ".join(path[1:]) + (" (%s)" % node["note"] if node.get("note") else ""))
                 if node["depth"] == 1:
@@ -202,7 +210,8 @@ def main() -> None:
     bundle = man["bundle"]
     coord = man["coordinate"]
     embedded = [c["gav"] for c in man["components"]]
-    embedded_ga = {ga_str(g) for g in embedded}
+    synthetic = [(g, synthetic_hint(g)) for g in embedded if g.get("groupId") == SYNTHETIC_GROUP]
+    embedded_ga = {ga_str(g) for g in embedded if g.get("groupId") != SYNTHETIC_GROUP}
     boot_version = man.get("spring_boot_version")
     boot_embedded = "org.springframework.boot:spring-boot" in embedded_ga
     boot_excludes = boot_line_excludes(boot_version) if boot_version and not boot_embedded else []
@@ -216,9 +225,11 @@ def main() -> None:
             texts.append(p.read_text(encoding="utf-8", errors="replace"))
         else:
             log("WARN: tree file not found: %s" % t)
-    modules = analyse_trees(texts, embedded_ga) if texts else []
+    resolved_synthetic = {}
+    modules = analyse_trees(texts, embedded_ga, [h for _, h in synthetic], resolved_synthetic) if texts else []
+    banned_ga = sorted(embedded_ga | set(resolved_synthetic.values()))
 
-    includes_arg = ",".join(sorted(embedded_ga))
+    includes_arg = ",".join(banned_ga)
     md = []
     md.append("# Consumer POM change proposal: %s" % coord)
     md.append("")
@@ -270,7 +281,22 @@ def main() -> None:
         md.append("```bash\nmvn dependency:tree -Dverbose -Dincludes=%s\n```" % includes_arg)
         md.append("")
 
-    excludes = ["              <exclude>%s</exclude>" % ga for ga in sorted(embedded_ga)]
+    if synthetic:
+        md.append("## Jars embedded under synthetic coordinates")
+        md.append("")
+        md.append("These jars carried no Maven descriptor and could not be identified, so the bundle embeds them under `%s` coordinates. The consumer POM still references their real coordinates; find them in the dependency tree and exclude them like the others:" % SYNTHETIC_GROUP)
+        md.append("")
+        for g, h in synthetic:
+            real = resolved_synthetic.get(h["artifactId"]) if h else None
+            if real:
+                md.append("- `%s` (%s%s) is `%s` in the consumer tree; it is banned below" % (
+                    gav_str(g), h["artifactId"], (" " + h["version"]) if h.get("version") else "", real))
+            else:
+                md.append("- `%s`: look for artifactId `%s`%s in `mvn dependency:tree -Dverbose`, add an exclusion for its groupId:artifactId and append it to the Enforcer list" % (
+                    gav_str(g), h["artifactId"] if h else g["artifactId"], (" version " + h["version"]) if h and h.get("version") else ""))
+        md.append("")
+
+    excludes = ["              <exclude>%s</exclude>" % ga for ga in banned_ga]
     if boot_excludes:
         excludes.append("              <!-- the bundle was built from Spring Boot %s: stay on that minor line or rebuild the bundle -->" % boot_version)
         excludes += ["              <exclude>%s</exclude>" % e for e in boot_excludes]
@@ -318,6 +344,8 @@ def main() -> None:
         "spring_boot_version": boot_version,
         "boot_embedded": boot_embedded,
         "boot_line_excludes": boot_excludes,
+        "synthetic": [{"gav": g, "hint": h, "resolved": resolved_synthetic.get(h["artifactId"]) if h else None} for g, h in synthetic],
+        "banned": banned_ga,
         "modules": [{"module": m["module"], "remove_direct": m["remove_direct"], "exclusions": m["exclusions"], "paths": m["paths"]} for m in modules],
         "promoted_dependencies": promoted,
         "tree_provided": bool(texts),
