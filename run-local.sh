@@ -84,13 +84,15 @@ if [ "$mode" = "bundle" ]; then
         --group-id "$g" --artifact-id "$a" --version "$v" --release-url "$release_url" --snapshot-url "$snapshot_url" \
         --server-id nexus --sources-jar "$sources" --out work/bundle --manifest-out out/bundle-manifest.json
     if [ "$skip_maven" = false ]; then
-        "$PY" scripts/install_unidentified.py --manifest out/bundle-manifest.json --settings work/settings.xml
-        mvn -B -ntp -s work/settings.xml -f work/bundle/pom.xml clean verify
+        local_repo="$PWD/work/m2"   # job-local repository: components are installed here from the application's bytes
+        "$PY" scripts/install_components.py --manifest out/bundle-manifest.json --settings work/settings.xml \
+            --repo-url "$maven_repo_url" --local-repo "$local_repo"
+        mvn -B -ntp -s work/settings.xml -Dmaven.repo.local="$local_repo" -f work/bundle/pom.xml clean verify
         "$PY" scripts/verify_bundle.py --manifest out/bundle-manifest.json --out out/bundle-verification.json
         if [ "$publish" = true ]; then
             "$PY" scripts/publish_bundle.py --manifest out/bundle-manifest.json --verification out/bundle-verification.json \
                 --settings work/settings.xml --release-url "$release_url" --snapshot-url "$snapshot_url" --server-id nexus \
-                --out out/publish.json
+                --local-repo "$local_repo" --out out/publish.json
         fi
     else
         echo "skipping Maven build, bundle verification and publishing (--skip-maven)"

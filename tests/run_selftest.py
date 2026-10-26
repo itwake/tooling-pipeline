@@ -122,6 +122,9 @@ def main() -> None:
         inv = read_json(out / "inventory-offline.json")
         by_name = {d["name"]: d for d in inv["dependencies"]}
         ok("layout and count", inv["app"]["layout"] == "boot-jar" and inv["app"]["dependency_count"] == len(libs))
+        ok("class-loading order taken from classpath.idx", inv["app"]["classpath_source"] == "BOOT-INF/classpath.idx"
+           and [d["name"] for d in inv["dependencies"]][:2] == ["bcprov-jdk15on-1.60.jar", "codec-a-1.0.jar"]
+           and by_name["codec-a-1.0.jar"]["classpath_index"] == 1)
         ok("spring boot version detected", inv["app"]["spring_boot_version"] == "3.3.5")
         ok("gav from pom.properties", by_name["commons-io-2.16.1.jar"]["gav"] == {"groupId": "commons-io", "artifactId": "commons-io", "version": "2.16.1"})
         ok("sha1 recorded", by_name["commons-io-2.16.1.jar"]["sha1"] == fx.sha1_of(libs["commons-io"]))
@@ -181,10 +184,16 @@ def main() -> None:
         ok("signed jar is allowed with a warning", sel["ok"] and any(f["code"] == "signed-jar" and "Oracle JDK" in f["message"] for f in sel["findings"]))
         sel = selection("codec-a, -commons-io", "excl")
         ok("exclusion wins over expansion", names(sel) == ["codec-a-1.0.jar", "codec-b-1.0.jar"] and any(f["code"] == "excluded-related" for f in sel["findings"]))
-        sel = selection("* -dup-y", "all")
-        ok("star selects every jar", sel["ok"] and len(sel["selected"]) == len(libs) - 1 and "dup-y-1.0.jar" not in names(sel))
-        sel = selection("*", "all-conflict", expect=1)
-        ok("conflicting class bytes are a hard error", any(f["code"] == "overlap-conflict" for f in sel["findings"]) and sel["overlaps"]["conflicts"][0]["path"] == "com/dup/Same.class")
+        sel = selection("*", "all")
+        ok("star selects every jar; duplicates resolve in class-loading order",
+           sel["ok"] and len(sel["selected"]) == len(libs)
+           and sel["overlaps"]["conflicts"] == [{"path": "com/dup/Same.class", "winner": "dup-x-1.0.jar", "shadowed": ["dup-y-1.0.jar"]}]
+           and any(f["code"] == "overlap-resolved" and "dup-x-1.0.jar shadows dup-y-1.0.jar" in f["message"] for f in sel["findings"])
+           and [d["name"] for d in sel["selected"]] == [d["name"] for d in inv["dependencies"]])
+        sel = selection("* -dup-y", "all-excl")
+        ok("exclusion removes one side of a duplicate", sel["ok"] and len(sel["selected"]) == len(libs) - 1 and not sel["overlaps"]["conflicts"])
+        run("resolve_selection.py", "--inventory", out / "inventory.json", "--select", "commons-io", "--policy-mode", "strict", "--out", out / "sel-compat.json")
+        ok("old --policy-mode flag is accepted and ignored", read_json(out / "sel-compat.json")["ok"])
         sel = selection("nope-lib", "missing", expect=1)
         ok("unknown token fails", any(f["code"] == "not-found" for f in sel["findings"]))
         sel = selection("tomcat-embed-core", "offline-tomcat", inventory=out / "inventory-offline.json")
@@ -195,9 +204,9 @@ def main() -> None:
            and any(f["code"] == "unidentified-synthetic" for f in sel["findings"]))
         sel = selection("org.bouncycastle:bcprov-jdk15on:1.60", "offline-explicit", inventory=out / "inventory-offline.json")
         ok("explicit coordinates replace the synthetic ones", sel["ok"] and sel["selected"][0]["gav"]["groupId"] == "org.bouncycastle")
-        sel = selection("* -dup-y", "offline-all", inventory=out / "inventory-offline.json")
+        sel = selection("*", "offline-all", inventory=out / "inventory-offline.json")
         ok("star works offline, unidentified jars included",
-           sel["ok"] and len(sel["selected"]) == len(libs) - 1
+           sel["ok"] and len(sel["selected"]) == len(libs)
            and sorted(d["name"] for d in sel["selected"] if d["gav_source"] == "synthetic") == ["bcprov-jdk15on-1.60.jar", "vendor-sdk-2.0.0.jar"])
         sel = selection("codec-a\ncodec-b\ncommons-codec", "merge")
         ok("merge transformers detected", sel["transformers"]["props_merge"] == ["META-INF/spring.factories"]
@@ -224,8 +233,13 @@ def main() -> None:
         ok("pom has distributionManagement", "<snapshotRepository>" in pom and "maven-releases" in pom)
         ok("legal files relocated", (proj / "src/main/resources/META-INF/third-party/commons-io-2.16.1/LICENSE.txt").is_file()
            and (proj / "src/main/resources/META-INF/third-party/BUNDLE-CONTENTS.txt").is_file())
-        ok("manifest lists 10 components", len(man["components"]) == 10 and man["contents_attr"].startswith("com.example.codec:codec-a:1.0,")
-           and not man["unidentified"])
+        ok("manifest lists 10 components in class-loading order", len(man["components"]) == 10 and man["contents_attr"].startswith("com.example.codec:codec-a:1.0,")
+           and not man["unidentified"] and len(man["install"]) == 10 and all(Path(i["file"]).is_file() for i in man["install"]))
+        text = run("install_components.py", "--manifest", out / "bundle-manifest.json", "--repo-url", repo_url, "--local-repo", work / "m2", "--dry-run", env=with_creds)
+        ok("every component is installed from the application's bytes, with the real POM when the repository has it",
+           text.count("install-file") == 10 and "-Dmaven.repo.local=" in text
+           and any("-Dfile=" in l and "commons-io-2.16.1.jar" in l and "-DpomFile=" in l for l in text.splitlines())
+           and any("codec-a-1.0.jar" in l and "-DgeneratePom=true" in l for l in text.splitlines()))
 
         # ---- stage 6: bundle verification on a simulated Shade output ----------------------
         print("[verify bundle]")
@@ -336,8 +350,34 @@ def main() -> None:
            len(syn_man["unidentified"]) == 1 and Path(syn_man["unidentified"][0]["file"]).is_file()
            and syn_gav["groupId"] == "rebundle.unidentified" and syn_gav["artifactId"] == "vendor-sdk" and syn_gav["version"].startswith("2.0.0-u")
            and "<groupId>rebundle.unidentified</groupId>" in (syn_proj / "pom.xml").read_text(encoding="utf-8"))
-        text = run("install_unidentified.py", "--manifest", out / "bundle-manifest-syn.json", "--dry-run")
-        ok("install-file command prepared for the synthetic jar", "install-file" in text and "-DgroupId=rebundle.unidentified" in text and "-DartifactId=vendor-sdk" in text)
+        text = run("install_components.py", "--manifest", out / "bundle-manifest-syn.json", "--dry-run")
+        ok("install-file command prepared for the synthetic jar", "install-file" in text and "-DgroupId=rebundle.unidentified" in text
+           and "-DartifactId=vendor-sdk" in text and "-DgeneratePom=true" in text)
+
+        # ---- duplicates end to end: the first copy in class-loading order wins ---------------
+        print("[duplicates]")
+        run("resolve_selection.py", "--inventory", out / "inventory.json", "--select", "dup-x\ndup-y", "--out", out / "sel-dup.json")
+        dup_bundle = {"groupId": bundle["groupId"], "artifactId": "dup-bundle", "version": "1.0.0"}
+        dup_proj = work / "bundle-dup"
+        run("gen_bundle_project.py", "--selection", out / "sel-dup.json", "--source", out / "source.json", "--group-id", dup_bundle["groupId"],
+            "--artifact-id", dup_bundle["artifactId"], "--version", dup_bundle["version"], "--out", dup_proj, "--manifest-out", out / "bundle-manifest-dup.json")
+        dup_man = read_json(out / "bundle-manifest-dup.json")
+        ok("duplicate providers ordered like the application's classpath", [c["file"] for c in dup_man["components"]] == ["dup-x-1.0.jar", "dup-y-1.0.jar"])
+        dup_jars = [libs["dup-x"], libs["dup-y"]]
+        dup_good = fx.simulate_shade(dup_proj, dup_jars, dup_bundle, dup_man["contents_attr"], source_attr, False, dup_proj / "target" / "dup-bundle-1.0.0.jar", boot_version="3.3.5")
+        fx.write_reduced_pom(dup_proj / "target" / "dependency-reduced-pom.xml", dup_bundle, [])
+        run("verify_bundle.py", "--manifest", out / "bundle-manifest-dup.json", "--out", out / "bv-dup.json")
+        ok("bundle keeping the first copy verifies", read_json(out / "bv-dup.json")["ok"])
+        dup_bad = fx.simulate_shade(dup_proj, list(reversed(dup_jars)), dup_bundle, dup_man["contents_attr"], source_attr, False, dup_proj / "target" / "dup-bad.jar", boot_version="3.3.5")
+        run("verify_bundle.py", "--manifest", out / "bundle-manifest-dup.json", "--bundle", dup_bad, "--out", out / "bv-dup-bad.json", expect=1)
+        ok("bundle keeping the wrong copy is rejected", "com/dup/Same.class" in next(c["detail"] for c in read_json(out / "bv-dup-bad.json")["checks"] if c["check"] == "classes-and-resources-identical"))
+        new_dup = fx.build_new_app(app, dup_good, ["dup-x-1.0.jar", "dup-y-1.0.jar"], work / "new-dup.jar")
+        run("verify_app_equivalence.py", "--old", app, "--new", new_dup, "--out", out / "eq-dup.json")
+        ok("effective classpath unchanged when the winning copy is kept", read_json(out / "eq-dup.json")["ok"])
+        new_dup_bad = fx.build_new_app(app, dup_bad, ["dup-x-1.0.jar", "dup-y-1.0.jar"], work / "new-dup-bad.jar")
+        run("verify_app_equivalence.py", "--old", app, "--new", new_dup_bad, "--out", out / "eq-dup-bad.json", expect=1)
+        ok("effective classpath change detected when the shadowed copy wins",
+           "com/dup/Same.class" in next(c["detail"] for c in read_json(out / "eq-dup-bad.json")["checks"] if c["check"] == "classpath-entries-identical"))
         syn_jar = fx.simulate_shade(syn_proj, [libs["vendor-sdk"]], syn_bundle, syn_man["contents_attr"], source_attr, False,
                                     syn_proj / "target" / "syn-bundle-1.0.0.jar", boot_version="3.3.5")
         fx.write_reduced_pom(syn_proj / "target" / "dependency-reduced-pom.xml", syn_bundle, [])

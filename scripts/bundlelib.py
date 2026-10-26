@@ -512,6 +512,7 @@ class AppArtifact:
     def __init__(self, path):
         self.path = Path(path)
         self._zip: Optional[zipfile.ZipFile] = None
+        self._order: Optional[Tuple[List[str], str]] = None
         self.lib_prefixes: List[str] = []
         self.classes_prefix: Optional[str] = None
         if self.path.is_file():
@@ -572,7 +573,7 @@ class AppArtifact:
         return any(rel.startswith(p) for p in self.lib_prefixes)
 
     # -- dependency jars -------------------------------------------------------------------
-    def dependency_jars(self) -> List[DepJar]:
+    def _raw_dependency_jars(self) -> List[DepJar]:
         jars: List[DepJar] = []
         if self._zip is not None:
             zf = self._zip
@@ -588,7 +589,55 @@ class AppArtifact:
                     if p.is_file() and p.suffix.lower() == ".jar":
                         rel = p.relative_to(self.path).as_posix()
                         jars.append(DepJar(p.name, rel, lambda p=p: p.read_bytes()))
-        jars.sort(key=lambda j: j.path_in_app)
+        return jars
+
+    def classpath_order(self) -> Tuple[List[str], str]:
+        """Dependency jar names in class-loading order, and where that order comes from.
+
+        Spring Boot writes BOOT-INF/classpath.idx and its launcher follows it; Jib writes
+        jib-classpath-file. Without either, the archive / directory order is used."""
+        if self._order is not None:
+            return self._order
+
+        def parse_idx(data: bytes) -> List[str]:
+            out = []
+            for raw in data.decode("utf-8", "replace").splitlines():
+                line = raw.strip()
+                if line.startswith("- "):
+                    line = line[2:].strip()
+                line = line.strip('"')
+                if line.lower().endswith(".jar"):
+                    out.append(line.rsplit("/", 1)[-1])
+            return out
+
+        names, source = None, ""
+        if self._zip is not None:
+            for idx in ("BOOT-INF/classpath.idx", "WEB-INF/classpath.idx"):
+                if idx in self._zip.namelist():
+                    names, source = parse_idx(self._zip.read(idx)), idx
+                    break
+        else:
+            for idx in ("BOOT-INF/classpath.idx", "WEB-INF/classpath.idx"):
+                p = self.path / idx
+                if p.is_file():
+                    names, source = parse_idx(p.read_bytes()), idx
+                    break
+            if names is None and (self.path / "jib-classpath-file").is_file():
+                text = (self.path / "jib-classpath-file").read_text(encoding="utf-8", errors="replace")
+                names = [e.strip().rsplit("/", 1)[-1] for e in text.replace("\n", ":").split(":") if e.strip().lower().endswith(".jar")]
+                source = "jib-classpath-file"
+        if names is None:
+            names = [j.name for j in self._raw_dependency_jars()]
+            source = "archive-order" if self._zip is not None else "directory-order"
+        self._order = (names, source)
+        return self._order
+
+    def dependency_jars(self) -> List[DepJar]:
+        """Dependency jars in class-loading order (see classpath_order)."""
+        jars = self._raw_dependency_jars()
+        order, _ = self.classpath_order()
+        position = {n: i for i, n in enumerate(order)}
+        jars.sort(key=lambda j: (position.get(j.name, len(order)), j.name))
         return jars
 
     # -- everything else -------------------------------------------------------------------

@@ -75,12 +75,14 @@ def main() -> None:
     except (ValueError, FileNotFoundError, zipfile.BadZipFile) as e:
         fail(str(e))
 
-    log("Inspecting %s (layout: %s)" % (path, app.layout))
+    order_names, order_source = app.classpath_order()
+    log("Inspecting %s (layout: %s, class-loading order from %s)" % (path, app.layout, order_source))
     deps = []
-    for dj in app.dependency_jars():
+    for index, dj in enumerate(app.dependency_jars()):
         rec = {
             "name": dj.name,
             "path_in_app": dj.path_in_app,
+            "classpath_index": index,
             "size": dj.size,
             "sha256": dj.sha256,
             "sha1": sha1_bytes(dj.data),
@@ -142,6 +144,7 @@ def main() -> None:
             "sha256": app.file_sha256(),
             "spring_boot_version": boot,
             "dependency_count": len(deps),
+            "classpath_source": order_source,
             "repo_url": args.repo_url or None,
             "inspected_at": utc_now_iso(),
         },

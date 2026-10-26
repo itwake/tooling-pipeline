@@ -14,8 +14,12 @@ and the dependencies declared in the selected jars' own pom.xml, as long as they
 the application. Nothing is refused for policy reasons; the report explains every addition and
 warns about the consequences (Boot version coupling, stripped signatures).
 
-Hard errors, the only ones: a token that matches nothing or several jars, a jar whose coordinates
-could not be identified, and two jars holding the same class path with different bytes.
+Two jars holding the same class path with different bytes are kept the way the application
+resolves them: the copy that comes first on the application's classpath (BOOT-INF/classpath.idx)
+wins, exactly as the JVM picks it at runtime; the report lists what was shadowed.
+
+Hard errors, the only ones left: a token that matches nothing or several jars, an unreadable jar,
+and properties resources that need Spring Boot's merging transformer when no Boot version is known.
 """
 from __future__ import annotations
 
@@ -54,6 +58,7 @@ def main() -> None:
     ap.add_argument("--select-file", help="file with selection tokens")
     ap.add_argument("--policy", default=str(Path(__file__).resolve().parent.parent / "config" / "policy.json"))
     ap.add_argument("--no-expand", action="store_true", help="do not add related jars automatically")
+    ap.add_argument("--policy-mode", default=None, help=argparse.SUPPRESS)  # accepted for old callers, ignored
     ap.add_argument("--out", default="out/selection.json")
     args = ap.parse_args()
 
@@ -189,7 +194,8 @@ def main() -> None:
             add_finding("error", "unidentified", "%s: coordinates cannot be identified%s; select it as groupId:artifactId:version or exclude it with -%s (candidates: %s)" % (
                 d["name"], (" (%s)" % d["identification_note"]) if d.get("identification_note") else "", d["name"][:-4], candidates), d["name"])
 
-    selected_list = sorted(selected.values(), key=lambda d: ga_str(d["gav"]) if d.get("gav") else d["name"])
+    # class-loading order of the application: the bundle keeps duplicates the same way the JVM does
+    selected_list = sorted(selected.values(), key=lambda d: (d.get("classpath_index", 10 ** 9), d["name"]))
     auto_added = [d for d in selected_list if not d["reasons"][0].startswith("selected:")]
 
     # ---- notes about the selection -------------------------------------------------------
@@ -245,14 +251,21 @@ def main() -> None:
                     elif cat == "props-merge":
                         props_counts[n] += 1
         app.close()
+        position = {d["name"]: d.get("classpath_index", 10 ** 9) for d in deps}
         for path, shas in sorted(entries.items()):
             if len(shas) > 1:
-                conflicts.append({"path": path, "providers": {s: j for s, j in shas.items()}})
+                providers = sorted((j for jars in shas.values() for j in jars), key=lambda j: (position.get(j, 10 ** 9), j))
+                conflicts.append({"path": path, "winner": providers[0], "shadowed": providers[1:]})
             elif len(next(iter(shas.values()))) > 1:
                 identical.append(path)
         if conflicts:
-            add_finding("error", "overlap-conflict", "%d entries exist in several selected jars with different bytes; they cannot share one jar, exclude one side: %s" % (
-                len(conflicts), "; ".join("%s (%s)" % (c["path"], " vs ".join(", ".join(v) for v in c["providers"].values())) for c in conflicts[:5])))
+            pairs = sorted({(c["winner"], s) for c in conflicts for s in c["shadowed"]})
+            add_finding("warn", "overlap-resolved", "%d entries exist in several selected jars with different bytes; the bundle keeps the copy that comes first on the application's classpath, as the JVM does: %s" % (
+                len(conflicts), "; ".join("%s shadows %s" % (w, s) for w, s in pairs[:6])))
+            resources = [c["path"] for c in conflicts if not c["path"].endswith(".class")]
+            if resources:
+                add_finding("warn", "resource-copies-collapse", "%d of them are resources; a library that reads every copy (getResources) will only see the first after merging: %s" % (
+                    len(resources), ", ".join(resources[:6])))
         if identical:
             add_finding("info", "overlap-identical", "%d entries are duplicated with identical bytes (first copy is kept)" % len(identical))
 
@@ -283,6 +296,7 @@ def main() -> None:
         },
         "spring_boot_version": boot_version,
         "families": coupled,
+        "classpath_source": inv["app"].get("classpath_source"),
         "app": inv["app"],
         "ok": not errors,
     }

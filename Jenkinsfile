@@ -81,8 +81,9 @@ pipeline {
         CREATE_SOURCES_JAR    = 'true'
         // -----------------------------------------------------------------------------------
         NEXUS_HOSTS = "${NEXUS_DOCKER_REGISTRY},${NEXUS_MAVEN_REPO_URL},${NEXUS_RELEASE_URL},${NEXUS_SNAPSHOT_URL}"
+        MAVEN_LOCAL_REPO = "${WORKSPACE}/work/m2"   // job-local repository: components are installed here from the application's bytes
         PY        = 'python3'
-        MVN_FLAGS = '-B -ntp -s work/settings.xml'
+        MVN_FLAGS = "-B -ntp -s work/settings.xml -Dmaven.repo.local=${WORKSPACE}/work/m2"
     }
 
     stages {
@@ -90,6 +91,7 @@ pipeline {
             steps {
                 sh '''
                     rm -rf work out && mkdir -p work out
+                    echo "mvn-rebundle revision: $(git rev-parse --short HEAD 2>/dev/null || echo unknown) ($(git log -1 --format=%cd --date=short 2>/dev/null || echo 'no git checkout'))"
                     "$PY" --version
                     java -version
                     mvn -v
@@ -154,10 +156,15 @@ pipeline {
                 stage('Build bundle') {
                     steps {
                         script {
-                            withNexusCredentials {
-                                // jars without known coordinates are installed locally under synthetic coordinates first
-                                sh '"$PY" scripts/install_unidentified.py --manifest out/bundle-manifest.json --settings work/settings.xml'
-                                sh 'mvn $MVN_FLAGS -f work/bundle/pom.xml clean verify'
+                            withSourceCredentials('nexus') {
+                                withNexusCredentials {
+                                    // every component is installed into the job-local repository from the application's own bytes
+                                    sh '''
+                                        "$PY" scripts/install_components.py --manifest out/bundle-manifest.json --settings work/settings.xml \
+                                            --repo-url "$NEXUS_MAVEN_REPO_URL" --local-repo "$MAVEN_LOCAL_REPO"
+                                    '''
+                                    sh 'mvn $MVN_FLAGS -f work/bundle/pom.xml clean verify'
+                                }
                             }
                         }
                     }
@@ -189,7 +196,7 @@ pipeline {
                             "$PY" scripts/publish_bundle.py --manifest out/bundle-manifest.json \
                                 --verification out/bundle-verification.json --settings work/settings.xml \
                                 --release-url "$NEXUS_RELEASE_URL" --snapshot-url "$NEXUS_SNAPSHOT_URL" --server-id nexus \
-                                --out out/publish.json
+                                --local-repo "$MAVEN_LOCAL_REPO" --out out/publish.json
                         '''
                     }
                 }

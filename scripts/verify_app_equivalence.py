@@ -81,7 +81,8 @@ def load_jars(app: AppArtifact):
 
 
 def collect_entries(jars, skip_prefixes):
-    plain = defaultdict(lambda: defaultdict(list))  # path -> sha -> [jar]
+    """jars must be in class-loading order: the first provider of a path is the effective one."""
+    plain = defaultdict(lambda: defaultdict(list))  # path -> sha -> [jar], insertion order = loading order
     merged_lines = defaultdict(set)                 # services / append -> lines
     merged_props = defaultdict(lambda: defaultdict(set))
     for j in jars:
@@ -187,13 +188,20 @@ def main() -> None:
     old_plain, old_lines, old_props = collect_entries(old_jars, skip)
     new_plain, new_lines, new_props = collect_entries(new_jars, skip)
 
-    missing = sorted(set(old_plain) - set(new_plain))
-    extra = sorted(set(new_plain) - set(old_plain))
-    changed = sorted(p for p in set(old_plain) & set(new_plain) if set(old_plain[p]) != set(new_plain[p]))
+    # effective classpath: for every path, the copy the class loader sees first
+    old_eff = {p: next(iter(shas)) for p, shas in old_plain.items()}
+    new_eff = {p: next(iter(shas)) for p, shas in new_plain.items()}
+    missing = sorted(set(old_eff) - set(new_eff))
+    extra = sorted(set(new_eff) - set(old_eff))
+    changed = sorted(p for p in set(old_eff) & set(new_eff) if old_eff[p] != new_eff[p])
     check("classpath-entries-identical", not missing and not extra and not changed,
           "missing %d (%s); extra %d (%s); changed %d (%s)" % (
               len(missing), ", ".join(missing[:8]), len(extra), ", ".join(extra[:8]), len(changed), ", ".join(changed[:8]))
-          if missing or extra or changed else "%d entries compared" % len(old_plain))
+          if missing or extra or changed else "%d entries compared, first copy in class-loading order" % len(old_eff))
+    collapsed = sorted(p for p in old_plain if len(old_plain[p]) > 1 and len(new_plain.get(p, {})) < len(old_plain[p]) and not p.endswith(".class"))
+    check("duplicate-resources-collapsed", not collapsed,
+          "resources that existed in several copies now have fewer; libraries reading every copy (getResources) see less: %s" % ", ".join(collapsed[:10])
+          if collapsed else "no multi-copy resource lost a copy", level="warn")
 
     line_problems = []
     for p in sorted(set(old_lines) | set(new_lines)):

@@ -217,6 +217,8 @@ def build_fake_nexus(repo_root: Path, libs: dict, app_jar: Path, snapshot_metada
     put("com/example/app/1.1.0-SNAPSHOT/app-1.1.0-20241001.101010-3.jar", app_jar)
     put("com/example/app/1.1.0-SNAPSHOT/maven-metadata.xml", snapshot_metadata)
     put("org/springframework/boot/spring-boot-dependencies/3.3.5/spring-boot-dependencies-3.3.5.pom", BOOT_BOM)
+    put("commons-io/commons-io/2.16.1/commons-io-2.16.1.pom", '<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>'
+        "<groupId>commons-io</groupId><artifactId>commons-io</artifactId><version>2.16.1</version></project>\n")
     put("com/example/boms/extra-bom/1.0/extra-bom-1.0.pom", EXTRA_BOM)
     for g, a, v, key in (("org.apache.tomcat.embed", "tomcat-embed-core", "10.1.59", "tomcat-embed-core"),
                          ("org.apache.tomcat.embed", "tomcat-embed-el", "10.1.59", "tomcat-embed-el"),

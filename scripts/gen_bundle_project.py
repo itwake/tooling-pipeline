@@ -234,9 +234,13 @@ def main() -> None:
         shutil.rmtree(out)
     out.mkdir(parents=True)
 
-    selected = sorted(selected, key=lambda d: ga_str(d["gav"]))
+    # keep the selection's order: it is the application's class-loading order, and Shade keeps the
+    # first copy of a duplicate entry in dependency order, so duplicates resolve like in the application
     contents = ",".join(gav_str(d["gav"]) for d in selected)
-    includes = sorted({ga_str(d["gav"]) for d in selected})
+    includes = []
+    for d in selected:
+        if ga_str(d["gav"]) not in includes:
+            includes.append(ga_str(d["gav"]))
 
     pom = POM_TEMPLATE
     repl = {
@@ -276,6 +280,9 @@ def main() -> None:
     by_path = {j.path_in_app: j for j in app.dependency_jars()}
     components = []
     unidentified = []
+    install = []
+    components_dir = out / "components"
+    components_dir.mkdir(parents=True, exist_ok=True)
     for d in selected:
         dj = by_path.get(d["path_in_app"])
         if dj is None:
@@ -290,11 +297,13 @@ def main() -> None:
                     target.write_bytes(zf.read(n))
                     copied.append(n)
         synthetic = d.get("gav_source") == "synthetic"
+        # every component is installed into the build's local repository from the application's own
+        # bytes, so the Shade build never depends on the repository having (the same) artifact
+        target = components_dir / d["name"]
+        target.write_bytes(dj.data)
+        install.append({"name": d["name"], "file": str(target), "gav": d["gav"], "synthetic": synthetic,
+                        "sha1": d.get("sha1"), "sha256": d["sha256"]})
         if synthetic:
-            # the original file is installed into the local repository under the synthetic coordinates
-            target = out / "unidentified" / d["name"]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(dj.data)
             unidentified.append({"name": d["name"], "file": str(target), "gav": d["gav"], "hint": d.get("synthetic_hint"),
                                  "sha1": d.get("sha1"), "sha256": d["sha256"]})
         components.append({
@@ -324,7 +333,9 @@ def main() -> None:
         "source": source or sel.get("app"),
         "source_desc": source_desc,
         "components": components,
+        "install": install,
         "unidentified": unidentified,
+        "classpath_source": sel.get("classpath_source"),
         "transformers": transformers,
         "spring_boot_version": boot_version,
         "shade_version": args.shade_version,
@@ -345,8 +356,9 @@ def main() -> None:
         ", props-merge(%d) via spring-boot-maven-plugin %s" % (len(transformers["props_merge"]), boot_version) if transformers.get("props_merge") else "",
         ", Multi-Release" if transformers.get("multi_release") else ""))
     if unidentified:
-        log("  unidentified: %d jar(s) embedded under synthetic coordinates (%s); run install_unidentified.py before the build" % (
+        log("  unidentified: %d jar(s) embedded under synthetic coordinates (%s)" % (
             len(unidentified), ", ".join(u["name"] for u in unidentified)))
+    log("  install    : install_components.py --manifest %s   (components from the application's bytes)" % args.manifest_out)
     log("  build      : mvn -f %s -B clean verify" % (out / "pom.xml"))
 
 

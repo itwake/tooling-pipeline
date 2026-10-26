@@ -25,6 +25,7 @@ def main() -> None:
     ap.add_argument("--release-url", default="")
     ap.add_argument("--snapshot-url", default="")
     ap.add_argument("--server-id", default="nexus")
+    ap.add_argument("--local-repo", default="", help="maven.repo.local used by the build")
     ap.add_argument("--deploy-plugin-version", default="3.1.2")
     ap.add_argument("--dry-run", action="store_true", help="print the command, upload nothing")
     ap.add_argument("--out", default="out/publish.json")
@@ -59,6 +60,8 @@ def main() -> None:
     cmd = [mvn, "-B", "-ntp"]
     if args.settings:
         cmd += ["-s", args.settings]
+    if args.local_repo:
+        cmd.append("-Dmaven.repo.local=%s" % args.local_repo)
     cmd += [
         "org.apache.maven.plugins:maven-deploy-plugin:%s:deploy-file" % args.deploy_plugin_version,
         "-Dfile=%s" % jar,

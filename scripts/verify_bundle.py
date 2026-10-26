@@ -119,7 +119,7 @@ def main() -> None:
                 elif cat == "props-merge":
                     for k, vals in properties_values(parse_properties(data.decode("utf-8", "replace"))).items():
                         props_exp[n][k].update(vals)
-                else:
+                elif n not in expected:  # first copy wins, as in the application's class-loading order
                     expected[n] = sha256_bytes(data)
     app.close()
 
