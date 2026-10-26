@@ -24,6 +24,23 @@ def withNexusCredentials(Closure body) {
     }
 }
 
+// Credentials needed to read the source artifact; `auth` is what `extract_source.py --detect` printed.
+def withSourceCredentials(String auth, Closure body) {
+    if (auth == 'ecr' && env.AWS_CREDENTIALS_ID?.trim()) {
+        withCredentials([aws(credentialsId: env.AWS_CREDENTIALS_ID,
+                             accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+            body()
+        }
+    } else if (auth == 'nexus' && env.SOURCE_CREDENTIALS_ID?.trim()) {
+        withCredentials([usernamePassword(credentialsId: env.SOURCE_CREDENTIALS_ID,
+                                          usernameVariable: 'SOURCE_USERNAME', passwordVariable: 'SOURCE_PASSWORD')]) {
+            body()
+        }
+    } else {
+        body()
+    }
+}
+
 pipeline {
     agent any            // or: agent { label 'maven-docker' }
 
@@ -34,14 +51,12 @@ pipeline {
     }
 
     parameters {
-        choice(name: 'SOURCE_TYPE', choices: ['image', 'jar'],
-               description: 'image: container image; jar: http(s) URL or agent-local path of an executable jar/war')
         string(name: 'SOURCE_REF', defaultValue: '',
-               description: 'Image reference (registry.example.com/team/app:1.2.3) or jar location')
+               description: 'Where the application comes from: an image reference (123456789012.dkr.ecr.eu-west-1.amazonaws.com/team/app:1.2.3, nexus-docker.example.com/team/app:1.2.3), Maven coordinates (com.example:app:1.2.3, com.example:app:1.2.3:war, com.example:app:1.2.3:jar:exec), an http(s) URL, or a path on the agent. The kind of source and the login it needs are detected from the reference')
         string(name: 'APP_PATH', defaultValue: '/app/app.jar',
-               description: 'Application path inside the image: a fat jar file, or an exploded directory (/workspace for buildpacks images, /app for Jib images)')
-        string(name: 'IMAGE_PLATFORM', defaultValue: '', description: 'Image platform, e.g. linux/amd64; empty uses the default')
-        choice(name: 'IMAGE_TOOL', choices: ['auto', 'docker', 'crane'], description: 'Tool used to read the image')
+               description: 'Images only: application path inside the image, a fat jar file or an exploded directory (/workspace for buildpacks images, /app for Jib images)')
+        string(name: 'IMAGE_PLATFORM', defaultValue: '', description: 'Images only: platform, e.g. linux/amd64; empty uses the default')
+        choice(name: 'IMAGE_TOOL', choices: ['auto', 'docker', 'crane'], description: 'Images only: tool used to log in and read the image')
         booleanParam(name: 'INVENTORY_ONLY', defaultValue: false,
                      description: 'Stop after the inventory: lists every dependency jar with its coordinates so you can decide what to select')
         text(name: 'SELECT', defaultValue: 'commons-io:commons-io',
@@ -62,7 +77,12 @@ pipeline {
         NEXUS_SNAPSHOT_URL   = 'https://nexus.example.com/repository/maven-snapshots/'
         NEXUS_CREDENTIALS_ID = 'nexus-deploy'   // Jenkins username/password credential ID; empty = anonymous (cannot publish)
         MAVEN_MIRROR_URL     = ''               // company Maven group repository, e.g. https://nexus.example.com/repository/maven-public/ ; empty = Maven Central
+        NEXUS_MAVEN_REPO_URL = 'https://nexus.example.com/repository/maven-public/'   // Maven coordinates in SOURCE_REF are resolved here
+        NEXUS_DOCKER_REGISTRY = 'nexus-docker.example.com'   // host[:port] of the Nexus Docker registry; images from it log in with SOURCE_CREDENTIALS_ID
+        SOURCE_CREDENTIALS_ID = 'nexus-deploy'  // Nexus credential for reading images, URLs and coordinates hosted on Nexus; may equal NEXUS_CREDENTIALS_ID
+        AWS_CREDENTIALS_ID   = ''               // images in ECR: AWS credential ID (CloudBees AWS Credentials plugin); empty = the agent's instance role
         // -----------------------------------------------------------------------------------
+        NEXUS_HOSTS = "${NEXUS_DOCKER_REGISTRY},${NEXUS_MAVEN_REPO_URL},${NEXUS_RELEASE_URL},${NEXUS_SNAPSHOT_URL}"
         PY        = 'python3'
         MVN_FLAGS = '-B -ntp -s work/settings.xml'
     }
@@ -83,10 +103,19 @@ pipeline {
 
         stage('Fetch source') {
             steps {
-                sh '''
-                    "$PY" scripts/extract_source.py --type "$SOURCE_TYPE" --ref "$SOURCE_REF" --path "$APP_PATH" \
-                        --image-tool "$IMAGE_TOOL" --platform "$IMAGE_PLATFORM" --out work/app --meta out/source.json
-                '''
+                script {
+                    // kind, auth and host are detected from the reference; bind only the credentials that are needed
+                    def detected = sh(returnStdout: true,
+                                      script: '"$PY" scripts/extract_source.py --detect --ref "$SOURCE_REF" --nexus-hosts "$NEXUS_HOSTS"').trim()
+                    echo "Source detected: ${detected}"
+                    withSourceCredentials(detected.tokenize()[1]) {
+                        sh '''
+                            "$PY" scripts/extract_source.py --ref "$SOURCE_REF" --path "$APP_PATH" --nexus-hosts "$NEXUS_HOSTS" \
+                                --image-tool "$IMAGE_TOOL" --platform "$IMAGE_PLATFORM" --maven-repo-url "$NEXUS_MAVEN_REPO_URL" \
+                                --out work/app --meta out/source.json
+                        '''
+                    }
+                }
             }
         }
 

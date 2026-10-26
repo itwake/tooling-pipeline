@@ -8,11 +8,15 @@ the rules the generated project configures; the real Shade run is covered on Jen
 """
 from __future__ import annotations
 
+import base64
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -28,9 +32,9 @@ PY = sys.executable
 passed = 0
 
 
-def run(script, *args, expect=0, cwd=None):
+def run(script, *args, expect=0, cwd=None, env=None):
     cmd = [PY, "-I", str(SCRIPTS / script), *map(str, args)]
-    p = subprocess.run(cmd, cwd=str(cwd or ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8")
+    p = subprocess.run(cmd, cwd=str(cwd or ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8")
     if p.returncode != expect:
         print(p.stdout)
         raise AssertionError("%s exited %d, expected %d" % (script, p.returncode, expect))
@@ -72,6 +76,118 @@ def main() -> None:
     f = by_name["commons-codec-1.17.1.jar"]["flags"]
     ok("flags: multi-release/module-info/spi", f["multi_release"] and f["module_info"] and f["services"] == ["org.apache.commons.codec.Codec"])
     ok("flags: signed", by_name["signed-lib-1.0.jar"]["flags"]["signed"])
+
+    # ---- source types: ECR / Nexus helpers and a fake Nexus Maven repository --------------
+    print("[source types]")
+    import extract_source as es
+    ok("ecr region derived from the registry host",
+       es.ecr_region("123456789012.dkr.ecr.eu-west-1.amazonaws.com") == "eu-west-1"
+       and es.ecr_region("123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn") == "cn-north-1"
+       and es.ecr_region("123456789012.dkr.ecr-fips.us-gov-west-1.amazonaws.com") == "us-gov-west-1"
+       and es.ecr_region("nexus-docker.example.com", "ap-southeast-1") == "ap-southeast-1"
+       and es.ecr_region("nexus-docker.example.com") is None)
+    ok("registry host of an image reference",
+       es.registry_host("123456789012.dkr.ecr.eu-west-1.amazonaws.com/team/app:1.2.3") == "123456789012.dkr.ecr.eu-west-1.amazonaws.com"
+       and es.registry_host("nexus.example.com:5000/team/app@sha256:abc") == "nexus.example.com:5000"
+       and es.registry_host("library/nginx:1.25") == "index.docker.io")
+    metadata = """<?xml version="1.0" encoding="UTF-8"?>
+<metadata modelVersion="1.1.0"><groupId>com.example</groupId><artifactId>app</artifactId><version>1.1.0-SNAPSHOT</version>
+<versioning><snapshot><timestamp>20241001.101010</timestamp><buildNumber>3</buildNumber></snapshot><lastUpdated>20241001101010</lastUpdated>
+<snapshotVersions>
+<snapshotVersion><extension>jar</extension><value>1.1.0-20241001.101010-3</value><updated>20241001101010</updated></snapshotVersion>
+<snapshotVersion><classifier>exec</classifier><extension>jar</extension><value>1.1.0-20241001.101010-4</value><updated>20241001101010</updated></snapshotVersion>
+<snapshotVersion><extension>pom</extension><value>1.1.0-20241001.101010-3</value><updated>20241001101010</updated></snapshotVersion>
+</snapshotVersions></versioning></metadata>
+"""
+    ok("snapshot version resolution",
+       es.resolve_snapshot_version(metadata, "1.1.0-SNAPSHOT", "jar", None) == "1.1.0-20241001.101010-3"
+       and es.resolve_snapshot_version(metadata, "1.1.0-SNAPSHOT", "jar", "exec") == "1.1.0-20241001.101010-4"
+       and es.resolve_snapshot_version(metadata, "1.1.0-SNAPSHOT", "war", None) == "1.1.0-20241001.101010-3"
+       and es.resolve_snapshot_version("<metadata><versioning><snapshot><localCopy>true</localCopy></snapshot></versioning></metadata>",
+                                       "1.1.0-SNAPSHOT", "jar", None) == "1.1.0-SNAPSHOT")
+    ok("maven artifact url follows g:a:v[:packaging[:classifier]]",
+       es.maven_artifact_url("com.example:app:1.2.3:jar:exec", "https://nexus.example.com/repository/maven-public")
+       == ("https://nexus.example.com/repository/maven-public/com/example/app/1.2.3/app-1.2.3-exec.jar", "app-1.2.3-exec.jar", "1.2.3")
+       and es.maven_artifact_url("com.example:app:1.2.3:war", "https://nexus.example.com/repository/maven-public")[1] == "app-1.2.3.war"
+       and es.maven_artifact_url("com.example:app:1.2.3", "https://nexus.example.com/repository/maven-public")[1] == "app-1.2.3.jar")
+    nx = es.parse_hosts("nexus-docker.example.com:5000, https://nexus.example.com/repository/maven-public/, ,")
+    ok("nexus hosts parsed from hosts and urls", nx == {"nexus-docker.example.com:5000", "nexus.example.com"})
+    ok("detection: urls",
+       es.detect_source("https://nexus.example.com/repository/raw/app.jar", nx)[:2] == ("url", "nexus")
+       and es.detect_source("https://files.example.org/app.jar", nx)[:2] == ("url", "none"))
+    ok("detection: local paths",
+       es.detect_source(str(app), nx)[:2] == ("file", "none") and es.detect_source(str(app.parent), nx)[:2] == ("dir", "none"))
+    ok("detection: maven coordinates",
+       es.detect_source("com.example:app:1.2.3", nx)[:2] == ("maven", "nexus")
+       and es.detect_source("com.example:app:1.2.3:jar:exec", nx)[:2] == ("maven", "nexus"))
+    ok("detection: images by registry host",
+       es.detect_source("123456789012.dkr.ecr.eu-west-1.amazonaws.com/team/app:1.2.3", nx) == ("image", "ecr", "123456789012.dkr.ecr.eu-west-1.amazonaws.com")
+       and es.detect_source("public.ecr.aws/team/app:1", nx)[:2] == ("image", "ecr")
+       and es.detect_source("nexus-docker.example.com:5000/team/app:1.2.3", nx) == ("image", "nexus", "nexus-docker.example.com:5000")
+       and es.detect_source("ghcr.io/team/app:1.2.3", nx) == ("image", "none", "ghcr.io")
+       and es.detect_source("nginx:1.25", nx) == ("image", "none", "index.docker.io"))
+    detected = run("extract_source.py", "--detect", "--ref", "nexus-docker.example.com:5000/team/app:1.2.3",
+                   "--nexus-hosts", "nexus-docker.example.com:5000,https://nexus.example.com/repository/maven-public/").strip()
+    ok("--detect prints kind, auth and host", detected == "image nexus nexus-docker.example.com:5000")
+    run("extract_source.py", "--ref", "123456789012.dkr.ecr.eu-west-1.amazonaws.com/team/app:1", "--out", work / "ecr", "--meta", out / "ecr.json", expect=2)
+    ok("ecr image without docker, crane or aws fails cleanly", not (out / "ecr.json").exists())
+
+    repo = work / "fakenexus"
+    release_dir = repo / "repository" / "maven-public" / "com" / "example" / "app" / "1.0.0"
+    snapshot_dir = repo / "repository" / "maven-public" / "com" / "example" / "app" / "1.1.0-SNAPSHOT"
+    release_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+    shutil.copy(app, release_dir / "app-1.0.0.jar")
+    shutil.copy(app, snapshot_dir / "app-1.1.0-20241001.101010-3.jar")
+    (snapshot_dir / "maven-metadata.xml").write_text(metadata, encoding="utf-8")
+    token = "Basic " + base64.b64encode(b"reader:secret").decode()
+
+    class NexusLike(SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=str(repo), **k)
+
+        def do_GET(self):
+            if self.headers.get("Authorization") != token:
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="nexus"')
+                self.end_headers()
+                return
+            super().do_GET()
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), NexusLike)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    repo_url = "http://127.0.0.1:%d/repository/maven-public/" % server.server_address[1]
+    with_creds = dict(os.environ, SOURCE_USERNAME="reader", SOURCE_PASSWORD="secret")
+    without_creds = {k: v for k, v in os.environ.items() if not k.startswith("SOURCE_")}
+    try:
+        run("extract_source.py", "--ref", "com.example:app:1.0.0", "--maven-repo-url", repo_url,
+            "--out", work / "mvn-rel", "--meta", out / "mvn-rel.json", env=with_creds)
+        rel_meta = read_json(out / "mvn-rel.json")
+        ok("maven coordinates detected and downloaded with basic auth",
+           rel_meta["type"] == "maven" and rel_meta["detected"] and rel_meta["sha256"] == src["sha256"]
+           and rel_meta["auth"] == "nexus" and rel_meta["maven"]["resolved_version"] == "1.0.0")
+        run("extract_source.py", "--ref", "com.example:app:1.1.0-SNAPSHOT", "--maven-repo-url", repo_url,
+            "--out", work / "mvn-snap", "--meta", out / "mvn-snap.json", env=with_creds)
+        snap_meta = read_json(out / "mvn-snap.json")
+        ok("maven snapshot coordinates resolved through maven-metadata.xml",
+           snap_meta["maven"]["resolved_version"] == "1.1.0-20241001.101010-3"
+           and Path(snap_meta["local_path"]).name == "app-1.1.0-20241001.101010-3.jar" and snap_meta["sha256"] == src["sha256"])
+        run("extract_source.py", "--ref", "com.example:app:1.0.0", "--maven-repo-url", repo_url,
+            "--out", work / "mvn-anon", "--meta", out / "mvn-anon.json", env=without_creds, expect=2)
+        ok("maven coordinates without credentials are rejected by the repository", not (out / "mvn-anon.json").exists())
+        url_ref = repo_url + "com/example/app/1.0.0/app-1.0.0.jar"
+        run("extract_source.py", "--ref", url_ref, "--nexus-hosts", repo_url, "--out", work / "url-nexus", "--meta", out / "url-nexus.json", env=with_creds)
+        ok("url on a nexus host downloaded with basic auth", read_json(out / "url-nexus.json")["auth"] == "nexus" and read_json(out / "url-nexus.json")["sha256"] == src["sha256"])
+        run("extract_source.py", "--ref", url_ref, "--out", work / "url-anon", "--meta", out / "url-anon.json", env=with_creds, expect=2)
+        ok("url on an unknown host never sends the nexus credentials", not (out / "url-anon.json").exists())
+        run("extract_source.py", "--type", "nexus-maven", "--ref", "com.example:app", "--maven-repo-url", repo_url,
+            "--out", work / "mvn-bad", "--meta", out / "mvn-bad.json", env=with_creds, expect=2)
+        ok("malformed maven coordinates fail", not (out / "mvn-bad.json").exists())
+    finally:
+        server.shutdown()
 
     # ---- stage 3: policy ------------------------------------------------------------------
     print("[resolve selection]")

@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # Run the same stages as the Jenkins jobs on a workstation (Linux, macOS or Git Bash on Windows).
 #
-#   ./run-local.sh bundle --type jar --ref /path/app.jar --select "commons-io" \
-#        --gav com.company.platform:thirdparty-bundle:1.0.0-SNAPSHOT \
+#   ./run-local.sh bundle --ref REF --select "commons-io" --gav com.company.platform:thirdparty-bundle:1.0.0-SNAPSHOT \
 #        [--path /app/app.jar] [--image-tool auto|docker|crane] [--platform linux/amd64] \
+#        [--nexus-hosts host1,host2] [--maven-repo-url URL] [--aws-region R] [--type TYPE] \
 #        [--inventory-only] [--policy-mode strict|warn] [--no-sources] [--mirror-url URL] \
 #        [--release-url URL --snapshot-url URL --publish] [--skip-maven]
 #
 #   ./run-local.sh consumer [--manifest out/bundle-manifest.json | --bundle g:a:v --embedded "g:a:v,g:a:v"] \
 #        [--tree dependency-tree.txt]
 #
-#   ./run-local.sh verify --old /path/old-app.jar --new /path/new-app.jar [--bundle-artifact-id thirdparty-bundle]
-#        (--old / --new accept a jar, an exploded directory, or image:<ref>[#<path>] when docker/crane is available)
+#   ./run-local.sh verify --old REF[#path] --new REF[#path] [--bundle-artifact-id ID] \
+#        [--nexus-hosts host1,host2] [--maven-repo-url URL] [--aws-region R]
 #
-# Nexus credentials for publishing: export NEXUS_USERNAME / NEXUS_PASSWORD before running.
+# REF is detected like SOURCE_REF in Jenkins: an image reference (#path selects the application inside
+# it), Maven coordinates g:a:v[:packaging[:classifier]], an http(s) URL, or a local file / directory.
+# Credentials come from the environment: SOURCE_USERNAME / SOURCE_PASSWORD for references on the Nexus
+# hosts, the usual AWS variables or an instance role for ECR, NEXUS_USERNAME / NEXUS_PASSWORD for publishing.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -23,18 +26,28 @@ command -v "$PY" >/dev/null 2>&1 || PY=python
 mode=${1:-bundle}
 [ $# -gt 0 ] && shift
 
-usage() { sed -n '2,17p' "$0"; exit 2; }
+usage() { sed -n '2,19p' "$0"; exit 2; }
+
+extract() {  # <ref> <path> <out dir> <meta file>
+    "$PY" scripts/extract_source.py --ref "$1" --path "$2" --type "$type" --nexus-hosts "$nexus_hosts" \
+        --image-tool "$image_tool" --platform "$platform" --aws-region "$aws_region" --maven-repo-url "$maven_repo_url" \
+        --out "$3" --meta "$4"
+}
 
 if [ "$mode" = "bundle" ]; then
-    type=jar ref="" path=/app/app.jar image_tool=auto platform="" select="" gav="" policy_mode=strict
-    sources=true mirror_url="" release_url="" snapshot_url="" publish=false skip_maven=false inventory_only=false
+    ref="" path=/app/app.jar type=auto image_tool=auto platform="" aws_region="" maven_repo_url="" nexus_hosts=""
+    select="" gav="" policy_mode=strict sources=true mirror_url="" release_url="" snapshot_url=""
+    publish=false skip_maven=false inventory_only=false
     while [ $# -gt 0 ]; do
         case "$1" in
-            --type) type=$2; shift 2;;
             --ref) ref=$2; shift 2;;
             --path) path=$2; shift 2;;
+            --type) type=$2; shift 2;;
             --image-tool) image_tool=$2; shift 2;;
             --platform) platform=$2; shift 2;;
+            --aws-region) aws_region=$2; shift 2;;
+            --maven-repo-url) maven_repo_url=$2; shift 2;;
+            --nexus-hosts) nexus_hosts=$2; shift 2;;
             --select) select=$2; shift 2;;
             --gav) gav=$2; shift 2;;
             --policy-mode) policy_mode=$2; shift 2;;
@@ -57,8 +70,7 @@ if [ "$mode" = "bundle" ]; then
 
     rm -rf work out && mkdir -p work out
     "$PY" scripts/gen_maven_settings.py --server-id nexus --mirror-url "$mirror_url" --out work/settings.xml
-    "$PY" scripts/extract_source.py --type "$type" --ref "$ref" --path "$path" --image-tool "$image_tool" \
-        --platform "$platform" --out work/app --meta out/source.json
+    extract "$ref" "$path" work/app out/source.json
     "$PY" scripts/inspect_app.py --source out/source.json --out out/inventory.json
     if [ "$inventory_only" = true ]; then
         "$PY" scripts/write_summary.py --out-dir out
@@ -110,7 +122,7 @@ elif [ "$mode" = "consumer" ]; then
     echo "done: see out/consumer-patch.md"
 
 elif [ "$mode" = "verify" ]; then
-    old="" new="" bundle_artifact_id="" image_tool=auto platform=""
+    old="" new="" bundle_artifact_id="" type=auto image_tool=auto platform="" aws_region="" maven_repo_url="" nexus_hosts=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --old) old=$2; shift 2;;
@@ -118,23 +130,18 @@ elif [ "$mode" = "verify" ]; then
             --bundle-artifact-id) bundle_artifact_id=$2; shift 2;;
             --image-tool) image_tool=$2; shift 2;;
             --platform) platform=$2; shift 2;;
+            --aws-region) aws_region=$2; shift 2;;
+            --maven-repo-url) maven_repo_url=$2; shift 2;;
+            --nexus-hosts) nexus_hosts=$2; shift 2;;
             *) echo "unknown option: $1"; usage;;
         esac
     done
     [ -n "$old" ] && [ -n "$new" ] || usage
     rm -rf work out && mkdir -p work out
-    fetch() {  # <label> <spec>  -> metadata out/<label>-source.json
-        local label=$1 spec=$2 ref p
-        if [[ "$spec" == image:* ]]; then
-            ref=${spec#image:}; p=/app/app.jar
-            if [[ "$ref" == *"#"* ]]; then p=${ref#*#}; ref=${ref%%#*}; fi
-            "$PY" scripts/extract_source.py --type image --ref "$ref" --path "$p" --image-tool "$image_tool" \
-                --platform "$platform" --out "work/$label" --meta "out/$label-source.json"
-        elif [ -d "$spec" ]; then
-            "$PY" scripts/extract_source.py --type dir --ref "$spec" --out "work/$label" --meta "out/$label-source.json"
-        else
-            "$PY" scripts/extract_source.py --type jar --ref "$spec" --out "work/$label" --meta "out/$label-source.json"
-        fi
+    fetch() {  # <label> <ref[#path]>
+        local label=$1 spec=$2 ref=$2 p=/app/app.jar
+        if [[ "$spec" == *"#"* ]] && [ ! -e "$spec" ]; then p=${spec#*#}; ref=${spec%%#*}; fi
+        extract "$ref" "$p" "work/$label" "out/$label-source.json"
     }
     fetch old "$old"
     fetch new "$new"

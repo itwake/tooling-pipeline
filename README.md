@@ -34,10 +34,10 @@ The three jobs are independent. The consumer job takes the bundle either from an
 ## Agent requirements
 
 - Linux agent (`sh` steps).
-- `mvn-rebundle`: JDK 17+, Maven 3.6+, Python 3.8+ on the PATH; for image sources `docker` (with a reachable daemon) or `crane`. `crane` needs no daemon and suits CI better.
+- `mvn-rebundle`: JDK 17+, Maven 3.6+, Python 3.8+ on the PATH; for image sources `docker` (with a reachable daemon) or `crane`, plus the `aws` CLI for images in ECR. `crane` needs no daemon and suits CI better.
 - `mvn-rebundle-consumer`: Python 3.8+; JDK and Maven when a consumer project is analysed.
 - `mvn-rebundle-verify`: Python 3.8+; `docker` or `crane` for image inputs.
-- Jenkins plugins: Pipeline, Git, Credentials Binding, Copy Artifact (consumer job, unless explicit coordinates are used).
+- Jenkins plugins: Pipeline, Git, Credentials Binding, Copy Artifact (consumer job, unless explicit coordinates are used), CloudBees AWS Credentials (only when `AWS_CREDENTIALS_ID` is set).
 
 ## Creating the Jenkins jobs
 
@@ -50,6 +50,10 @@ The three jobs are independent. The consumer job takes the bundle either from an
    | `NEXUS_RELEASE_URL` / `NEXUS_SNAPSHOT_URL` | Hosted repositories |
    | `NEXUS_CREDENTIALS_ID` | ID of a username/password credential in Jenkins; empty means anonymous (no publishing) |
    | `MAVEN_MIRROR_URL` | Company Maven group repository; empty resolves from Maven Central |
+   | `NEXUS_MAVEN_REPO_URL` | Repository that Maven coordinates are resolved in, usually the group repository |
+   | `NEXUS_DOCKER_REGISTRY` | Host of the Nexus Docker registry; images from it log in with `SOURCE_CREDENTIALS_ID` |
+   | `SOURCE_CREDENTIALS_ID` | Username/password credential used to read images, URLs and coordinates hosted on Nexus; may be the same as `NEXUS_CREDENTIALS_ID` |
+   | `AWS_CREDENTIALS_ID` | AWS credential for images in ECR (CloudBees AWS Credentials plugin); empty uses the agent's instance role |
    | `GIT_CREDENTIALS_ID` | Consumer job only, optional: credential for checking out the consumer project |
 
 4. The first run of each job only registers its parameters with Jenkins and fails or runs empty; that is expected. Use "Build with Parameters" afterwards.
@@ -59,10 +63,9 @@ The three jobs are independent. The consumer job takes the bundle either from an
 
 | Parameter | Meaning |
 |---|---|
-| `SOURCE_TYPE` | `image` or `jar` |
-| `SOURCE_REF` | Image reference, or an http(s) URL / agent-local path of the jar |
-| `APP_PATH` | Path of the application inside the image. A file for a fat jar; a directory for exploded layouts (`/workspace` for buildpacks images, `/app` for Jib images) |
-| `IMAGE_PLATFORM` / `IMAGE_TOOL` | Platform of a multi-arch image; extraction tool auto/docker/crane |
+| `SOURCE_REF` | Where the application comes from: an image reference, Maven coordinates, an http(s) URL or a path on the agent. The kind of source and the login it needs are detected from the reference, see below |
+| `APP_PATH` | Images only: path of the application inside the image. A file for a fat jar; a directory for exploded layouts (`/workspace` for buildpacks images, `/app` for Jib images) |
+| `IMAGE_PLATFORM` / `IMAGE_TOOL` | Images only: platform of a multi-arch image; tool used to log in and read the image, auto/docker/crane |
 | `INVENTORY_ONLY` | Stop after the inventory. Use it first to see which jars and coordinates the artifact contains |
 | `SELECT` | Dependencies to merge, one per line: `artifactId`, `groupId:artifactId` or `groupId:artifactId:version` |
 | `OUT_GROUP_ID` / `OUT_ARTIFACT_ID` / `OUT_VERSION` | Bundle coordinates. A `-SNAPSHOT` version goes to the snapshot repository |
@@ -70,7 +73,20 @@ The three jobs are independent. The consumer job takes the bundle either from an
 | `CREATE_SOURCES_JAR` | Also build a `-sources.jar` so IDEs show the sources of the merged libraries |
 | `PUBLISH` | `false` builds and verifies only; `true` uploads the verified jar, its dependency-reduced POM and the sources jar with `deploy-file` |
 
-Suggested first runs: `INVENTORY_ONLY=true` against any Spring Boot fat jar (`SOURCE_TYPE=jar`), then `SELECT=commons-io` with `PUBLISH=false`. Switch to an image source and enable publishing once that works.
+### Source detection
+
+| `SOURCE_REF` looks like | Treated as | Login |
+|---|---|---|
+| `http://...` or `https://...` | Download of the jar/war | Basic auth with `SOURCE_CREDENTIALS_ID` when the host is one of the Nexus hosts (`NEXUS_DOCKER_REGISTRY`, `NEXUS_MAVEN_REPO_URL`, the publish URLs); anonymous otherwise |
+| An existing path on the agent | A jar/war file, or an exploded / Jib directory | None |
+| `groupId:artifactId:version`, optionally `:packaging[:classifier]` (`com.example:app:1.2.3:war`, `com.example:app:1.2.3:jar:exec`) | Maven coordinates resolved in `NEXUS_MAVEN_REPO_URL`; SNAPSHOT versions through `maven-metadata.xml` | Basic auth with `SOURCE_CREDENTIALS_ID` |
+| `<account>.dkr.ecr.<region>.amazonaws.com/...` or `public.ecr.aws/...` | Image in AWS ECR | `aws ecr get-login-password` for the region in the host, then `docker login` / `crane auth login`; AWS credentials from `AWS_CREDENTIALS_ID` or the agent's instance role |
+| Image reference on `NEXUS_DOCKER_REGISTRY` | Image in the Nexus Docker registry | `docker login` / `crane auth login` with `SOURCE_CREDENTIALS_ID` |
+| Any other image reference | Image in a registry the agent is already logged in to | None |
+
+The job runs `extract_source.py --detect` first and binds only the credentials that the detected source needs. The verify job detects its old and new artifacts the same way, so two Nexus coordinates or two ECR tags can be compared directly.
+
+Suggested first runs: `INVENTORY_ONLY=true` with `SOURCE_REF` pointing at any Spring Boot fat jar on the agent, then `SELECT=commons-io` with `PUBLISH=false`. Switch to an image or Nexus source and enable publishing once that works.
 
 ## `mvn-rebundle-consumer` parameters
 
@@ -84,11 +100,11 @@ Without `CONSUMER_GIT_URL` the proposal still contains the bundle dependency sni
 
 ## `mvn-rebundle-verify` parameters
 
-`OLD_*` and `NEW_*` describe the artifacts built before and after the change (each `image` or `jar`, with the path inside the image), plus `IMAGE_PLATFORM`, `IMAGE_TOOL` and an optional `BUNDLE_ARTIFACT_ID` to pin which jar is the bundle.
+`OLD_SOURCE_REF` / `NEW_SOURCE_REF` are the artifacts built before and after the change, detected like `SOURCE_REF` above, with `OLD_APP_PATH` / `NEW_APP_PATH` for images, plus `IMAGE_PLATFORM`, `IMAGE_TOOL` and an optional `BUNDLE_ARTIFACT_ID` to pin which jar is the bundle. Its `environment` block carries the same Nexus and AWS settings as the main job.
 
 ## What the `mvn-rebundle` stages do
 
-1. **Fetch source**: images are read with `docker create` + `docker cp` (the container is never started) or streamed with `crane export`, extracting only the requested path; jars are downloaded. The image digest and the artifact SHA-256 are recorded.
+1. **Fetch source**: detects the kind of reference and logs in when needed (ECR: `aws ecr get-login-password` for the registry's region; Nexus Docker registry: the Nexus credential), then reads images with `docker create` + `docker cp` (the container is never started) or streams them with `crane export`, extracting only the requested path. Maven coordinates are downloaded from the repository layout with SNAPSHOT versions resolved through `maven-metadata.xml`; URLs are downloaded. The image digest, the Maven coordinates and the artifact SHA-256 are recorded.
 2. **Inspect application**: detects the layout (fat jar, war, exploded directory, Jib libs directory) and lists every dependency jar with its coordinates (from the jar's own pom.properties), SHA-256, signatures, module-info, Multi-Release, SPI files, Spring metadata, native libraries and nested jars. Jars whose coordinates cannot be identified are listed; select them explicitly as `g:a:v`. With `INVENTORY_ONLY` the job stops here.
 3. **Resolve selection & policy**: resolves the selection to unique jars and applies `policy.json`. Two jars holding the same class path with different bytes cannot be merged; that is a hard error. Counts which SPI / Spring resources occur in several jars to decide which transformers are needed.
 4. **Generate bundle project**: writes a standalone Maven project to `work/bundle/`. Dependencies are pinned to the versions found in the artifact; `artifactSet` includes only the selected coordinates; signatures, `INDEX.LIST` and `module-info` are excluded; LICENSE/NOTICE files move to `META-INF/third-party/<artifact>-<version>/`; SPI files use ServicesResourceTransformer, AutoConfiguration.imports and friends use AppendingTransformer, and `spring.factories` present in several jars uses Spring Boot's PropertiesMergingResourceTransformer (version taken from the artifact's Boot). The manifest carries `X-Dependency-Bundle-Contents`, which the verify job reads; `project.build.outputTimestamp` is fixed so the build is reproducible.
@@ -125,7 +141,7 @@ Finally run the existing tests, rebuild the image and smoke-test it.
 ./run-local.sh verify --old /path/old-app.jar --new /path/new-app.jar
 ```
 
-Image input: `--type image --ref registry.example.com/team/app:1.2.3 --path /app/app.jar`. `--inventory-only` stops after the inventory. On a machine without Maven add `--skip-maven` to stop after project generation. Publishing needs `export NEXUS_USERNAME NEXUS_PASSWORD` plus `--release-url`, `--snapshot-url` and `--publish`. The consumer mode reads `out/bundle-manifest.json` from a previous bundle run, or takes `--bundle g:a:v --embedded "g:a:v,g:a:v"`.
+`--ref` takes the same forms as `SOURCE_REF` and is detected the same way: image references (`--path` selects the application inside the image), Maven coordinates (`--maven-repo-url URL`), URLs or local paths. Pass `--nexus-hosts host1,host2` so that references on Nexus use the exported `SOURCE_USERNAME` / `SOURCE_PASSWORD`; images in ECR use the AWS credentials of the environment or the instance role. `--type` overrides the detection. `--inventory-only` stops after the inventory. On a machine without Maven add `--skip-maven` to stop after project generation. Publishing needs `export NEXUS_USERNAME NEXUS_PASSWORD` plus `--release-url`, `--snapshot-url` and `--publish`. The consumer mode reads `out/bundle-manifest.json` from a previous bundle run, or takes `--bundle g:a:v --embedded "g:a:v,g:a:v"`.
 
 Self-test (no Maven needed; the Shade output is simulated from synthetic fixtures):
 

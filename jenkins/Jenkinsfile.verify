@@ -2,8 +2,44 @@
 // Proves that every class and resource on the dependency classpath is byte-identical: only the replaced
 // jars disappear, the bundle appears, and the application's own classes are unchanged.
 //
-// Both inputs may be images or jars. Agent requirements: Python 3.8+; docker or crane for image sources.
+// Each input is a reference like SOURCE_REF of the main job: an image reference (ECR, the Nexus Docker
+// registry or any registry the agent is logged in to), Maven coordinates resolved in NEXUS_MAVEN_REPO_URL,
+// an http(s) URL or a path on the agent. The kind and the login it needs are detected from the reference.
+// Agent requirements: Python 3.8+; docker or crane for images; the aws CLI for images in ECR.
 // Job setup: "Pipeline script from SCM", Script Path = jenkins/Jenkinsfile.verify.
+
+// Credentials needed to read a source artifact; `auth` is what `extract_source.py --detect` printed.
+def withSourceCredentials(String auth, Closure body) {
+    if (auth == 'ecr' && env.AWS_CREDENTIALS_ID?.trim()) {
+        withCredentials([aws(credentialsId: env.AWS_CREDENTIALS_ID,
+                             accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+            body()
+        }
+    } else if (auth == 'nexus' && env.SOURCE_CREDENTIALS_ID?.trim()) {
+        withCredentials([usernamePassword(credentialsId: env.SOURCE_CREDENTIALS_ID,
+                                          usernameVariable: 'SOURCE_USERNAME', passwordVariable: 'SOURCE_PASSWORD')]) {
+            body()
+        }
+    } else {
+        body()
+    }
+}
+
+// Detects one reference, binds the credentials it needs and extracts it to work/<label>.
+def fetchSource(String label, String ref, String appPath) {
+    def detected = sh(returnStdout: true,
+                      script: "\"\$PY\" scripts/extract_source.py --detect --ref '${ref}' --nexus-hosts \"\$NEXUS_HOSTS\"").trim()
+    echo "${label} source detected: ${detected}"
+    withSourceCredentials(detected.tokenize()[1]) {
+        withEnv(["FETCH_REF=${ref}", "FETCH_PATH=${appPath}", "FETCH_LABEL=${label}"]) {
+            sh '''
+                "$PY" scripts/extract_source.py --ref "$FETCH_REF" --path "$FETCH_PATH" --nexus-hosts "$NEXUS_HOSTS" \
+                    --image-tool "$IMAGE_TOOL" --platform "$IMAGE_PLATFORM" --maven-repo-url "$NEXUS_MAVEN_REPO_URL" \
+                    --out "work/$FETCH_LABEL" --meta "out/$FETCH_LABEL-source.json"
+            '''
+        }
+    }
+}
 
 pipeline {
     agent any
@@ -14,18 +50,23 @@ pipeline {
     }
 
     parameters {
-        choice(name: 'OLD_SOURCE_TYPE', choices: ['image', 'jar'], description: 'Type of the artifact built before the change')
-        string(name: 'OLD_SOURCE_REF', defaultValue: '', description: 'Image reference or jar location of the old build')
-        string(name: 'OLD_APP_PATH', defaultValue: '/app/app.jar', description: 'Application path inside the old image')
-        choice(name: 'NEW_SOURCE_TYPE', choices: ['image', 'jar'], description: 'Type of the artifact built after the change')
-        string(name: 'NEW_SOURCE_REF', defaultValue: '', description: 'Image reference or jar location of the new build')
-        string(name: 'NEW_APP_PATH', defaultValue: '/app/app.jar', description: 'Application path inside the new image')
-        string(name: 'IMAGE_PLATFORM', defaultValue: '', description: 'Image platform, e.g. linux/amd64; empty uses the default')
-        choice(name: 'IMAGE_TOOL', choices: ['auto', 'docker', 'crane'], description: 'Tool used to read the images')
+        string(name: 'OLD_SOURCE_REF', defaultValue: '', description: 'Artifact built before the change: image reference, Maven coordinates, URL or agent path')
+        string(name: 'OLD_APP_PATH', defaultValue: '/app/app.jar', description: 'Images only: application path inside the old image')
+        string(name: 'NEW_SOURCE_REF', defaultValue: '', description: 'Artifact built after the change: image reference, Maven coordinates, URL or agent path')
+        string(name: 'NEW_APP_PATH', defaultValue: '/app/app.jar', description: 'Images only: application path inside the new image')
+        string(name: 'IMAGE_PLATFORM', defaultValue: '', description: 'Images only: platform, e.g. linux/amd64; empty uses the default')
+        choice(name: 'IMAGE_TOOL', choices: ['auto', 'docker', 'crane'], description: 'Images only: tool used to log in and read the images')
         string(name: 'BUNDLE_ARTIFACT_ID', defaultValue: '', description: 'Optional: restrict bundle detection to this artifactId (default: detected from the manifest)')
     }
 
     environment {
+        // ---- site specific: edit once -------------------------------------------------------
+        NEXUS_MAVEN_REPO_URL  = 'https://nexus.example.com/repository/maven-public/'   // Maven coordinates are resolved here
+        NEXUS_DOCKER_REGISTRY = 'nexus-docker.example.com'   // host[:port] of the Nexus Docker registry
+        SOURCE_CREDENTIALS_ID = 'nexus-deploy'  // Nexus credential for reading images, URLs and coordinates hosted on Nexus
+        AWS_CREDENTIALS_ID    = ''              // images in ECR: AWS credential ID (CloudBees AWS Credentials plugin); empty = the agent's instance role
+        // -----------------------------------------------------------------------------------
+        NEXUS_HOSTS = "${NEXUS_DOCKER_REGISTRY},${NEXUS_MAVEN_REPO_URL}"
         PY = 'python3'
     }
 
@@ -38,19 +79,13 @@ pipeline {
 
         stage('Fetch old build') {
             steps {
-                sh '''
-                    "$PY" scripts/extract_source.py --type "$OLD_SOURCE_TYPE" --ref "$OLD_SOURCE_REF" --path "$OLD_APP_PATH" \
-                        --image-tool "$IMAGE_TOOL" --platform "$IMAGE_PLATFORM" --out work/old --meta out/old-source.json
-                '''
+                script { fetchSource('old', params.OLD_SOURCE_REF, params.OLD_APP_PATH) }
             }
         }
 
         stage('Fetch new build') {
             steps {
-                sh '''
-                    "$PY" scripts/extract_source.py --type "$NEW_SOURCE_TYPE" --ref "$NEW_SOURCE_REF" --path "$NEW_APP_PATH" \
-                        --image-tool "$IMAGE_TOOL" --platform "$IMAGE_PLATFORM" --out work/new --meta out/new-source.json
-                '''
+                script { fetchSource('new', params.NEW_SOURCE_REF, params.NEW_APP_PATH) }
             }
         }
 
