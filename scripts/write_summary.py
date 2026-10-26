@@ -56,9 +56,9 @@ def main() -> None:
             md.append("- Unidentified coordinates: %s" % ", ".join(unknown))
         md.append("")
     if selection:
-        md += ["## Selection and policy (%s mode)" % selection["policy_mode"], ""]
+        md += ["## Selection", ""]
         for d in selection["selected"]:
-            md.append("- `%s` from %s" % (gav_str(d["gav"]), d["name"]))
+            md.append("- `%s` from %s (%s)" % (gav_str(d["gav"]) if d.get("gav") else "?", d["name"], (d.get("reasons") or ["selected"])[0]))
         md.append("")
         if selection["findings"]:
             md += ["| Level | Code | Message |", "|---|---|---|"]

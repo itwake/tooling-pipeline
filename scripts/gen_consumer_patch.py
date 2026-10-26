@@ -1,25 +1,44 @@
 #!/usr/bin/env python3
 """Stage 7: proposal for the consumer project's POM change (never applied automatically).
 
+The bundle is described by one of
+  --manifest    bundle-manifest.json of an mvn-rebundle build (default)
+  --bundle-jar  a bundle jar, for example downloaded from Nexus (its manifest lists the contents)
+  --bundle g:a:v --embedded "g:a:v,..."   coordinates typed by hand
+
 With one or more `mvn dependency:tree -Dverbose -DoutputType=text` outputs of the consumer
 project the proposal is exact: which direct dependencies to delete and which direct
 dependencies need an <exclusion> because they transitively bring an embedded coordinate.
 Without a tree it explains how to produce one and gives the generic snippets.
 
 The Enforcer rule in the proposal is the real gate: the consumer build fails whenever an
-embedded coordinate sneaks back through any path, so incomplete exclusions cannot go
-unnoticed.
+embedded coordinate sneaks back through any path, and, when Spring Boot itself is not inside
+the bundle, whenever the consumer leaves the Boot minor line the bundle was built from.
 """
 from __future__ import annotations
 
 import argparse
 import sys
 import xml.etree.ElementTree as ET
+import zipfile
 from collections import OrderedDict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bundlelib import fail, ga_str, gav_str, log, parse_dependency_trees, parse_selection_text, read_json, write_json  # noqa: E402
+from bundlelib import (  # noqa: E402
+    BUNDLE_BOOT_ATTR,
+    BUNDLE_CONTENTS_ATTR,
+    fail,
+    ga_str,
+    gav_str,
+    identify_gav,
+    log,
+    parse_dependency_trees,
+    parse_selection_text,
+    read_json,
+    read_manifest,
+    write_json,
+)
 
 ENFORCER = """<plugin>
   <groupId>org.apache.maven.plugins</groupId>
@@ -37,7 +56,7 @@ ENFORCER = """<plugin>
             <excludes>
 %s
             </excludes>
-            <message>These coordinates are embedded in %s. Add an exclusion on the dependency that reintroduces them (mvn dependency:tree -Dverbose -Dincludes=%s).</message>
+            <message>%s</message>
           </bannedDependencies>
         </rules>
       </configuration>
@@ -64,6 +83,50 @@ def reduced_pom_dependencies(path: Path):
     return deps
 
 
+def parse_coordinates(text: str):
+    components = []
+    for tok in parse_selection_text(text):
+        p = tok.split(":")
+        if len(p) < 3:
+            fail("coordinate '%s' must be groupId:artifactId:version" % tok)
+        gav = {"groupId": p[0], "artifactId": p[1], "version": p[2]}
+        if len(p) > 3 and p[3]:
+            gav["classifier"] = p[3]
+        components.append({"gav": gav})
+    return components
+
+
+def manifest_from_jar(path: str) -> dict:
+    with zipfile.ZipFile(path) as zf:
+        attrs = read_manifest(zf)
+        gav, _, _ = identify_gav(zf, Path(path).name)
+    contents = attrs.get(BUNDLE_CONTENTS_ATTR, "")
+    if not gav or not contents:
+        fail("%s is not an mvn-rebundle bundle (needs its own pom.properties and the %s manifest attribute)" % (path, BUNDLE_CONTENTS_ATTR))
+    return {"bundle": gav, "coordinate": gav_str(gav), "components": parse_coordinates(contents.replace(",", "\n")),
+            "reduced_pom": "", "spring_boot_version": attrs.get(BUNDLE_BOOT_ATTR)}
+
+
+def manifest_from_coordinates(bundle: str, embedded_text: str) -> dict:
+    parts = bundle.split(":")
+    if len(parts) != 3:
+        fail("--bundle must be groupId:artifactId:version")
+    components = parse_coordinates(embedded_text)
+    if not components:
+        fail("--embedded (or --embedded-file) is required with --bundle")
+    return {"bundle": {"groupId": parts[0], "artifactId": parts[1], "version": parts[2]}, "coordinate": bundle,
+            "components": components, "reduced_pom": "", "spring_boot_version": None}
+
+
+def boot_line_excludes(boot_version: str):
+    parts = boot_version.split(".")
+    if len(parts) < 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+        return []
+    major, minor = int(parts[0]), int(parts[1])
+    return ["org.springframework.boot:spring-boot:(,%d.%d)" % (major, minor),
+            "org.springframework.boot:spring-boot:[%d.%d,)" % (major, minor + 1)]
+
+
 def analyse_trees(texts, embedded_ga):
     modules = []
     for text in texts:
@@ -83,11 +146,10 @@ def analyse_trees(texts, embedded_ga):
                     entry = module["exclusions"].setdefault(direct, {"version": None, "targets": []})
                     if ga not in entry["targets"]:
                         entry["targets"].append(ga)
-            # version of the direct dependencies that need exclusions
             for node in tree["nodes"]:
                 if node["depth"] == 1 and ga_str(node) in module["exclusions"]:
                     module["exclusions"][ga_str(node)]["version"] = node.get("version")
-            modules.append(module)  # untouched modules are kept so the report shows them
+            modules.append(module)
     return modules
 
 
@@ -117,6 +179,7 @@ def exclusion_snippet(direct_ga: str, targets, version) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manifest", default="out/bundle-manifest.json", help="bundle manifest written by gen_bundle_project.py")
+    ap.add_argument("--bundle-jar", default="", help="instead of --manifest: a bundle jar (its manifest lists the contents)")
     ap.add_argument("--bundle", default="", help="instead of --manifest: groupId:artifactId:version of an existing bundle")
     ap.add_argument("--embedded", default="", help="with --bundle: embedded coordinates g:a:v, comma or newline separated")
     ap.add_argument("--embedded-file", default="", help="with --bundle: file holding the embedded coordinates")
@@ -126,34 +189,25 @@ def main() -> None:
     ap.add_argument("--out-json", default="out/consumer-patch.json")
     args = ap.parse_args()
 
-    if args.bundle:
-        parts = args.bundle.split(":")
-        if len(parts) != 3:
-            fail("--bundle must be groupId:artifactId:version")
+    if args.bundle_jar:
+        man = manifest_from_jar(args.bundle_jar)
+    elif args.bundle:
         text = args.embedded or ""
         if args.embedded_file:
             text += "\n" + Path(args.embedded_file).read_text(encoding="utf-8")
-        components = []
-        for tok in parse_selection_text(text):
-            p = tok.split(":")
-            if len(p) < 3:
-                fail("embedded coordinate '%s' must be groupId:artifactId:version" % tok)
-            gav = {"groupId": p[0], "artifactId": p[1], "version": p[2]}
-            if len(p) > 3 and p[3]:
-                gav["classifier"] = p[3]
-            components.append({"gav": gav})
-        if not components:
-            fail("--embedded (or --embedded-file) is required with --bundle")
-        man = {"bundle": {"groupId": parts[0], "artifactId": parts[1], "version": parts[2]},
-               "coordinate": args.bundle, "components": components, "reduced_pom": ""}
+        man = manifest_from_coordinates(args.bundle, text)
     else:
         man = read_json(args.manifest)
+
     bundle = man["bundle"]
     coord = man["coordinate"]
     embedded = [c["gav"] for c in man["components"]]
     embedded_ga = {ga_str(g) for g in embedded}
-    reduced_pom = Path(args.reduced_pom or man.get("reduced_pom", ""))
-    promoted = [d for d in reduced_pom_dependencies(reduced_pom) if "%s:%s" % (d.get("groupId"), d.get("artifactId")) not in embedded_ga] if reduced_pom.is_file() else []
+    boot_version = man.get("spring_boot_version")
+    boot_embedded = "org.springframework.boot:spring-boot" in embedded_ga
+    boot_excludes = boot_line_excludes(boot_version) if boot_version and not boot_embedded else []
+    reduced_pom = Path(args.reduced_pom or man.get("reduced_pom") or "")
+    promoted = [d for d in reduced_pom_dependencies(reduced_pom) if "%s:%s" % (d.get("groupId"), d.get("artifactId")) not in embedded_ga] if str(reduced_pom) and reduced_pom.is_file() else []
 
     texts = []
     for t in args.tree:
@@ -211,20 +265,34 @@ def main() -> None:
         md.append("")
         md.append("```bash\nmvn -B org.apache.maven.plugins:maven-dependency-plugin:3.7.1:tree -Dverbose -DoutputType=text -DoutputFile=\"$PWD/dependency-tree.txt\" -DappendOutput=true\n```")
         md.append("")
-        md.append("Then regenerate this proposal:")
-        md.append("")
-        md.append("```bash\npython3 scripts/gen_consumer_patch.py --manifest out/bundle-manifest.json --tree dependency-tree.txt\n```")
-        md.append("")
-        md.append("Or inspect every path that brings an original coordinate by hand:")
+        md.append("Then regenerate this proposal with `--tree dependency-tree.txt`, or inspect every path that brings an original coordinate by hand:")
         md.append("")
         md.append("```bash\nmvn dependency:tree -Dverbose -Dincludes=%s\n```" % includes_arg)
         md.append("")
 
+    excludes = ["              <exclude>%s</exclude>" % ga for ga in sorted(embedded_ga)]
+    if boot_excludes:
+        excludes.append("              <!-- the bundle was built from Spring Boot %s: stay on that minor line or rebuild the bundle -->" % boot_version)
+        excludes += ["              <exclude>%s</exclude>" % e for e in boot_excludes]
+    message = "These coordinates are embedded in %s. Add an exclusion on the dependency that reintroduces them (mvn dependency:tree -Dverbose -Dincludes=%s)." % (coord, includes_arg)
+    if boot_excludes:
+        message += " Spring Boot outside the %s.x line needs a rebuilt bundle." % ".".join(boot_version.split(".")[:2])
     md.append("## 3. Enforcer gate (put it in the parent POM's build/plugins so every module inherits it)")
     md.append("")
-    md.append("```xml\n%s\n```" % (ENFORCER % ("\n".join("              <exclude>%s</exclude>" % ga for ga in sorted(embedded_ga)), coord, includes_arg)))
+    md.append("```xml\n%s\n```" % (ENFORCER % ("\n".join(excludes), message)))
     md.append("")
-    md.append("## 4. Transitive dependencies the bundle POM still declares")
+
+    md.append("## 4. Spring Boot version")
+    md.append("")
+    if boot_embedded:
+        md.append("Spring Boot %s itself is inside the bundle. Set the `<version>` of `spring-boot-maven-plugin` to `%s` so the launcher matches the embedded runtime, and remove the Boot starters from the POM; the Enforcer rule bans their coordinates anyway." % (boot_version or "(version unknown)", boot_version or "the embedded version"))
+    elif boot_version:
+        md.append("The bundle was built from a Spring Boot %s application. The Enforcer rule above keeps the consumer on the %s.x line; moving to another line means rebuilding the bundle first, because the embedded libraries are frozen at the versions that line manages." % (boot_version, ".".join(boot_version.split(".")[:2])))
+    else:
+        md.append("The Spring Boot version of the source application is unknown; rebuild the bundle whenever the consumer upgrades Spring Boot.")
+    md.append("")
+
+    md.append("## 5. Transitive dependencies the bundle POM still declares")
     md.append("")
     if promoted:
         md.append("These are not embedded; consumers keep getting them transitively through the bundle. Their versions follow the consumer's dependencyManagement (for example the Spring Boot BOM):")
@@ -232,12 +300,12 @@ def main() -> None:
         for d in promoted:
             md.append("- `%s:%s:%s`%s" % (d.get("groupId"), d.get("artifactId"), d.get("version"), (" (scope %s)" % d["scope"]) if d.get("scope") else ""))
     else:
-        md.append("None (or the bundle was not built yet and the dependency-reduced POM does not exist).")
+        md.append("None (or the dependency-reduced POM was not available).")
     md.append("")
-    md.append("## 5. Verification")
+    md.append("## 6. Verification")
     md.append("")
     md.append("1. Consumer `mvn -B clean verify`: a passing Enforcer check means no path brings the original coordinates back.")
-    md.append("2. Run Jenkinsfile.verify on the app.jar or image built before and after the change: every class and resource on the dependency classpath must be byte-identical, with only the replaced jars gone and the bundle added.")
+    md.append("2. Run the verify job on the app.jar or image built before and after the change: every class and resource on the dependency classpath must be byte-identical, with only the replaced jars gone and the bundle added.")
     md.append("3. Run the existing tests, rebuild the image, smoke-test it.")
     md.append("")
 
@@ -247,6 +315,9 @@ def main() -> None:
         "bundle": bundle,
         "coordinate": coord,
         "embedded": embedded,
+        "spring_boot_version": boot_version,
+        "boot_embedded": boot_embedded,
+        "boot_line_excludes": boot_excludes,
         "modules": [{"module": m["module"], "remove_direct": m["remove_direct"], "exclusions": m["exclusions"], "paths": m["paths"]} for m in modules],
         "promoted_dependencies": promoted,
         "tree_provided": bool(texts),

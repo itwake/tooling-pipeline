@@ -50,11 +50,14 @@ APPEND_RESOURCES = [
 PROPERTIES_MERGE_RESOURCES = [
     "META-INF/spring.factories",
     "META-INF/spring/aot.factories",
+    "META-INF/spring.components",
+    "META-INF/spring-devtools.properties",
 ]
 NATIVE_SUFFIXES = (".so", ".dll", ".dylib", ".jnilib")
 THIRD_PARTY_DIR = "META-INF/third-party/"
 BUNDLE_CONTENTS_ATTR = "X-Dependency-Bundle-Contents"
 BUNDLE_SOURCE_ATTR = "X-Dependency-Bundle-Source"
+BUNDLE_BOOT_ATTR = "X-Dependency-Bundle-Spring-Boot"
 
 # --------------------------------------------------------------------------- small utils
 
@@ -76,6 +79,10 @@ def fail(msg: str, code: int = 2) -> "NoReturn":  # type: ignore[name-defined]
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def sha1_bytes(data: bytes) -> str:
+    return hashlib.sha1(data).hexdigest()
 
 
 def sha256_file(path: Path) -> str:
@@ -376,6 +383,47 @@ def identify_gav(zf: zipfile.ZipFile, filename: str) -> Tuple[Optional[dict], st
             }
         )
     return None, "unknown", candidates
+
+
+def declared_dependencies(zf: zipfile.ZipFile, gav: dict) -> List[dict]:
+    """Runtime dependencies declared in the jar's own embedded pom.xml (compile/runtime, not optional)."""
+    path = "META-INF/maven/%s/%s/pom.xml" % (gav.get("groupId"), gav.get("artifactId"))
+    try:
+        data = zf.read(path)
+    except KeyError:
+        return []
+    try:
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(data)
+    except Exception:  # noqa: BLE001
+        return []
+
+    def local(tag: str) -> str:
+        return tag.split("}", 1)[-1]
+
+    def child(el, name):
+        for c in el:
+            if local(c.tag) == name:
+                return c
+        return None
+
+    subst = {"${project.groupId}": gav.get("groupId"), "${pom.groupId}": gav.get("groupId"),
+             "${project.artifactId}": gav.get("artifactId"), "${pom.artifactId}": gav.get("artifactId")}
+    deps = child(root, "dependencies")
+    out: List[dict] = []
+    if deps is None:
+        return out
+    for dep in deps:
+        f = {local(c.tag): (c.text or "").strip() for c in dep}
+        g, a = f.get("groupId", ""), f.get("artifactId", "")
+        g, a = subst.get(g, g), subst.get(a, a)
+        if not g or not a or "${" in g or "${" in a:
+            continue
+        if f.get("scope", "compile") in ("test", "provided", "system") or f.get("optional", "").lower() == "true":
+            continue
+        out.append({"groupId": g, "artifactId": a, "scope": f.get("scope", "compile")})
+    return out
 
 
 def scan_jar(zf: zipfile.ZipFile) -> dict:

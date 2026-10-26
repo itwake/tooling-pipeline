@@ -21,6 +21,7 @@ from xml.sax.saxutils import escape
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bundlelib import (  # noqa: E402
     AppArtifact,
+    BUNDLE_BOOT_ATTR,
     BUNDLE_CONTENTS_ATTR,
     BUNDLE_SOURCE_ATTR,
     THIRD_PARTY_DIR,
@@ -126,6 +127,7 @@ POM_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 @@MULTI_RELEASE@@
                     <@@CONTENTS_ATTR@@>@@CONTENTS@@</@@CONTENTS_ATTR@@>
                     <@@SOURCE_ATTR@@>@@SOURCE_ATTR_VALUE@@</@@SOURCE_ATTR@@>
+@@BOOT_ATTR_LINE@@
                   </manifestEntries>
                 </transformer>
               </transformers>
@@ -255,6 +257,7 @@ def main() -> None:
         "@@CONTENTS_ATTR@@": BUNDLE_CONTENTS_ATTR,
         "@@SOURCE_ATTR@@": BUNDLE_SOURCE_ATTR,
         "@@SOURCE_ATTR_VALUE@@": escape(source_attr),
+        "@@BOOT_ATTR_LINE@@": ("                    <%s>%s</%s>" % (BUNDLE_BOOT_ATTR, escape(boot_version), BUNDLE_BOOT_ATTR)) if boot_version else "",
     }
     dist = ""
     if args.release_url or args.snapshot_url:

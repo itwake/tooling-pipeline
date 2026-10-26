@@ -9,7 +9,8 @@ The kind of source and the authentication it needs are detected from --ref alone
   groupId:artifactId:version    Maven coordinates, optionally :packaging[:classifier] (the
                                 dependency-plugin convention); resolved in --maven-repo-url,
                                 SNAPSHOT versions through maven-metadata.xml, basic auth as above
-  anything else                 an image reference; --path is copied out of the image. The registry
+  anything else                 an image reference; --path (or the part after '#' in the
+                                reference) is copied out of the image. The registry
                                 host decides the login: AWS ECR hosts run `aws ecr get-login-password`
                                 (AWS credentials from the environment or the instance role), hosts in
                                 --nexus-hosts log in with SOURCE_USERNAME / SOURCE_PASSWORD, other
@@ -106,6 +107,16 @@ def detect_source(ref: str, nexus_hosts: Set[str]) -> Tuple[str, str, Optional[s
     if host.lower() in nexus_hosts:
         return "image", "nexus", host
     return "image", "none", host
+
+
+def split_ref(ref: str) -> Tuple[str, Optional[str]]:
+    """'registry/app:tag#/path/in/image' -> ('registry/app:tag', '/path/in/image').
+
+    URLs and existing local paths are never split."""
+    if ref.startswith(("http://", "https://")) or "#" not in ref or Path(ref).exists():
+        return ref, None
+    base, path = ref.split("#", 1)
+    return base, (path or None)
 
 
 def resolve_type(explicit: str, ref: str, nexus_hosts: Set[str]) -> Tuple[str, str, Optional[str]]:
@@ -364,6 +375,9 @@ def main() -> None:
     ap.add_argument("--packaging", default="jar", help="Maven coordinates without a packaging: jar or war")
     args = ap.parse_args()
 
+    args.ref, path_override = split_ref(args.ref)
+    if path_override:
+        args.path = path_override
     nexus_hosts = parse_hosts(args.nexus_hosts) | parse_hosts(args.maven_repo_url)
     kind, auth, host = resolve_type(args.type, args.ref, nexus_hosts)
     if args.detect:

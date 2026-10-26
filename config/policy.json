@@ -1,33 +1,27 @@
 {
-  "_comment": "Merge policy. deny_* entries fail the build in strict mode and become warnings in warn mode; hard errors (unidentifiable coordinates, same class path with different bytes) fail in every mode.",
+  "_comment": "Nothing here refuses a selection. `families` are groupId prefixes whose modules must stay together: selecting one jar of a family pulls every jar of that family present in the application into the bundle. The only hard errors are unidentifiable coordinates and two jars holding the same class path with different bytes.",
 
-  "deny_groups": {
-    "org.springframework": "Spring Framework / Boot / Security modules must share one version managed by the Boot BOM; freezing one inside a bundle breaks that alignment",
-    "com.fasterxml.jackson": "Jackson modules must share one version and register through SPI",
-    "io.netty": "Netty modules must share one version and ship platform native libraries",
-    "io.micrometer": "Micrometer modules must share one version",
-    "org.apache.tomcat": "Embedded Tomcat modules must share one version",
-    "org.eclipse.jetty": "Jetty modules must share one version",
-    "org.apache.logging.log4j": "Log4j2 modules must share one version and carry custom component metadata",
-    "ch.qos.logback": "Logging providers must match the SLF4J API",
+  "families": {
+    "org.springframework": "Spring Framework, Boot, Security, Data: one release train",
+    "com.fasterxml.jackson": "Jackson core, databind, annotations and modules share one version",
+    "io.netty": "Netty modules share one version and ship platform native libraries",
+    "io.micrometer": "Micrometer modules share one version",
+    "org.apache.tomcat": "embedded Tomcat core, el and websocket share one version",
+    "org.eclipse.jetty": "Jetty modules share one version",
+    "org.apache.logging.log4j": "Log4j API, bridges and core share one version",
+    "ch.qos.logback": "Logback classic and core share one version",
     "org.slf4j": "SLF4J API, providers and bridges must match",
-    "org.jetbrains.kotlin": "Kotlin standard library modules must share one version",
-    "org.jetbrains.kotlinx": "Kotlin coroutines / serialization modules must share one version",
-    "io.projectreactor": "Reactor modules must share one version",
-    "org.hibernate": "Hibernate modules must share one version",
-    "org.bouncycastle": "JCE providers must stay signed on Oracle JDKs",
-    "io.grpc": "gRPC modules must share one version",
-    "com.google.protobuf": "The protobuf runtime is coupled to the version of the generated code"
+    "org.jetbrains.kotlin": "Kotlin standard library modules share one version",
+    "org.jetbrains.kotlinx": "Kotlin coroutines / serialization modules share one version",
+    "io.projectreactor": "Reactor modules share one version",
+    "org.hibernate": "Hibernate modules share one version",
+    "org.bouncycastle": "BouncyCastle provider, pkix and util share one version",
+    "io.grpc": "gRPC modules share one version",
+    "com.google.protobuf": "protobuf runtime and generated code are version coupled",
+    "io.jsonwebtoken": "jjwt api, impl and jackson share one version"
   },
 
-  "deny_artifacts": {},
-
-  "warn_groups": {
-    "jakarta": "Jakarta API jars are usually managed by the Boot BOM and will no longer follow Boot upgrades once merged",
-    "javax": "javax API jars are usually managed by the Boot BOM and will no longer follow Boot upgrades once merged"
-  },
-
-  "refuse_signed_jars": true,
+  "signed_jar_note": "its signature is stripped by the merge. A JCE provider such as BouncyCastle then loads on OpenJDK builds (Temurin, Corretto, Zulu) but is rejected by Oracle JDK",
   "warn_native_libs": true,
   "warn_nested_jars": true,
 

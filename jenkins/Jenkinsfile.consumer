@@ -1,13 +1,12 @@
 // mvn-rebundle / consumer: propose the POM change of a project that will consume a bundle.
 //
-// The bundle comes either from an mvn-rebundle build (its archived bundle-manifest.json and
-// dependency-reduced POM are copied with the Copy Artifact plugin) or from explicit coordinates
-// (BUNDLE_COORDINATES + EMBEDDED_COORDINATES) for a bundle that already exists in Nexus.
-// With CONSUMER_GIT_URL the consumer project is checked out and `dependency:tree -Dverbose` runs
-// there, so the proposal lists the exclusions per module and per path. Without it the proposal
-// contains the generic snippets and the commands to produce the tree.
+// The bundle comes from an mvn-rebundle build (its archived bundle-manifest.json and dependency-reduced
+// POM are copied with the Copy Artifact plugin) or, with BUNDLE_COORDINATES, from Nexus (the bundle jar
+// and its POM are downloaded; the jar's manifest lists what it embeds). With CONSUMER_GIT_URL the
+// consumer project is checked out and `dependency:tree -Dverbose` runs there, so the proposal lists the
+// exclusions per module and per path; without it the proposal holds the generic snippets.
 //
-// Agent requirements (Linux): Python 3.8+; Maven 3.6+ and JDK when CONSUMER_GIT_URL is used.
+// Agent requirements (Linux): Python 3.8+; Maven 3.6+ and a JDK when CONSUMER_GIT_URL is used.
 // Plugins: Copy Artifact (unless BUNDLE_COORDINATES is used), Git, Credentials Binding.
 // The upstream job may need "Permission to Copy Artifact" granted to this job.
 // Job setup: "Pipeline script from SCM", Script Path = jenkins/Jenkinsfile.consumer.
@@ -24,6 +23,17 @@ def withNexusCredentials(Closure body) {
     }
 }
 
+def withSourceCredentials(Closure body) {
+    if (env.SOURCE_CREDENTIALS_ID?.trim()) {
+        withCredentials([usernamePassword(credentialsId: env.SOURCE_CREDENTIALS_ID,
+                                          usernameVariable: 'SOURCE_USERNAME', passwordVariable: 'SOURCE_PASSWORD')]) {
+            body()
+        }
+    } else {
+        body()
+    }
+}
+
 pipeline {
     agent any
 
@@ -33,12 +43,9 @@ pipeline {
     }
 
     parameters {
-        string(name: 'UPSTREAM_JOB', defaultValue: 'mvn-rebundle', description: 'Name of the mvn-rebundle build job to take the bundle from')
-        string(name: 'UPSTREAM_BUILD', defaultValue: '', description: 'Build number of that job; empty = last successful build')
+        string(name: 'UPSTREAM_BUILD', defaultValue: '', description: 'Build number of the UPSTREAM_JOB run to take the bundle from; empty = last successful build')
         string(name: 'BUNDLE_COORDINATES', defaultValue: '',
-               description: 'Alternative to the upstream build: groupId:artifactId:version of an existing bundle')
-        text(name: 'EMBEDDED_COORDINATES', defaultValue: '',
-             description: 'With BUNDLE_COORDINATES: the coordinates embedded in that bundle, one groupId:artifactId:version per line')
+               description: 'Alternative to the upstream build: groupId:artifactId:version of a bundle already published to Nexus')
         string(name: 'CONSUMER_GIT_URL', defaultValue: '', description: 'Optional: git URL of the consumer project; enables the per-path exclusion list')
         string(name: 'CONSUMER_GIT_REF', defaultValue: 'main', description: 'Consumer branch, tag or commit')
         string(name: 'CONSUMER_MAVEN_ARGS', defaultValue: '', description: 'Extra arguments for the consumer dependency:tree run, e.g. -Pprod')
@@ -46,10 +53,14 @@ pipeline {
 
     environment {
         // ---- site specific: edit once -------------------------------------------------------
-        NEXUS_CREDENTIALS_ID = ''               // only needed when MAVEN_MIRROR_URL requires authentication
-        MAVEN_MIRROR_URL     = ''               // company Maven group repository used for the consumer dependency:tree; empty = Maven Central
-        GIT_CREDENTIALS_ID   = ''               // optional: credential ID for checking out CONSUMER_GIT_URL
+        UPSTREAM_JOB          = 'mvn-rebundle'   // name of the build job whose archives hold bundle-manifest.json
+        NEXUS_MAVEN_REPO_URL  = 'https://nexus.example.com/repository/maven-public/'   // BUNDLE_COORDINATES are downloaded from here
+        SOURCE_CREDENTIALS_ID = 'nexus-deploy'   // Nexus credential for downloading the bundle
+        NEXUS_CREDENTIALS_ID  = ''               // only needed when MAVEN_MIRROR_URL requires authentication
+        MAVEN_MIRROR_URL      = ''               // Maven mirror for the consumer dependency:tree run; empty = Maven Central
+        GIT_CREDENTIALS_ID    = ''               // optional: credential ID for checking out CONSUMER_GIT_URL
         // -----------------------------------------------------------------------------------
+        NEXUS_HOSTS = "${NEXUS_MAVEN_REPO_URL}"
         PY = 'python3'
     }
 
@@ -57,7 +68,6 @@ pipeline {
         stage('Prepare') {
             steps {
                 sh 'rm -rf work out && mkdir -p work out && "$PY" --version'
-                writeFile file: 'work/embedded.txt', text: params.EMBEDDED_COORDINATES
                 sh '"$PY" scripts/gen_maven_settings.py --server-id nexus --mirror-url "$MAVEN_MIRROR_URL" --out work/settings.xml'
             }
         }
@@ -67,10 +77,26 @@ pipeline {
             steps {
                 script {
                     def selector = params.UPSTREAM_BUILD?.trim() ? specific(params.UPSTREAM_BUILD.trim()) : lastSuccessful()
-                    copyArtifacts(projectName: params.UPSTREAM_JOB, selector: selector, fingerprintArtifacts: true,
+                    copyArtifacts(projectName: env.UPSTREAM_JOB, selector: selector, fingerprintArtifacts: true,
                                   filter: 'out/bundle-manifest.json, work/bundle/target/dependency-reduced-pom.xml')
                 }
                 sh 'test -f out/bundle-manifest.json || { echo "bundle-manifest.json not found in the upstream build"; exit 1; }'
+            }
+        }
+
+        stage('Bundle from Nexus') {
+            when { expression { params.BUNDLE_COORDINATES?.trim() } }
+            steps {
+                script {
+                    withSourceCredentials {
+                        sh '''
+                            "$PY" scripts/extract_source.py --ref "$BUNDLE_COORDINATES" --nexus-hosts "$NEXUS_HOSTS" \
+                                --maven-repo-url "$NEXUS_MAVEN_REPO_URL" --out work/bundle-jar --meta out/bundle-jar-source.json
+                            "$PY" scripts/extract_source.py --ref "$BUNDLE_COORDINATES:pom" --nexus-hosts "$NEXUS_HOSTS" \
+                                --maven-repo-url "$NEXUS_MAVEN_REPO_URL" --out work/bundle-pom --meta out/bundle-pom-source.json
+                        '''
+                    }
+                }
             }
         }
 
@@ -102,7 +128,9 @@ pipeline {
                     ARGS=""
                     if [ -f out/consumer-dependency-tree.txt ]; then ARGS="--tree out/consumer-dependency-tree.txt"; fi
                     if [ -n "$BUNDLE_COORDINATES" ]; then
-                        "$PY" scripts/gen_consumer_patch.py --bundle "$BUNDLE_COORDINATES" --embedded-file work/embedded.txt $ARGS \
+                        JAR=$(ls work/bundle-jar/*.jar | head -1)
+                        POM=$(ls work/bundle-pom/*.pom | head -1)
+                        "$PY" scripts/gen_consumer_patch.py --bundle-jar "$JAR" --reduced-pom "$POM" $ARGS \
                             --out out/consumer-patch.md --out-json out/consumer-patch.json
                     else
                         "$PY" scripts/gen_consumer_patch.py --manifest out/bundle-manifest.json \
