@@ -679,9 +679,59 @@ def build_boot_consumer_project(target: Path, single: bool = False) -> Path:
     return target
 
 
-def build_consumer_project(target: Path, single: bool = False) -> Path:
+# Profiles for build_consumer_project(profiles=True): the root's `legacy` profile declares commons-io
+# again, app's `local` profile re-declares spring-boot-starter-web with an exclusion of its own and
+# commons-io at another version, and adds h2, which SAMPLE_TREE never shows.
+CONSUMER_ROOT_PROFILES = """
+    <profiles>
+        <profile>
+            <id>legacy</id>
+            <dependencies>
+                <dependency>
+                    <groupId>commons-io</groupId>
+                    <artifactId>commons-io</artifactId>
+                    <version>2.11.0</version>
+                </dependency>
+            </dependencies>
+        </profile>
+    </profiles>
+"""
+CONSUMER_APP_PROFILES = """
+    <profiles>
+        <profile>
+            <id>local</id>
+            <dependencies>
+                <dependency>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-web</artifactId>
+                    <exclusions>
+                        <exclusion>
+                            <groupId>org.springframework.boot</groupId>
+                            <artifactId>spring-boot-starter-json</artifactId>
+                        </exclusion>
+                    </exclusions>
+                </dependency>
+                <dependency>
+                    <groupId>commons-io</groupId>
+                    <artifactId>commons-io</artifactId>
+                    <version>2.15.0</version>
+                </dependency>
+                <dependency>
+                    <groupId>com.h2database</groupId>
+                    <artifactId>h2</artifactId>
+                    <version>2.2.224</version>
+                    <scope>runtime</scope>
+                </dependency>
+            </dependencies>
+        </profile>
+    </profiles>
+"""
+
+
+def build_consumer_project(target: Path, single: bool = False, profiles: bool = False) -> Path:
     """A consumer project matching SAMPLE_TREE: multi-module with comments and 4-space indentation,
-    or a single module with 2-space indentation and no build section."""
+    or a single module with 2-space indentation and no build section. profiles=True adds the
+    CONSUMER_ROOT_PROFILES and CONSUMER_APP_PROFILES blocks to the multi-module build."""
     if target.exists():
         import shutil
 
@@ -690,10 +740,12 @@ def build_consumer_project(target: Path, single: bool = False) -> Path:
         target.mkdir(parents=True)
         (target / "pom.xml").write_text(CONSUMER_SINGLE_POM, encoding="utf-8")
         return target
+    root_pom = CONSUMER_ROOT_POM.replace("</project>", CONSUMER_ROOT_PROFILES + "</project>") if profiles else CONSUMER_ROOT_POM
+    app_pom = CONSUMER_APP_POM.replace("</project>", CONSUMER_APP_PROFILES + "</project>") if profiles else CONSUMER_APP_POM
     (target / "app").mkdir(parents=True)
     (target / "app-batch").mkdir(parents=True)
-    (target / "pom.xml").write_text(CONSUMER_ROOT_POM, encoding="utf-8")
-    (target / "app" / "pom.xml").write_text(CONSUMER_APP_POM, encoding="utf-8")
+    (target / "pom.xml").write_text(root_pom, encoding="utf-8")
+    (target / "app" / "pom.xml").write_text(app_pom, encoding="utf-8")
     (target / "app-batch" / "pom.xml").write_text(CONSUMER_BATCH_POM, encoding="utf-8")
     return target
 

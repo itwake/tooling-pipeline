@@ -4,8 +4,11 @@
 Reads consumer-patch.json (written by gen_consumer_patch.py from the consumer's dependency tree)
 and edits the POMs in place, preserving their formatting and comments:
 
-  * deletes the direct dependencies that the bundle replaces,
-  * adds <exclusions> on the direct dependencies that transitively bring an embedded coordinate,
+  * deletes the direct dependencies that the bundle replaces, from the main <dependencies> and from
+    every profile that declares them (the Enforcer bans them whatever the active profiles),
+  * adds <exclusions> on the direct dependencies that transitively bring an embedded coordinate, on
+    each of their declarations (a profile that re-declares one replaces the main declaration,
+    exclusions included, while it is active),
   * adds the bundle dependency first in every changed module (version managed in the root POM of
     a multi-module build, explicit otherwise), with exclusions for the transitive dependencies of
     the bundle POM that the module must not take from the bundle,
@@ -15,8 +18,10 @@ and edits the POMs in place, preserving their formatting and comments:
     embedded Boot version wherever the changed modules declare or manage the plugin inside the
     checkout, so the launcher the plugin writes matches the runtime.
 
-Dependencies declared in a parent POM inside the checkout are edited there. Nothing is committed;
-the caller reviews the diff (--diff) and decides.
+Dependencies declared in a parent POM inside the checkout are edited there. Dependencies that
+profiles declare and that the dependency tree never showed (the profile was not active when it ran)
+are listed as warnings: nothing is known about what they bring. Nothing is committed; the caller
+reviews the diff (--diff) and decides.
 """
 from __future__ import annotations
 
@@ -125,28 +130,32 @@ def parent_of(pom: Pom, poms: Dict[str, Pom]) -> Optional[Pom]:
     return None
 
 
-def locate_dependency(pom: Pom, poms: Dict[str, Pom], g: str, a: str):
-    """The POM (module or an ancestor inside the checkout) that declares g:a, and the element."""
-    current: Optional[Pom] = pom
-    seen = set()
-    while current is not None and current.path not in seen:
-        seen.add(current.path)
-        dep = pomedit.find_dependency(current.root, current.src, g, a)
-        if dep is not None:
-            return current, dep
-        current = parent_of(current, poms)
-    return None, None
+def declarations(pom: Pom, poms: Dict[str, Pom], g: str, a: str):
+    """Every declaration of g:a the module sees, as (owner POM, place, element): the module's own POM
+    and its parents inside the checkout, main <dependencies> ("" as place) and profiles alike."""
+    found = []
+    for owner in ancestors(pom, poms):
+        found += [(owner, place, dep) for place, dep in pomedit.dependency_declarations(owner.root, owner.src, g, a)]
+    return found
 
 
-def remove_dependency(pom: Pom, poms: Dict[str, Pom], ga: str, warnings: List[str]) -> None:
+def remove_dependency(pom: Pom, poms: Dict[str, Pom], ga: str, removed: set, warnings: List[str]) -> None:
+    """Delete every declaration of a replaced coordinate the module sees. The Enforcer bans it whatever
+    the active profiles, so one left in an inactive profile would fail the build the day it is used."""
     g, a = ga.split(":", 1)
-    owner, dep = locate_dependency(pom, poms, g, a)
-    if dep is None:
-        warnings.append("%s: direct dependency %s not found in the POM or its parents (declared through a profile or a BOM import?)" % (pom.ga, ga))
-        return
-    owner.src = pomedit.remove_element(owner.src, dep)
-    owner.reparse()
-    owner.actions.append("removed dependency %s" % ga)
+    found = False
+    while True:
+        decls = declarations(pom, poms, g, a)
+        if not decls:
+            break
+        owner, place, dep = decls[0]
+        owner.src = pomedit.remove_element(owner.src, dep)
+        owner.reparse()
+        owner.actions.append("removed dependency %s%s" % (ga, (" from %s" % place) if place else ""))
+        found = True
+        removed.add(ga)
+    if not found and ga not in removed:
+        warnings.append("%s: direct dependency %s not found in the POM, its profiles or its parents inside the checkout (removed by an earlier run, or declared in a parent POM outside the checkout?)" % (pom.ga, ga))
 
 
 def ensure_exclusions(owner: Pom, dep, targets: List[str]) -> List[str]:
@@ -166,14 +175,31 @@ def ensure_exclusions(owner: Pom, dep, targets: List[str]) -> List[str]:
 
 
 def add_exclusions(pom: Pom, poms: Dict[str, Pom], direct_ga: str, targets: List[str], warnings: List[str]) -> None:
+    """Add the exclusions on every declaration of the direct dependency the module sees: a profile that
+    re-declares it replaces the main declaration, exclusions included, while it is active."""
     g, a = direct_ga.split(":", 1)
-    owner, dep = locate_dependency(pom, poms, g, a)
-    if dep is None:
-        warnings.append("%s: dependency %s (needs exclusions for %s) not found in the POM or its parents" % (pom.ga, direct_ga, ", ".join(targets)))
+    count = len(declarations(pom, poms, g, a))
+    if not count:
+        warnings.append("%s: dependency %s (needs exclusions for %s) not found in the POM, its profiles or its parents inside the checkout" % (pom.ga, direct_ga, ", ".join(targets)))
         return
-    added = ensure_exclusions(owner, dep, targets)
-    if added:
-        owner.actions.append("excluded %s from %s" % (", ".join(added), direct_ga))
+    for i in range(count):
+        owner, place, dep = declarations(pom, poms, g, a)[i]
+        added = ensure_exclusions(owner, dep, targets)
+        if added:
+            owner.actions.append("excluded %s from %s%s" % (", ".join(added), direct_ga, (" in %s" % place) if place else ""))
+
+
+def profile_dependencies_unseen(pom: Pom, poms: Dict[str, Pom], project: Path, direct: List[str], skip: set) -> List[str]:
+    """Dependencies declared in profiles of the module or its parents that the dependency tree did not
+    show: their profile was not active when it ran, so nothing is known about what they bring."""
+    out: List[str] = []
+    for owner in ancestors(pom, poms):
+        rel = owner.path.relative_to(project).as_posix()
+        for place, dep in pomedit.profile_dependencies(owner.root, owner.src):
+            ga = "%s:%s" % pomedit.dependency_ga(dep, owner.src, owner.group)
+            if ga not in direct and ga not in skip:
+                out.append("%s (%s of %s)" % (ga, place, rel))
+    return out
 
 
 def add_bundle_dependency(pom: Pom, bundle: dict, with_version: bool, exclusions: List[str]) -> None:
@@ -418,8 +444,11 @@ def main() -> None:
     multi_module = root_pom.packaging == "pom" and root_pom.root.child("modules") is not None
 
     bundle = patch["bundle"]
+    bundle_ga = "%s:%s" % (bundle["groupId"], bundle["artifactId"])
+    banned = patch.get("banned") or sorted({"%s:%s" % (g["groupId"], g["artifactId"]) for g in patch["embedded"] if g.get("groupId") != "rebundle.unidentified"})
     warnings: List[str] = []
     touched: List[Pom] = []
+    removed: set = set()
     for module in patch.get("modules", []):
         if not module.get("remove_direct") and not module.get("exclusions"):
             continue
@@ -429,17 +458,20 @@ def main() -> None:
             continue
         touched.append(pom)
         for ga in module.get("remove_direct", {}):
-            remove_dependency(pom, poms, ga, warnings)
+            remove_dependency(pom, poms, ga, removed, warnings)
         for direct_ga, info in module.get("exclusions", {}).items():
             add_exclusions(pom, poms, direct_ga, info.get("targets", []), warnings)
         add_bundle_dependency(pom, bundle, with_version=not multi_module, exclusions=list(module.get("bundle_exclusions") or {}))
+        if module.get("direct") is not None:
+            unseen = profile_dependencies_unseen(pom, poms, project, module["direct"], set(banned) | {bundle_ga})
+            if unseen:
+                warnings.append("%s: not in the dependency tree because the profile was not active when it ran: %s. If they bring an embedded coordinate, rerun the consumer tree with the profile active (CONSUMER_MAVEN_ARGS=-P<id>) or add the exclusions by hand" % (pom.ga, ", ".join(unseen)))
     if multi_module and touched:
         manage_bundle_version(root_pom, bundle)
     plugin_report = None
     if touched and patch.get("boot_embedded") and patch.get("spring_boot_version"):
         plugin_report = {"version": patch["spring_boot_version"],
                          "notes": align_boot_plugin(touched, poms, project, patch["spring_boot_version"], warnings)}
-    banned = patch.get("banned") or sorted({"%s:%s" % (g["groupId"], g["artifactId"]) for g in patch["embedded"] if g.get("groupId") != "rebundle.unidentified"})
     install_enforcer(root_pom, banned, patch.get("boot_line_excludes") or [], patch["coordinate"], patch.get("spring_boot_version"))
 
     changed = [p for p in poms.values() if p.changed()]

@@ -446,6 +446,35 @@ def main() -> None:
         ok("boot not embedded: plugin versions untouched",
            "<version>3.2.5</version>" in (boot_io / "app-batch" / "pom.xml").read_text(encoding="utf-8")
            and read_json(out / "apply-boot-io.json")["spring_boot_plugin"] is None)
+
+        # ---- dependencies declared in profiles -----------------------------------------------
+        print("[profile dependencies]")
+        ok("direct dependencies of each module recorded in the proposal",
+           "commons-io:commons-io" in mods["com.example:app"]["direct"] and "org.springframework.boot:spring-boot-starter-web" in mods["com.example:app"]["direct"]
+           and mods["com.example:app-batch"]["direct"] == ["com.example:app", "org.yaml:snakeyaml"])
+        prof = fx.build_consumer_project(work / "consumer-profiles", profiles=True)
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch.json", "--project", prof, "--out", out / "apply-prof.json", "--diff", out / "apply-prof.diff")
+        applied_prof = read_json(out / "apply-prof.json")
+        prof_actions = {f["path"]: f["actions"] for f in applied_prof["changed_files"]}
+        prof_app = (prof / "app" / "pom.xml").read_text(encoding="utf-8")
+        prof_root = (prof / "pom.xml").read_text(encoding="utf-8")
+        ok("replaced coordinate removed from the main dependencies, the module's profile and the parent's profile",
+           "<version>2.16.1</version>" not in prof_app and "<version>2.15.0</version>" not in prof_app and "<version>2.11.0</version>" not in prof_root
+           and "removed dependency commons-io:commons-io from profile local" in prof_actions["app/pom.xml"]
+           and "removed dependency commons-io:commons-io from profile legacy" in prof_actions["pom.xml"]
+           and not any("commons-io:commons-io not found" in w for w in applied_prof["warnings"]))
+        ok("exclusions added on the profile's re-declaration as well, merged with its own",
+           prof_app.count("<exclusion>") == 10
+           and prof_app.split("<id>local</id>")[1].count("<artifactId>spring-core</artifactId>") == 1
+           and "spring-boot-starter-json" in prof_app
+           and any(a.startswith("excluded ") and a.endswith("from org.springframework.boot:spring-boot-starter-web in profile local") for a in prof_actions["app/pom.xml"])
+           and all(ET.fromstring(p.encode("utf-8")) is not None for p in (prof_app, prof_root)))
+        ok("profile dependency the tree never showed is reported, the replaced and bundle coordinates are not",
+           any("com.h2database:h2 (profile local of app/pom.xml)" in w and "not active" in w for w in applied_prof["warnings"])
+           and not any("commons-io" in w or "thirdparty-bundle" in w for w in applied_prof["warnings"]))
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch.json", "--project", prof, "--out", out / "apply-prof2.json", "--diff", out / "apply-prof2.diff")
+        ok("profile handling applied twice changes nothing",
+           (out / "apply-prof2.diff").read_text(encoding="utf-8") == "" and not read_json(out / "apply-prof2.json")["changed_files"])
         run("apply_consumer_patch.py", "--patch", out / "consumer-patch-io.json", "--project", cons, "--out", out / "apply-notree.json", "--diff", out / "apply-notree.diff", expect=2)
         ok("a proposal without a tree cannot be applied", not (out / "apply-notree.json").exists())
         (work / "consumer" / "app" / "target").mkdir(parents=True, exist_ok=True)

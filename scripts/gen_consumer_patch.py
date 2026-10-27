@@ -145,7 +145,8 @@ def analyse_trees(texts, embedded_ga, hints=None, resolved=None, promoted_ga=Non
         for tree in parse_dependency_trees(text):
             root = tree["root"]
             module = {"module": ga_str(root), "remove_direct": OrderedDict(), "exclusions": OrderedDict(), "paths": [],
-                      "bundle_exclusions": OrderedDict(), "promoted_kept": OrderedDict()}
+                      "bundle_exclusions": OrderedDict(), "promoted_kept": OrderedDict(),
+                      "direct": list(OrderedDict.fromkeys(ga_str(n) for n in tree["nodes"] if n["depth"] == 1))}
             matched = set()
             for node in tree["nodes"]:
                 ga = ga_str(node)
@@ -395,7 +396,8 @@ def main() -> None:
         "synthetic": [{"gav": g, "hint": h, "resolved": resolved_synthetic.get(h["artifactId"]) if h else None} for g, h in synthetic],
         "banned": banned_ga,
         "modules": [{"module": m["module"], "remove_direct": m["remove_direct"], "exclusions": m["exclusions"],
-                     "bundle_exclusions": m["bundle_exclusions"], "promoted_kept": m["promoted_kept"], "paths": m["paths"]} for m in modules],
+                     "bundle_exclusions": m["bundle_exclusions"], "promoted_kept": m["promoted_kept"], "paths": m["paths"],
+                     "direct": m["direct"]} for m in modules],
         "promoted_dependencies": promoted,
         "tree_provided": bool(texts),
     })

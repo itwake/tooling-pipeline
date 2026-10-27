@@ -241,6 +241,32 @@ def find_dependency(root: Element, src: str, g: str, a: str) -> Optional[Element
     return None
 
 
+def profile_dependencies(root: Element, src: str) -> List[Tuple[str, Element]]:
+    """("profile <id>", element) for every dependency declared inside a profile of the POM."""
+    out: List[Tuple[str, Element]] = []
+    profiles = root.child("profiles")
+    for profile in (profiles.children_named("profile") if profiles is not None else []):
+        deps = profile.child("dependencies")
+        if deps is None:
+            continue
+        place = "profile %s" % (profile.child_text(src, "id") or "?")
+        out += [(place, d) for d in deps.children_named("dependency")]
+    return out
+
+
+def dependency_declarations(root: Element, src: str, g: str, a: str) -> List[Tuple[str, Element]]:
+    """Every declaration of g:a in the POM: ("", element) for the project's own <dependencies>, then
+    ("profile <id>", element) for each profile that declares it. While a profile is active its
+    declaration replaces the main one wholesale, exclusions included, so each of them counts."""
+    pg = project_group_id(root, src)
+    found: List[Tuple[str, Element]] = []
+    deps = root.child("dependencies")
+    if deps is not None:
+        found += [("", d) for d in deps.children_named("dependency") if dependency_ga(d, src, pg) == (g, a)]
+    found += [(place, d) for place, d in profile_dependencies(root, src) if dependency_ga(d, src, pg) == (g, a)]
+    return found
+
+
 def existing_exclusions(dep: Element, src: str) -> List[Tuple[str, str]]:
     exc = dep.child("exclusions")
     if exc is None:
