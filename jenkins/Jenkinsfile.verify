@@ -1,6 +1,8 @@
 // mvn-rebundle / verify: compare the Spring Boot artifacts built before and after the POM change.
 // Proves that every class and resource on the dependency classpath is byte-identical: only the replaced
-// jars disappear, the bundle appears, and the application's own classes are unchanged.
+// jars disappear and the bundle appears. Differences outside the swap (the project's own modules under
+// another CI-stamped version, application classes from another commit or JDK) are warnings and make
+// the build UNSTABLE; a difference in the swap itself fails it.
 //
 // Each input is a reference like SOURCE_REF of the main job: an image reference (ECR, the Nexus Docker
 // registry or any registry the agent is logged in to; append #/path when the application is not at
@@ -96,6 +98,13 @@ pipeline {
                     "$PY" scripts/verify_app_equivalence.py --old-source out/old-source.json --new-source out/new-source.json \
                         --bundle-artifact-id "$BUNDLE_ARTIFACT_ID" --policy config/policy.json --out out/equivalence.json
                 '''
+                script {
+                    def warnings = fileExists('out/equivalence-warnings.txt') ? readFile('out/equivalence-warnings.txt').tokenize('\n').findAll { it.trim() } : []
+                    if (warnings) {
+                        echo "Equivalence check passed with ${warnings.size()} warning(s):\n - " + warnings.join('\n - ')
+                        currentBuild.result = 'UNSTABLE'
+                    }
+                }
             }
         }
     }

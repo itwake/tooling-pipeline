@@ -249,11 +249,26 @@ def main() -> None:
         source_attr = "file=app.jar@sha256:" + src["sha256"]
         target = proj / "target"
         good = fx.simulate_shade(proj, jar_paths, bundle, man["contents_attr"], source_attr, True, target / "thirdparty-bundle-1.0.0.jar", boot_version="3.3.5")
-        fx.write_reduced_pom(target / "dependency-reduced-pom.xml", bundle, [("org.yaml", "snakeyaml", "2.2")])
+        # Shade promotes the components' transitive dependencies from their own POMs: snakeyaml at a version
+        # the application does not have, and tomcat-annotations-api, which the application never had
+        fx.write_reduced_pom(target / "dependency-reduced-pom.xml", bundle, [("org.yaml", "snakeyaml", "2.1"), ("org.apache.tomcat", "tomcat-annotations-api", "10.1.59")])
+        run("finalize_bundle_pom.py", "--manifest", out / "bundle-manifest.json", "--report", out / "bundle-pom.json")
+        fin = read_json(out / "bundle-pom.json")
+        final_pom = (target / "thirdparty-bundle-1.0.0.pom").read_text(encoding="utf-8")
+        ok("published POM keeps only promoted dependencies the application had, at the application's version",
+           [d["artifactId"] for d in fin["kept"]] == ["snakeyaml"] and [d["artifactId"] for d in fin["pruned"]] == ["tomcat-annotations-api"]
+           and fin["aligned"][0]["version"] == "2.2" and fin["aligned"][0]["version_in_reduced_pom"] == "2.1"
+           and "tomcat-annotations-api" not in final_pom and "<version>2.2</version>" in final_pom and ET.fromstring(final_pom.encode("utf-8")) is not None)
         run("verify_bundle.py", "--manifest", out / "bundle-manifest.json", "--out", out / "bundle-verification.json")
         ver = read_json(out / "bundle-verification.json")
         ok("simulated bundle passes every check", ver["ok"] and all(c["status"] == "pass" for c in ver["checks"] if c["check"] != "sources-jar-present"))
-        ok("promoted dependency reported", ver["promoted_dependencies"][0]["artifactId"] == "snakeyaml")
+        ok("promoted dependency reported from the published POM",
+           ver["promoted_dependencies"][0]["artifactId"] == "snakeyaml" and ver["pom_finalized"]
+           and any(c["check"] == "pom-promotes-only-application-dependencies" and c["status"] == "pass" for c in ver["checks"]))
+        run("verify_bundle.py", "--manifest", out / "bundle-manifest.json", "--reduced-pom", target / "dependency-reduced-pom.xml", "--out", out / "bv-unfinalized.json")
+        ok("an unfinalized POM is a warning naming the foreign dependency",
+           any(c["check"] == "pom-promotes-only-application-dependencies" and c["status"] == "warn" and "tomcat-annotations-api" in c["detail"]
+               for c in read_json(out / "bv-unfinalized.json")["checks"]))
 
         bad = fx.simulate_shade(proj, jar_paths, bundle, man["contents_attr"], source_attr, True, target / "bad-missing.jar", drop=["org/apache/commons/io/FileUtils.class"], boot_version="3.3.5")
         run("verify_bundle.py", "--manifest", out / "bundle-manifest.json", "--bundle", bad, "--out", out / "bv-missing.json", expect=1)
@@ -311,6 +326,9 @@ def main() -> None:
            web_targets == {"org.springframework.boot:spring-boot", "org.springframework:spring-core", "org.springframework:spring-jcl"}
            and app_mod["exclusions"]["org.apache.commons:commons-text"]["targets"] == ["commons-io:commons-io"])
         ok("second module parsed", mods["com.example:app-batch"]["exclusions"]["com.example:app"]["targets"] == ["commons-io:commons-io"])
+        ok("promoted dependency the modules already reach is excluded on the bundle dependency",
+           list(app_mod["bundle_exclusions"]) == ["org.yaml:snakeyaml"] and "already reached" in app_mod["bundle_exclusions"]["org.yaml:snakeyaml"]
+           and list(mods["com.example:app-batch"]["bundle_exclusions"]) == ["org.yaml:snakeyaml"] and not app_mod["promoted_kept"])
         md = (out / "consumer-patch.md").read_text(encoding="utf-8")
         ok("markdown has enforcer rule", "<exclude>commons-io:commons-io</exclude>" in md and "bannedDependencies" in md)
         ok("boot embedded: plugin alignment instead of a version pin", patch["boot_embedded"] and not patch["boot_line_excludes"] and "spring-boot-maven-plugin" in md)
@@ -335,6 +353,18 @@ def main() -> None:
             "--out", out / "consumer-patch-standalone.md", "--out-json", out / "consumer-patch-standalone.json")
         sa = {m["module"]: m for m in read_json(out / "consumer-patch-standalone.json")["modules"]}
         ok("standalone mode from explicit coordinates", list(sa["com.example:app"]["remove_direct"]) == ["commons-io:commons-io"])
+        fx.write_reduced_pom(work / "promoted.pom", {"groupId": "com.company.platform", "artifactId": "core-bundle", "version": "1.0.0"},
+                             [("org.springframework", "spring-jcl", "6.1.14"), ("org.yaml", "snakeyaml", "2.2"),
+                              ("org.apache.tomcat", "tomcat-annotations-api", "10.1.59"), ("org.apache.commons", "commons-text", "1.12.0")])
+        run("gen_consumer_patch.py", "--bundle", "com.company.platform:core-bundle:1.0.0", "--embedded", "org.springframework:spring-core:6.1.14",
+            "--tree", tree, "--reduced-pom", work / "promoted.pom", "--out", out / "cp-promoted.md", "--out-json", out / "cp-promoted.json")
+        pm = {m["module"]: m for m in read_json(out / "cp-promoted.json")["modules"]}["com.example:app"]
+        ok("promoted dependencies: kept when reachable only through an embedded coordinate, excluded when absent, already reachable or test-only",
+           list(pm["promoted_kept"]) == ["org.springframework:spring-jcl"]
+           and set(pm["bundle_exclusions"]) == {"org.yaml:snakeyaml", "org.apache.tomcat:tomcat-annotations-api", "org.apache.commons:commons-text"}
+           and "not in this module" in pm["bundle_exclusions"]["org.apache.tomcat:tomcat-annotations-api"]
+           and "test scope" in pm["bundle_exclusions"]["org.apache.commons:commons-text"]
+           and "<artifactId>tomcat-annotations-api</artifactId>" in (out / "cp-promoted.md").read_text(encoding="utf-8"))
         run("gen_consumer_patch.py", "--bundle", "bad-coordinates", "--embedded", "x:y:1", "--out", out / "cp-bad.md", "--out-json", out / "cp-bad.json", expect=2)
         ok("standalone mode validates the bundle coordinates", not (out / "cp-bad.json").exists())
 
@@ -351,8 +381,12 @@ def main() -> None:
            and app_pom.index("thirdparty-bundle") < app_pom.index("spring-boot-starter-web")
            and sorted(c["path"] for c in applied["changed_files"]) == ["app-batch/pom.xml", "app/pom.xml", "pom.xml"])
         ok("exclusions merged into the existing block and added where missing",
-           app_pom.count("<exclusion>") == 5 and "spring-boot-starter-logging" in app_pom
-           and "<artifactId>spring-core</artifactId>" in app_pom and batch_pom.count("<exclusion>") == 1)
+           app_pom.count("<exclusion>") == 6 and "spring-boot-starter-logging" in app_pom
+           and "<artifactId>spring-core</artifactId>" in app_pom and batch_pom.count("<exclusion>") == 2)
+        ok("promoted dependency excluded on the bundle dependency itself",
+           "<artifactId>snakeyaml</artifactId>" in app_pom.split("thirdparty-bundle")[1].split("</dependency>")[0]
+           and "<artifactId>snakeyaml</artifactId>" in batch_pom.split("thirdparty-bundle")[1].split("</dependency>")[0]
+           and any("from the bundle dependency" in a for f in applied["changed_files"] for a in f["actions"]))
         ok("enforcer execution added next to the existing one",
            root_pom.count("<execution>") == 2 and "ban-bundled-coordinates" in root_pom and "enforce-versions" in root_pom
            and "<exclude>org.springframework:spring-core</exclude>" in root_pom)
@@ -369,7 +403,7 @@ def main() -> None:
         run("apply_consumer_patch.py", "--patch", out / "consumer-patch.json", "--project", single, "--dry-run", "--out", out / "apply-single.json", "--diff", out / "apply-single.diff")
         single_diff = (out / "apply-single.diff").read_text(encoding="utf-8")
         ok("single module: explicit bundle version, build/plugins created, dry run leaves the file untouched",
-           "+      <version>1.0.0</version>" in single_diff and "+  <build>" in single_diff and "maven-enforcer-plugin" in single_diff
+           "+      <version>1.0.0</version>" in single_diff and "+      <exclusions>" in single_diff and "+  <build>" in single_diff and "maven-enforcer-plugin" in single_diff
            and (single / "pom.xml").read_text(encoding="utf-8") == fx.CONSUMER_SINGLE_POM
            and any("app-batch" in w for w in read_json(out / "apply-single.json")["warnings"]))
         run("apply_consumer_patch.py", "--patch", out / "consumer-patch-io.json", "--project", cons, "--out", out / "apply-notree.json", "--diff", out / "apply-notree.diff", expect=2)
@@ -457,8 +491,14 @@ def main() -> None:
         run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--out", out / "eq-leftover.json", expect=1)
         ok("original coordinates left on classpath detected", any(c["check"] == "original-coordinates-removed" and c["status"] == "fail" for c in read_json(out / "eq-leftover.json")["checks"]))
         new_bad = fx.build_new_app(app, good, selected_jars, work / "new-class.jar", change_class=True)
-        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--out", out / "eq-class.json", expect=1)
-        ok("changed application class detected", any(c["check"] == "application-classes-unchanged" and c["status"] == "fail" for c in read_json(out / "eq-class.json")["checks"]))
+        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--out", out / "eq-class.json")
+        eq_class = read_json(out / "eq-class.json")
+        ok("changed application class is a warning, listed for the pipeline",
+           eq_class["ok"] and eq_class["warnings"] == ["application-classes-unchanged"]
+           and "Greeter.class" in (out / "eq-class-warnings.txt").read_text(encoding="utf-8"))
+        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--strict", "--out", out / "eq-class-strict.json", expect=1)
+        ok("--strict turns the warning into a failure",
+           any(c["check"] == "application-classes-unchanged" and c["status"] == "fail" for c in read_json(out / "eq-class-strict.json")["checks"]))
         new_bad = fx.build_new_app(app, good, selected_jars, work / "new-droplib.jar", drop_lib="snakeyaml-2.2.jar")
         run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--out", out / "eq-droplib.json", expect=1)
         checks = {c["check"]: c for c in read_json(out / "eq-droplib.json")["checks"]}
@@ -472,6 +512,30 @@ def main() -> None:
             zf.extractall(exploded)
         run("verify_app_equivalence.py", "--old", app, "--new", exploded, "--out", out / "eq-exploded.json")
         ok("exploded layout supported", read_json(out / "eq-exploded.json")["ok"])
+
+        # ---- differences outside the swap are warnings; a leaked third-party jar still fails ----
+        print("[baseline differences]")
+        stamped_old, stamped_new = fx.build_stamped_apps(work / "stamped", libs, good, selected_jars)
+        run("verify_app_equivalence.py", "--old", stamped_old, "--new", stamped_new, "--out", out / "eq-stamped.json")
+        eq_st = read_json(out / "eq-stamped.json")
+        st = {c["check"]: c for c in eq_st["checks"]}
+        ok("project modules rebuilt under the CI-stamped version are a warning, the third-party checks pass",
+           eq_st["ok"] and st["project-version-differs"]["status"] == "warn" and "1.0.0-20240101 -> 1.0.0" in st["project-version-differs"]["detail"]
+           and "app-common" in st["project-version-differs"]["detail"]
+           and st["dependency-set-unchanged"]["status"] == "pass" and st["classpath-entries-identical"]["status"] == "pass"
+           and st["kept-jars-byte-identical"]["status"] == "pass")
+        ok("entries that embed the build version are marked, the archive signature is ignored",
+           st["project-module-entries-changed"]["status"] == "warn" and "(1 embed the build version)" in st["project-module-entries-changed"]["detail"]
+           and st["application-classes-unchanged"]["status"] == "warn" and "all embed the build version" in st["application-classes-unchanged"]["detail"]
+           and st["application-resources-unchanged"]["status"] == "pass" and eq_st["project_version"] == {"old": "1.0.0-20240101", "new": "1.0.0"})
+        leaked = fx.build_new_app(app, good, selected_jars, work / "new-leaked.jar", extra_libs=[fx.leaked_jar(work / "stamped")],
+                                  classpath_first=["tomcat-annotations-api-10.1.59.jar"])
+        run("verify_app_equivalence.py", "--old", app, "--new", leaked, "--out", out / "eq-leaked.json", expect=1)
+        lk = {c["check"]: c for c in read_json(out / "eq-leaked.json")["checks"]}
+        ok("a jar the old build never had fails, with the changed entries grouped by provider",
+           lk["dependency-set-unchanged"]["status"] == "fail" and "added: file:tomcat-annotations-api-10.1.59.jar" in lk["dependency-set-unchanged"]["detail"]
+           and lk["classpath-entries-identical"]["status"] == "fail" and "-> tomcat-annotations-api-10.1.59.jar: 1 changed" in lk["classpath-entries-identical"]["detail"]
+           and lk["classpath-entries-identical"]["items"][0]["path"] == "org/apache/commons/logging/LogFactory.class")
 
         # ---- source detection and the fake Nexus -----------------------------------------
         print("[source detection]")

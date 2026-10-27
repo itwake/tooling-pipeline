@@ -7,7 +7,8 @@ and edits the POMs in place, preserving their formatting and comments:
   * deletes the direct dependencies that the bundle replaces,
   * adds <exclusions> on the direct dependencies that transitively bring an embedded coordinate,
   * adds the bundle dependency first in every changed module (version managed in the root POM of
-    a multi-module build, explicit otherwise),
+    a multi-module build, explicit otherwise), with exclusions for the transitive dependencies of
+    the bundle POM that the module must not take from the bundle,
   * adds or updates the maven-enforcer-plugin execution that bans the embedded coordinates and,
     when Spring Boot is not inside the bundle, pins the consumer to the Boot minor line.
 
@@ -142,16 +143,12 @@ def remove_dependency(pom: Pom, poms: Dict[str, Pom], ga: str, warnings: List[st
     owner.actions.append("removed dependency %s" % ga)
 
 
-def add_exclusions(pom: Pom, poms: Dict[str, Pom], direct_ga: str, targets: List[str], warnings: List[str]) -> None:
-    g, a = direct_ga.split(":", 1)
-    owner, dep = locate_dependency(pom, poms, g, a)
-    if dep is None:
-        warnings.append("%s: dependency %s (needs exclusions for %s) not found in the POM or its parents" % (pom.ga, direct_ga, ", ".join(targets)))
-        return
+def ensure_exclusions(owner: Pom, dep, targets: List[str]) -> List[str]:
+    """Add the <exclusion> entries a dependency element lacks; returns the ones added."""
     present = set(pomedit.existing_exclusions(dep, owner.src))
     missing = [t for t in targets if tuple(t.split(":", 1)) not in present]
     if not missing:
-        return
+        return []
     blocks = "\n".join("<exclusion>\n  <groupId>%s</groupId>\n  <artifactId>%s</artifactId>\n</exclusion>" % tuple(t.split(":", 1)) for t in missing)
     exc = dep.child("exclusions")
     if exc is None:
@@ -159,22 +156,37 @@ def add_exclusions(pom: Pom, poms: Dict[str, Pom], direct_ga: str, targets: List
     else:
         owner.src = pomedit.insert_child(owner.src, exc, blocks, owner.root)
     owner.reparse()
-    owner.actions.append("excluded %s from %s" % (", ".join(missing), direct_ga))
+    return missing
 
 
-def add_bundle_dependency(pom: Pom, bundle: dict, with_version: bool) -> None:
-    if pomedit.find_dependency(pom.root, pom.src, bundle["groupId"], bundle["artifactId"]) is not None:
+def add_exclusions(pom: Pom, poms: Dict[str, Pom], direct_ga: str, targets: List[str], warnings: List[str]) -> None:
+    g, a = direct_ga.split(":", 1)
+    owner, dep = locate_dependency(pom, poms, g, a)
+    if dep is None:
+        warnings.append("%s: dependency %s (needs exclusions for %s) not found in the POM or its parents" % (pom.ga, direct_ga, ", ".join(targets)))
         return
-    block = "<dependency>\n  <groupId>%s</groupId>\n  <artifactId>%s</artifactId>\n%s</dependency>" % (
-        bundle["groupId"], bundle["artifactId"], ("  <version>%s</version>\n" % bundle["version"]) if with_version else "")
-    deps = pom.root.child("dependencies")
-    if deps is None:
-        pom.src, deps = pomedit.ensure_child(pom.src, ["dependencies"], {})
-        pom.reparse()
+    added = ensure_exclusions(owner, dep, targets)
+    if added:
+        owner.actions.append("excluded %s from %s" % (", ".join(added), direct_ga))
+
+
+def add_bundle_dependency(pom: Pom, bundle: dict, with_version: bool, exclusions: List[str]) -> None:
+    dep = pomedit.find_dependency(pom.root, pom.src, bundle["groupId"], bundle["artifactId"])
+    if dep is None:
+        block = "<dependency>\n  <groupId>%s</groupId>\n  <artifactId>%s</artifactId>\n%s</dependency>" % (
+            bundle["groupId"], bundle["artifactId"], ("  <version>%s</version>\n" % bundle["version"]) if with_version else "")
         deps = pom.root.child("dependencies")
-    pom.src = pomedit.insert_child(pom.src, deps, block, pom.root, first=True)
-    pom.reparse()
-    pom.actions.append("added bundle dependency %s:%s%s" % (bundle["groupId"], bundle["artifactId"], "" if with_version else " (version managed in the root POM)"))
+        if deps is None:
+            pom.src, deps = pomedit.ensure_child(pom.src, ["dependencies"], {})
+            pom.reparse()
+            deps = pom.root.child("dependencies")
+        pom.src = pomedit.insert_child(pom.src, deps, block, pom.root, first=True)
+        pom.reparse()
+        pom.actions.append("added bundle dependency %s:%s%s" % (bundle["groupId"], bundle["artifactId"], "" if with_version else " (version managed in the root POM)"))
+        dep = pomedit.find_dependency(pom.root, pom.src, bundle["groupId"], bundle["artifactId"])
+    added = ensure_exclusions(pom, dep, exclusions)
+    if added:
+        pom.actions.append("excluded %s from the bundle dependency" % ", ".join(added))
 
 
 def manage_bundle_version(root_pom: Pom, bundle: dict) -> None:
@@ -279,7 +291,7 @@ def main() -> None:
             remove_dependency(pom, poms, ga, warnings)
         for direct_ga, info in module.get("exclusions", {}).items():
             add_exclusions(pom, poms, direct_ga, info.get("targets", []), warnings)
-        add_bundle_dependency(pom, bundle, with_version=not multi_module)
+        add_bundle_dependency(pom, bundle, with_version=not multi_module, exclusions=list(module.get("bundle_exclusions") or {}))
     if multi_module and touched_modules:
         manage_bundle_version(root_pom, bundle)
     banned = patch.get("banned") or sorted({"%s:%s" % (g["groupId"], g["artifactId"]) for g in patch["embedded"] if g.get("groupId") != "rebundle.unidentified"})

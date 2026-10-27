@@ -1,16 +1,18 @@
 // mvn-rebundle / consumer: propose, and on request apply, the POM change of a project that will
 // consume a bundle.
 //
-// The bundle comes from an mvn-rebundle build (its archived bundle-manifest.json and dependency-reduced
-// POM are copied with the Copy Artifact plugin) or, with BUNDLE_COORDINATES, from Nexus (the bundle jar
-// and its POM are downloaded; the jar's manifest lists what it embeds). With CONSUMER_GIT_URL the
-// consumer project is checked out and `dependency:tree -Dverbose` runs there, so the proposal lists the
+// The bundle comes from an mvn-rebundle build (its archived bundle-manifest.json and published POM are
+// copied with the Copy Artifact plugin) or, with BUNDLE_COORDINATES, from Nexus (the bundle jar and its
+// POM are downloaded; the jar's manifest lists what it embeds). With CONSUMER_GIT_URL the consumer
+// project is checked out and `dependency:tree -Dverbose` runs there, so the proposal lists the
 // exclusions per module and per path; without it the proposal holds the generic snippets.
 //
 // APPLY=true turns the proposal into a branch of the consumer project: the POMs are edited in place
 // (formatting and comments preserved), the project is built with the Enforcer gate, the rebuilt Spring
 // Boot archive is compared with the artifact the bundle was built from, and the branch is pushed for
-// review. Nothing is merged automatically.
+// review. A failed comparison (the swap itself is wrong) stops before the push. Differences outside the
+// swap (project modules under another CI-stamped version, application classes from another commit or
+// JDK) are warnings: ON_WARNINGS decides whether to ask, push anyway or stop. Nothing is merged.
 //
 // Agent requirements (Linux): Python 3.8+; Maven 3.6+ and a JDK when CONSUMER_GIT_URL is used;
 // docker or crane (and the aws CLI for ECR) when the original artifact is an image.
@@ -61,6 +63,14 @@ def fetchSource(String label, String ref) {
             '''
         }
     }
+}
+
+// Warnings of the equivalence check, one per line; empty when it did not run or reported none.
+def equivalenceWarnings() {
+    if (!fileExists('out/equivalence-warnings.txt')) {
+        return []
+    }
+    return readFile('out/equivalence-warnings.txt').tokenize('\n').findAll { it.trim() }
 }
 
 // Git over https with a username/password credential; ssh remotes rely on the agent's keys.
@@ -122,6 +132,8 @@ pipeline {
         GIT_USER_EMAIL        = 'mvn-rebundle@example.com'
         CONSUMER_BUILD_ARGS   = '-DskipTests'    // APPLY: arguments of the consumer build (`mvn ... verify`)
         PUSH_BRANCH           = 'true'           // APPLY: push the branch to the consumer repository
+        ON_WARNINGS           = 'ask'            // APPLY, equivalence check passed with warnings: ask (input step), push (push, build UNSTABLE), stop (no push)
+        ON_WARNINGS_TIMEOUT   = '60'             // minutes to wait for the answer when ON_WARNINGS=ask; no answer = not pushed
         DEFAULT_APP_PATH      = '/app/app.jar'   // original artifact as an image: application path inside it
         IMAGE_PLATFORM        = ''
         IMAGE_TOOL            = 'auto'
@@ -148,7 +160,7 @@ pipeline {
                 script {
                     def selector = params.UPSTREAM_BUILD?.trim() ? specific(params.UPSTREAM_BUILD.trim()) : lastSuccessful()
                     copyArtifacts(projectName: env.UPSTREAM_JOB, selector: selector, fingerprintArtifacts: true,
-                                  filter: 'out/bundle-manifest.json, work/bundle/target/dependency-reduced-pom.xml')
+                                  filter: 'out/bundle-manifest.json, work/bundle/target/*.pom, work/bundle/target/dependency-reduced-pom.xml')
                 }
                 sh 'test -f out/bundle-manifest.json || { echo "bundle-manifest.json not found in the upstream build"; exit 1; }'
             }
@@ -203,8 +215,10 @@ pipeline {
                         "$PY" scripts/gen_consumer_patch.py --bundle-jar "$JAR" --reduced-pom "$POM" $ARGS \
                             --out out/consumer-patch.md --out-json out/consumer-patch.json
                     else
-                        "$PY" scripts/gen_consumer_patch.py --manifest out/bundle-manifest.json \
-                            --reduced-pom work/bundle/target/dependency-reduced-pom.xml $ARGS \
+                        # the published POM of the upstream build; older builds only archived the dependency-reduced one
+                        POM=$(ls work/bundle/target/*.pom 2>/dev/null | head -1)
+                        [ -n "$POM" ] || POM=work/bundle/target/dependency-reduced-pom.xml
+                        "$PY" scripts/gen_consumer_patch.py --manifest out/bundle-manifest.json --reduced-pom "$POM" $ARGS \
                             --out out/consumer-patch.md --out-json out/consumer-patch.json
                     fi
                 '''
@@ -248,14 +262,25 @@ pipeline {
                     }
                     if (!oldRef) {
                         echo 'The original artifact is unknown (bundle taken from Nexus and VERIFY_AGAINST empty): equivalence check skipped'
+                        env.EQUIVALENCE_NOTE = 'skipped, original artifact unknown'
                         return
                     }
                     fetchSource('old', oldRef)
+                    // failures (the swap is wrong) stop the job here; warnings (differences outside the swap) are
+                    // listed in out/equivalence-warnings.txt and decided on before the push
                     sh '''
                         NEW=$("$PY" -c "import json; print(json.load(open('out/rebuilt-app.json'))['new_jar'])")
                         "$PY" scripts/verify_app_equivalence.py --old-source out/old-source.json --new "$NEW" \
                             --policy config/policy.json --out out/equivalence.json
                     '''
+                    def warnings = equivalenceWarnings()
+                    if (warnings) {
+                        echo "Equivalence check passed with ${warnings.size()} warning(s):\n - " + warnings.join('\n - ')
+                        env.EQUIVALENCE_NOTE = "passed with ${warnings.size()} warning(s)"
+                        currentBuild.result = 'UNSTABLE'
+                    } else {
+                        env.EQUIVALENCE_NOTE = 'passed'
+                    }
                 }
             }
         }
@@ -271,22 +296,43 @@ pipeline {
             steps {
                 script {
                     def branch = readFile('out/consumer-apply.branch').trim()
-                    dir('work/consumer') {
-                        sh '''
-                            git config user.name "$GIT_USER_NAME"
-                            git config user.email "$GIT_USER_EMAIL"
-                            git add -A -- '*pom.xml'
-                            git commit -q -F - <<EOF
+                    def warnings = equivalenceWarnings()
+                    def push = true
+                    if (warnings && env.ON_WARNINGS == 'stop') {
+                        echo "ON_WARNINGS=stop: the equivalence check reported warnings, ${branch} is not pushed (the change is archived as out/consumer-apply.diff)"
+                        push = false
+                    } else if (warnings && env.ON_WARNINGS != 'push') {
+                        try {
+                            timeout(time: env.ON_WARNINGS_TIMEOUT.toInteger(), unit: 'MINUTES') {
+                                input message: "The equivalence check passed with ${warnings.size()} warning(s):\n - ${warnings.join('\n - ')}\n\nPush ${branch} anyway?",
+                                      ok: 'Push the branch'
+                            }
+                        } catch (err) {
+                            echo "${branch} not pushed: declined, or no answer within ${env.ON_WARNINGS_TIMEOUT} minutes (${err})"
+                            push = false
+                        }
+                    }
+                    if (push) {
+                        dir('work/consumer') {
+                            withEnv(["EQUIVALENCE_NOTE=${env.EQUIVALENCE_NOTE ?: 'not run'}"]) {
+                                sh '''
+                                    git config user.name "$GIT_USER_NAME"
+                                    git config user.email "$GIT_USER_EMAIL"
+                                    git add -A -- '*pom.xml'
+                                    git commit -q -F - <<EOF
 Replace bundled dependencies with $(sed 's#^rebundle/##' "$WORKSPACE/out/consumer-apply.branch")
 
 Generated by mvn-rebundle: direct dependencies removed, exclusions added on the
 paths that reintroduce embedded coordinates, Enforcer gate installed.
+Equivalence check against the original artifact: $EQUIVALENCE_NOTE ($BUILD_URL).
 EOF
-                        '''
-                        withGitCredentials {
-                            sh "git push origin HEAD:refs/heads/${branch}"
+                                '''
+                            }
+                            withGitCredentials {
+                                sh "git push origin HEAD:refs/heads/${branch}"
+                            }
+                            echo "Pushed ${branch}: open a merge request from it"
                         }
-                        echo "Pushed ${branch}: open a merge request from it"
                     }
                 }
             }

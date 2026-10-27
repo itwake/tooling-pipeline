@@ -2,9 +2,10 @@
 """Stage 8: publish the verified bundle to Nexus without rebuilding it.
 
 Uploads the exact jar that verify_bundle.py checked (its SHA-256 is compared with the
-verification report) together with the dependency-reduced POM and, when present, the
-sources jar, through maven-deploy-plugin's deploy-file goal. Refuses to publish when the
-verification report is missing, failed, or describes different bytes.
+verification report) together with the POM it checked (the one finalize_bundle_pom.py wrote,
+or Shade's dependency-reduced POM when that step did not run) and, when present, the sources
+jar, through maven-deploy-plugin's deploy-file goal. Refuses to publish when the verification
+report is missing, failed, or describes different bytes.
 """
 from __future__ import annotations
 
@@ -44,9 +45,12 @@ def main() -> None:
     sha = sha256_file(jar)
     if sha != ver.get("sha256"):
         fail("%s changed since verification (sha256 %s, verified %s)" % (jar.name, sha, ver.get("sha256")))
-    pom = Path(man["reduced_pom"])
+    pom = Path(ver.get("pom") or man.get("pom") or "")
+    if not str(pom) or not pom.is_file():
+        pom = Path(man["reduced_pom"])
+        log("WARN: publishing Shade's dependency-reduced POM as is (finalize_bundle_pom.py did not run)")
     if not pom.is_file():
-        fail("dependency-reduced POM not found: %s" % pom)
+        fail("POM not found: %s" % pom)
 
     version = man["bundle"]["version"]
     snapshot = version.endswith("-SNAPSHOT")

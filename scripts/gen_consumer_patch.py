@@ -7,9 +7,12 @@ The bundle is described by one of
   --bundle g:a:v --embedded "g:a:v,..."   coordinates typed by hand
 
 With one or more `mvn dependency:tree -Dverbose -DoutputType=text` outputs of the consumer
-project the proposal is exact: which direct dependencies to delete and which direct
-dependencies need an <exclusion> because they transitively bring an embedded coordinate.
-Without a tree it explains how to produce one and gives the generic snippets.
+project the proposal is exact: which direct dependencies to delete, which direct
+dependencies need an <exclusion> because they transitively bring an embedded coordinate, and
+which of the transitive dependencies the bundle POM still declares must be excluded on the
+bundle dependency itself (the module never had them, reaches them on its own, or only in test
+scope) rather than taken from the bundle. Without a tree it explains how to produce one and
+gives the generic snippets.
 
 The Enforcer rule in the proposal is the real gate: the consumer build fails whenever an
 embedded coordinate sneaks back through any path, and, when Spring Boot itself is not inside
@@ -21,7 +24,7 @@ import argparse
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -105,7 +108,7 @@ def manifest_from_jar(path: str) -> dict:
     if not gav or not contents:
         fail("%s is not an mvn-rebundle bundle (needs its own pom.properties and the %s manifest attribute)" % (path, BUNDLE_CONTENTS_ATTR))
     return {"bundle": gav, "coordinate": gav_str(gav), "components": parse_coordinates(contents.replace(",", "\n")),
-            "reduced_pom": "", "spring_boot_version": attrs.get(BUNDLE_BOOT_ATTR)}
+            "reduced_pom": "", "pom": "", "spring_boot_version": attrs.get(BUNDLE_BOOT_ATTR)}
 
 
 def manifest_from_coordinates(bundle: str, embedded_text: str) -> dict:
@@ -116,7 +119,7 @@ def manifest_from_coordinates(bundle: str, embedded_text: str) -> dict:
     if not components:
         fail("--embedded (or --embedded-file) is required with --bundle")
     return {"bundle": {"groupId": parts[0], "artifactId": parts[1], "version": parts[2]}, "coordinate": bundle,
-            "components": components, "reduced_pom": "", "spring_boot_version": None}
+            "components": components, "reduced_pom": "", "pom": "", "spring_boot_version": None}
 
 
 def boot_line_excludes(boot_version: str):
@@ -128,15 +131,22 @@ def boot_line_excludes(boot_version: str):
             "org.springframework.boot:spring-boot:[%d.%d,)" % (major, minor + 1)]
 
 
-def analyse_trees(texts, embedded_ga, hints=None, resolved=None):
+def analyse_trees(texts, embedded_ga, hints=None, resolved=None, promoted_ga=None):
     """Modules with the changes they need. Nodes matching a synthetic hint (artifactId and, when
-    known, version) count as embedded too; their real coordinates are recorded in `resolved`."""
+    known, version) count as embedded too; their real coordinates are recorded in `resolved`.
+
+    promoted_ga: transitive dependencies the bundle POM still declares. Per module each one is
+    either excluded on the bundle dependency (the module never had it, already reaches it through a
+    path without embedded coordinates, or only in test/provided scope) or kept (reachable only
+    through an embedded coordinate: once the exclusions are in place the bundle is its only path)."""
     modules = []
     resolved = resolved if resolved is not None else {}
     for text in texts:
         for tree in parse_dependency_trees(text):
             root = tree["root"]
-            module = {"module": ga_str(root), "remove_direct": OrderedDict(), "exclusions": OrderedDict(), "paths": []}
+            module = {"module": ga_str(root), "remove_direct": OrderedDict(), "exclusions": OrderedDict(), "paths": [],
+                      "bundle_exclusions": OrderedDict(), "promoted_kept": OrderedDict()}
+            matched = set()
             for node in tree["nodes"]:
                 ga = ga_str(node)
                 if ga not in embedded_ga:
@@ -145,6 +155,7 @@ def analyse_trees(texts, embedded_ga, hints=None, resolved=None):
                     if hit is None:
                         continue
                     resolved[hit["artifactId"]] = ga
+                matched.add(ga)
                 path = node["path"]
                 module["paths"].append(" -> ".join(path[1:]) + (" (%s)" % node["note"] if node.get("note") else ""))
                 if node["depth"] == 1:
@@ -157,18 +168,41 @@ def analyse_trees(texts, embedded_ga, hints=None, resolved=None):
             for node in tree["nodes"]:
                 if node["depth"] == 1 and ga_str(node) in module["exclusions"]:
                     module["exclusions"][ga_str(node)]["version"] = node.get("version")
+            occurrences = defaultdict(list)
+            for node in tree["nodes"]:
+                occurrences[ga_str(node)].append(node)
+            for ga in promoted_ga or []:
+                occ = occurrences.get(ga, [])
+                if not occ:
+                    module["bundle_exclusions"][ga] = "not in this module's dependency tree"
+                    continue
+                runtime = [n for n in occ if (n.get("scope") or "compile") in ("compile", "runtime")]
+                own = [n for n in runtime if not any(p in matched for p in n["path"][1:-1])]
+                if own:
+                    module["bundle_exclusions"][ga] = "already reached through " + " -> ".join(own[0]["path"][1:])
+                elif runtime:
+                    module["promoted_kept"][ga] = "reached only through " + " -> ".join(runtime[0]["path"][1:])
+                else:
+                    module["bundle_exclusions"][ga] = "only in %s scope here" % (occ[0].get("scope") or "unknown")
             modules.append(module)
     return modules
 
 
-def dependency_snippet(bundle: dict) -> str:
-    return "\n".join([
+def dependency_snippet(bundle: dict, exclusions=None) -> str:
+    lines = [
         "<dependency>",
         "  <groupId>%s</groupId>" % bundle["groupId"],
         "  <artifactId>%s</artifactId>" % bundle["artifactId"],
         "  <version>%s</version>" % bundle["version"],
-        "</dependency>",
-    ])
+    ]
+    if exclusions:
+        lines.append("  <exclusions>")
+        for ga in exclusions:
+            g, a = ga.split(":", 1)
+            lines += ["    <exclusion>", "      <groupId>%s</groupId>" % g, "      <artifactId>%s</artifactId>" % a, "    </exclusion>"]
+        lines.append("  </exclusions>")
+    lines.append("</dependency>")
+    return "\n".join(lines)
 
 
 def exclusion_snippet(direct_ga: str, targets, version) -> str:
@@ -192,7 +226,7 @@ def main() -> None:
     ap.add_argument("--embedded", default="", help="with --bundle: embedded coordinates g:a:v, comma or newline separated")
     ap.add_argument("--embedded-file", default="", help="with --bundle: file holding the embedded coordinates")
     ap.add_argument("--tree", action="append", default=[], help="dependency:tree text output (repeatable)")
-    ap.add_argument("--reduced-pom", help="dependency-reduced POM of the bundle (default from manifest)")
+    ap.add_argument("--reduced-pom", help="POM published with the bundle: the one finalize_bundle_pom.py wrote, or Shade's dependency-reduced POM (default from the manifest)")
     ap.add_argument("--out", default="out/consumer-patch.md")
     ap.add_argument("--out-json", default="out/consumer-patch.json")
     args = ap.parse_args()
@@ -215,8 +249,10 @@ def main() -> None:
     boot_version = man.get("spring_boot_version")
     boot_embedded = "org.springframework.boot:spring-boot" in embedded_ga
     boot_excludes = boot_line_excludes(boot_version) if boot_version and not boot_embedded else []
-    reduced_pom = Path(args.reduced_pom or man.get("reduced_pom") or "")
+    pom_candidates = [args.reduced_pom, man.get("pom"), man.get("reduced_pom")]
+    reduced_pom = next((Path(c) for c in pom_candidates if c and Path(c).is_file()), Path(""))
     promoted = [d for d in reduced_pom_dependencies(reduced_pom) if "%s:%s" % (d.get("groupId"), d.get("artifactId")) not in embedded_ga] if str(reduced_pom) and reduced_pom.is_file() else []
+    promoted_ga = ["%s:%s" % (d.get("groupId"), d.get("artifactId")) for d in promoted]
 
     texts = []
     for t in args.tree:
@@ -226,7 +262,7 @@ def main() -> None:
         else:
             log("WARN: tree file not found: %s" % t)
     resolved_synthetic = {}
-    modules = analyse_trees(texts, embedded_ga, [h for _, h in synthetic], resolved_synthetic) if texts else []
+    modules = analyse_trees(texts, embedded_ga, [h for _, h in synthetic], resolved_synthetic, promoted_ga) if texts else []
     banned_ga = sorted(embedded_ga | set(resolved_synthetic.values()))
 
     includes_arg = ",".join(banned_ga)
@@ -235,7 +271,7 @@ def main() -> None:
     md.append("")
     md.append("Coordinates embedded in the bundle: %s" % ", ".join(gav_str(g) for g in embedded))
     md.append("")
-    md.append("No Java code changes; package names stay the same. Three things to do: delete the replaced direct dependencies, add the bundle dependency, and add an exclusion on every path that still brings an original coordinate transitively. The Enforcer rule below fails the build whenever a path is missed.")
+    md.append("No Java code changes; package names stay the same. Three things to do: delete the replaced direct dependencies, add the bundle dependency, and add an exclusion on every path that still brings an original coordinate transitively. The Enforcer rule below fails the build whenever a path is missed. Section 2 also says, per module, which transitive dependencies of the bundle POM to exclude on the bundle dependency itself.")
     md.append("")
     md.append("## 1. Add the bundle dependency")
     md.append("")
@@ -264,6 +300,17 @@ def main() -> None:
                 for direct, info in m["exclusions"].items():
                     md.append("```xml\n%s\n```" % exclusion_snippet(direct, info["targets"], info.get("version")))
                     md.append("")
+            if m["bundle_exclusions"]:
+                md.append("The bundle POM still declares transitive dependencies this module must not take from the bundle; add the bundle dependency with these exclusions:")
+                md.append("")
+                for ga, why in m["bundle_exclusions"].items():
+                    md.append("- `%s`: %s" % (ga, why))
+                md.append("")
+                md.append("```xml\n%s\n```" % dependency_snippet(bundle, list(m["bundle_exclusions"])))
+                md.append("")
+            if m["promoted_kept"]:
+                md.append("Transitive dependencies this module keeps through the bundle: " + ", ".join("`%s` (%s)" % (ga, why) for ga, why in m["promoted_kept"].items()))
+                md.append("")
             md.append("<details><summary>Paths found in the dependency tree (%d)</summary>\n" % len(m["paths"]))
             for p in m["paths"]:
                 md.append("- %s" % p)
@@ -321,12 +368,12 @@ def main() -> None:
     md.append("## 5. Transitive dependencies the bundle POM still declares")
     md.append("")
     if promoted:
-        md.append("These are not embedded; consumers keep getting them transitively through the bundle. Their versions follow the consumer's dependencyManagement (for example the Spring Boot BOM):")
+        md.append("These are not embedded. The bundle POM promotes them so that a consumer which only reached them through an embedded coordinate still gets them. Section 2 decides per module: a module keeps one when it is reachable only through an embedded coordinate, and excludes it on the bundle dependency when it never had it, already reaches it on its own (the bundle would only move it ahead on the classpath and let the bundle's version compete) or has it only in test scope. Without a dependency tree, exclude the ones the module never had.")
         md.append("")
         for d in promoted:
             md.append("- `%s:%s:%s`%s" % (d.get("groupId"), d.get("artifactId"), d.get("version"), (" (scope %s)" % d["scope"]) if d.get("scope") else ""))
     else:
-        md.append("None (or the dependency-reduced POM was not available).")
+        md.append("None (or the bundle POM was not available).")
     md.append("")
     md.append("## 6. Verification")
     md.append("")
@@ -346,14 +393,16 @@ def main() -> None:
         "boot_line_excludes": boot_excludes,
         "synthetic": [{"gav": g, "hint": h, "resolved": resolved_synthetic.get(h["artifactId"]) if h else None} for g, h in synthetic],
         "banned": banned_ga,
-        "modules": [{"module": m["module"], "remove_direct": m["remove_direct"], "exclusions": m["exclusions"], "paths": m["paths"]} for m in modules],
+        "modules": [{"module": m["module"], "remove_direct": m["remove_direct"], "exclusions": m["exclusions"],
+                     "bundle_exclusions": m["bundle_exclusions"], "promoted_kept": m["promoted_kept"], "paths": m["paths"]} for m in modules],
         "promoted_dependencies": promoted,
         "tree_provided": bool(texts),
     })
     log("Consumer patch proposal written to %s" % args.out)
     for m in modules:
-        log("  %s: remove %d direct, exclusions on %d direct dependencies, %d paths" % (
-            m["module"], len(m["remove_direct"]), len(m["exclusions"]), len(m["paths"])))
+        log("  %s: remove %d direct, exclusions on %d direct dependencies, %d paths%s" % (
+            m["module"], len(m["remove_direct"]), len(m["exclusions"]), len(m["paths"]),
+            (", exclude on the bundle: %s" % ", ".join(m["bundle_exclusions"])) if m["bundle_exclusions"] else ""))
 
 
 if __name__ == "__main__":

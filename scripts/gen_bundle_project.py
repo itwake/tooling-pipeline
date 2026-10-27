@@ -8,7 +8,8 @@ The generated project
   * drops signatures, module-info, INDEX.LIST and relocates LICENSE/NOTICE files to
     META-INF/third-party/<artifact>-<version>/ so they cannot overwrite each other,
   * merges SPI files and Spring metadata with the matching transformers,
-  * publishes a dependency-reduced POM that keeps the non-embedded transitive dependencies.
+  * publishes a dependency-reduced POM that keeps the non-embedded transitive dependencies
+    (finalize_bundle_pom.py later restricts those to what the application contained).
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from identify import SYNTHETIC_GROUP  # noqa: E402
 from bundlelib import (  # noqa: E402
     AppArtifact,
     BUNDLE_BOOT_ATTR,
@@ -200,6 +202,8 @@ def main() -> None:
     ap.add_argument("--shade-version", default="3.6.0")
     ap.add_argument("--spring-boot-version", default="", help="override the detected Spring Boot version")
     ap.add_argument("--manifest-out", default="out/bundle-manifest.json")
+    ap.add_argument("--inventory", default="", help="inventory.json of the application (default: next to the selection file); "
+                    "its coordinates bound what the published POM may promote")
     args = ap.parse_args()
 
     sel = read_json(args.selection)
@@ -208,6 +212,20 @@ def main() -> None:
         fail("selection is empty")
     if not sel.get("ok", True):
         fail("selection has errors; refusing to generate")
+
+    # every identified coordinate of the application: the published POM may promote a transitive
+    # dependency only when the application had it (finalize_bundle_pom.py)
+    inv_path = Path(args.inventory) if args.inventory else Path(args.selection).resolve().parent / "inventory.json"
+    app_coordinates = []
+    if inv_path.is_file():
+        seen = set()
+        for d in read_json(inv_path).get("dependencies", []):
+            g = d.get("gav")
+            if g and g.get("groupId") and g.get("groupId") != SYNTHETIC_GROUP and ga_str(g) not in seen:
+                seen.add(ga_str(g))
+                app_coordinates.append({"groupId": g["groupId"], "artifactId": g["artifactId"], "version": g.get("version")})
+    else:
+        log("WARN: inventory not found at %s: the published POM cannot be restricted to the application's dependencies" % inv_path)
 
     transformers = sel.get("transformers", {})
     boot_version = args.spring_boot_version or sel.get("spring_boot_version")
@@ -344,6 +362,8 @@ def main() -> None:
         "project_dir": str(out),
         "expected_jar": str(out / "target" / ("%s-%s.jar" % (args.artifact_id, args.version))),
         "reduced_pom": str(out / "target" / "dependency-reduced-pom.xml"),
+        "pom": str(out / "target" / ("%s-%s.pom" % (args.artifact_id, args.version))),
+        "application_coordinates": app_coordinates,
         "generated_at": utc_now_iso(),
     }
     write_json(args.manifest_out, manifest)
@@ -360,6 +380,8 @@ def main() -> None:
             len(unidentified), ", ".join(u["name"] for u in unidentified)))
     log("  install    : install_components.py --manifest %s   (components from the application's bytes)" % args.manifest_out)
     log("  build      : mvn -f %s -B clean verify" % (out / "pom.xml"))
+    log("  finalize   : finalize_bundle_pom.py --manifest %s   (published POM: promoted dependencies limited to the application's %d coordinates)" % (
+        args.manifest_out, len(app_coordinates)))
 
 
 if __name__ == "__main__":

@@ -9,7 +9,8 @@ resolved), so a repository jar that differs from the one running in production f
   * LICENSE / NOTICE files were relocated under META-INF/third-party/<artifact>-<version>/
   * no signature files, module-info or INDEX.LIST survived; no unexpected extra entries
   * manifest carries the contents attribute (and Multi-Release when needed)
-  * the dependency-reduced POM no longer declares the embedded coordinates
+  * the published POM no longer declares the embedded coordinates and promotes only transitive
+    dependencies the application contained (finalize_bundle_pom.py)
 """
 from __future__ import annotations
 
@@ -71,13 +72,18 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manifest", default="out/bundle-manifest.json", help="written by gen_bundle_project.py")
     ap.add_argument("--bundle", help="built bundle jar (default: manifest.expected_jar)")
-    ap.add_argument("--reduced-pom", help="dependency-reduced POM (default: manifest.reduced_pom)")
+    ap.add_argument("--pom", help="published POM written by finalize_bundle_pom.py (default: manifest.pom when it exists)")
+    ap.add_argument("--reduced-pom", help="check Shade's dependency-reduced POM instead (default: manifest.reduced_pom)")
     ap.add_argument("--out", default="out/bundle-verification.json")
     args = ap.parse_args()
 
     man = read_json(args.manifest)
     bundle_path = Path(args.bundle or man["expected_jar"])
-    reduced_pom = Path(args.reduced_pom or man["reduced_pom"])
+    final_pom = Path(args.pom or man.get("pom") or "")
+    if args.pom or (not args.reduced_pom and str(final_pom) and final_pom.is_file()):
+        pom_path, finalized = final_pom, True
+    else:
+        pom_path, finalized = Path(args.reduced_pom or man["reduced_pom"]), False
     if not bundle_path.is_file():
         fail("bundle jar not found: %s" % bundle_path)
     app_path = (man.get("source") or {}).get("local_path")
@@ -191,16 +197,29 @@ def main() -> None:
     check("manifest-multi-release", want_mr == has_mr, "Multi-Release=%s, expected %s" % (has_mr, want_mr))
 
     promoted = []
-    if reduced_pom.is_file():
-        deps = reduced_pom_dependencies(reduced_pom)
+    if pom_path.is_file():
+        deps = reduced_pom_dependencies(pom_path)
         embedded_ga = {ga_str(c["gav"]) for c in man["components"]}
         still = [d for d in deps if "%s:%s" % (d.get("groupId"), d.get("artifactId")) in embedded_ga]
         promoted = [d for d in deps if d not in still]
         check("reduced-pom-drops-embedded", not still,
               "still declared: %s" % ", ".join("%s:%s" % (d.get("groupId"), d.get("artifactId")) for d in still) if still
               else "%d remaining dependencies: %s" % (len(promoted), ", ".join("%s:%s:%s" % (d.get("groupId"), d.get("artifactId"), d.get("version")) for d in promoted)))
+        app_ga = {ga_str(g) for g in man.get("application_coordinates") or []}
+        foreign = [d for d in promoted if "%s:%s" % (d.get("groupId"), d.get("artifactId")) not in app_ga] if app_ga else []
+        if not finalized:
+            check("pom-promotes-only-application-dependencies", False,
+                  "finalize_bundle_pom.py did not run: Shade's dependency-reduced POM would be published as is%s" % (
+                      " (it promotes %s, which the application never had)" % ", ".join("%s:%s" % (d.get("groupId"), d.get("artifactId")) for d in foreign) if foreign else ""),
+                  level="warn")
+        elif not app_ga:
+            check("pom-promotes-only-application-dependencies", False, "application coordinates unknown (inventory missing when the project was generated); nothing was pruned", level="warn")
+        else:
+            check("pom-promotes-only-application-dependencies", not foreign,
+                  "promoted although the application never had them: %s" % ", ".join("%s:%s" % (d.get("groupId"), d.get("artifactId")) for d in foreign) if foreign
+                  else "%d promoted dependencies, all present in the application" % len(promoted))
     else:
-        check("reduced-pom-drops-embedded", False, "dependency-reduced POM not found at %s" % reduced_pom, level="warn")
+        check("reduced-pom-drops-embedded", False, "POM not found at %s" % pom_path, level="warn")
 
     if man.get("sources_jar"):
         src_jar = bundle_path.with_name(bundle_path.stem + "-sources.jar")
@@ -213,12 +232,15 @@ def main() -> None:
         "size": bundle_path.stat().st_size,
         "entry_count": len(bnames),
         "expected_entry_count": len(expected),
+        "pom": str(pom_path) if pom_path.is_file() else None,
+        "pom_finalized": finalized and pom_path.is_file(),
         "checks": checks,
         "promoted_dependencies": promoted,
         "ok": not failed,
     }
     write_json(args.out, result)
     log("Bundle %s (%d entries, sha256 %s)" % (bundle_path.name, len(bnames), result["sha256"][:16]))
+    log("POM %s%s" % (pom_path, "" if finalized else " (dependency-reduced, not finalized)"))
     for c in checks:
         log("  [%s] %s%s" % (c["status"].upper(), c["check"], (": " + c["detail"]) if c["detail"] else ""))
     if failed:

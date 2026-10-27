@@ -26,10 +26,15 @@
   "warn_nested_jars": true,
 
   "equivalence": {
-    "_comment": "Non-dependency entries ignored by the application equivalence check (files that always change on a rebuild)",
+    "_comment": "Non-dependency entries ignored by the application equivalence check: files that always change on a rebuild, and a jar signature of the archive itself",
     "ignore_app_entries": [
       "META-INF/MANIFEST.MF",
       "META-INF/maven/**",
+      "META-INF/*.SF",
+      "META-INF/*.RSA",
+      "META-INF/*.DSA",
+      "META-INF/*.EC",
+      "META-INF/SIG-*",
       "META-INF/build-info.properties",
       "BOOT-INF/classpath.idx",
       "BOOT-INF/layers.idx",

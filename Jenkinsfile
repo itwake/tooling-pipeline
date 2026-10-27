@@ -61,7 +61,7 @@ pipeline {
         string(name: 'BUNDLE_ARTIFACT_ID', defaultValue: 'thirdparty-bundle', description: 'artifactId of the bundle; the groupId is BUNDLE_GROUP_ID in the environment block')
         string(name: 'BUNDLE_VERSION', defaultValue: '1.0.0-SNAPSHOT', description: 'version of the bundle; -SNAPSHOT goes to the snapshot repository')
         booleanParam(name: 'PUBLISH', defaultValue: false,
-                     description: 'Upload the verified jar, its dependency-reduced POM and the sources jar to Nexus; false builds and verifies only')
+                     description: 'Upload the verified jar, its POM and the sources jar to Nexus; false builds and verifies only')
     }
 
     environment {
@@ -164,6 +164,9 @@ pipeline {
                                             --repo-url "$NEXUS_MAVEN_REPO_URL" --local-repo "$MAVEN_LOCAL_REPO"
                                     '''
                                     sh 'mvn $MVN_FLAGS -f work/bundle/pom.xml clean verify'
+                                    // the published POM: Shade's dependency-reduced POM minus the promoted transitive
+                                    // dependencies the application never had (an excluded tomcat-annotations-api, for example)
+                                    sh '"$PY" scripts/finalize_bundle_pom.py --manifest out/bundle-manifest.json --report out/bundle-pom.json'
                                 }
                             }
                         }
@@ -207,7 +210,7 @@ pipeline {
     post {
         always {
             sh '"$PY" scripts/write_summary.py --out-dir out || true'
-            archiveArtifacts artifacts: 'out/**, work/bundle/pom.xml, work/bundle/target/*.jar, work/bundle/target/dependency-reduced-pom.xml',
+            archiveArtifacts artifacts: 'out/**, work/bundle/pom.xml, work/bundle/target/*.jar, work/bundle/target/*.pom, work/bundle/target/dependency-reduced-pom.xml',
                              allowEmptyArchive: true, fingerprint: true
         }
     }

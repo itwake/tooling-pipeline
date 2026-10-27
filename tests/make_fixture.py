@@ -300,8 +300,14 @@ def write_reduced_pom(path: Path, bundle: dict, remaining: list) -> Path:
 
 
 def build_new_app(old_app: Path, bundle_jar: Path, replaced_names: list, out: Path, keep_replaced=False,
-                  change_class=False, drop_lib=None, app_seed="v2") -> Path:
-    """Rebuild the fat jar as the consumer's build would after the POM change."""
+                  change_class=False, drop_lib=None, app_seed="v2", extra_libs=None, classpath_first=None,
+                  rewrite=None, swap_libs=None) -> Path:
+    """Rebuild the fat jar as the consumer's build would after the POM change.
+
+    extra_libs: jars added to BOOT-INF/lib; classpath_first: jar names placed ahead of the rest in
+    classpath.idx; rewrite: {entry: bytes or None} replacing (None: dropping) application entries;
+    swap_libs: {old jar name: new jar path}, a project module rebuilt under another version."""
+    extra_libs, classpath_first, rewrite, swap_libs = extra_libs or [], classpath_first or [], rewrite or {}, swap_libs or {}
     with zipfile.ZipFile(old_app) as zin, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
         names = zin.namelist()
         lib_names = []
@@ -312,8 +318,17 @@ def build_new_app(old_app: Path, bundle_jar: Path, replaced_names: list, out: Pa
                     continue
                 if drop_lib and base == drop_lib:
                     continue
+                if base in swap_libs:
+                    newp = Path(swap_libs[base])
+                    zout.write(newp, "BOOT-INF/lib/" + newp.name, compress_type=zipfile.ZIP_STORED)
+                    lib_names.append(newp.name)
+                    continue
                 lib_names.append(base)
                 zout.writestr(zin.getinfo(n), zin.read(n), compress_type=zipfile.ZIP_STORED)
+                continue
+            if n in rewrite:
+                if rewrite[n] is not None:
+                    zout.writestr(n, rewrite[n])
                 continue
             if n == "BOOT-INF/classpath.idx":
                 continue
@@ -330,8 +345,55 @@ def build_new_app(old_app: Path, bundle_jar: Path, replaced_names: list, out: Pa
         bname = "BOOT-INF/lib/" + bundle_jar.name
         zout.write(bundle_jar, bname, compress_type=zipfile.ZIP_STORED)
         lib_names.append(bundle_jar.name)
-        zout.writestr("BOOT-INF/classpath.idx", "".join('- "BOOT-INF/lib/%s"\n' % n for n in sorted(lib_names)).encode())
+        for extra in extra_libs:
+            zout.write(extra, "BOOT-INF/lib/" + Path(extra).name, compress_type=zipfile.ZIP_STORED)
+            lib_names.append(Path(extra).name)
+        order = [n for n in classpath_first if n in lib_names] + sorted(n for n in lib_names if n not in classpath_first)
+        zout.writestr("BOOT-INF/classpath.idx", "".join('- "BOOT-INF/lib/%s"\n' % n for n in order).encode())
     return out
+
+
+def version_class(name: str, version: str) -> bytes:
+    """A fake class whose constant pool holds the build version (a Version constant, a @Generated date...)."""
+    return fake_class(name) + b"\x01" + version.encode() + b"\x00"
+
+
+def project_module_jar(libdir: Path, artifact: str, version: str) -> Path:
+    """One of the project's own modules: the application's groupId, a class embedding the version."""
+    pkg = "com/example/%s/" % artifact.replace("-", "")
+    return dep_jar(libdir, "com.example", artifact, version, [], legal=False,
+                   extra={pkg + "Util.class": fake_class(pkg + "Util", "stable"), pkg + "Version.class": version_class(pkg + "Version", version)})
+
+
+def leaked_jar(libdir: Path) -> Path:
+    """A jar the old build never had (Shade promoted it from a component's POM) carrying a class path an
+    embedded jar also provides, like tomcat-annotations-api next to jakarta.annotation-api."""
+    return dep_jar(libdir, "org.apache.tomcat", "tomcat-annotations-api", "10.1.59", ["org/apache/commons/logging/LogFactory.class"],
+                   no_pom=True, legal=False, manifest_extra={"Implementation-Title": "Apache Tomcat"})
+
+
+def build_stamped_apps(target: Path, libs: dict, bundle_jar: Path, replaced_names: list):
+    """The original build under a CI-stamped version, signed, with a project module jar; the rebuild
+    under the plain POM version. The module's coordinates, its Version class and the application's
+    BuildStamp class differ, nothing else."""
+    old_v, new_v = "1.0.0-20240101", "1.0.0"
+    old_mod = project_module_jar(target / "old-modules", "app-common", old_v)
+    new_mod = project_module_jar(target / "new-modules", "app-common", new_v)
+    stamped = dict(libs)
+    stamped["app-common"] = old_mod
+    old_app = build_app(target / "old-app.jar", stamped, extra_app_entries={
+        "META-INF/maven/com.example/app/pom.properties": ("groupId=com.example\nartifactId=app\nversion=%s\n" % old_v).encode(),
+        "BOOT-INF/classes/com/example/BuildStamp.class": version_class("com.example.BuildStamp", old_v),
+        "META-INF/BOOT.SF": b"Signature-Version: 1.0\n",
+        "META-INF/BOOT.RSA": b"\x30\x82",
+    })
+    new_app = build_new_app(old_app, bundle_jar, replaced_names, target / "new-app.jar", swap_libs={old_mod.name: new_mod}, rewrite={
+        "META-INF/maven/com.example/app/pom.properties": ("groupId=com.example\nartifactId=app\nversion=%s\n" % new_v).encode(),
+        "BOOT-INF/classes/com/example/BuildStamp.class": version_class("com.example.BuildStamp", new_v),
+        "META-INF/BOOT.SF": None,
+        "META-INF/BOOT.RSA": None,
+    })
+    return old_app, new_app
 
 
 CONSUMER_ROOT_POM = """<?xml version="1.0" encoding="UTF-8"?>

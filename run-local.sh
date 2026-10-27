@@ -11,8 +11,9 @@
 #        | --bundle g:a:v --embedded "g:a:v,g:a:v"] [--tree dependency-tree.txt] [--project DIR [--apply]]
 #        (--project with a tree: edits the consumer POMs; without --apply only the diff is produced)
 #
-#   ./run-local.sh verify --old REF --new REF [--bundle-artifact-id ID] [--path /app/app.jar] \
+#   ./run-local.sh verify --old REF --new REF [--bundle-artifact-id ID] [--strict] [--path /app/app.jar] \
 #        [--maven-repo-url URL] [--nexus-hosts host1,host2] [--aws-region R]
+#        (--strict: differences outside the swap, normally warnings, fail the run too)
 #
 # REF is detected like SOURCE_REF in Jenkins: an image reference (append #/path for the application inside
 # it), Maven coordinates g:a:v[:packaging[:classifier]], an http(s) URL, or a local file / directory.
@@ -27,7 +28,7 @@ command -v "$PY" >/dev/null 2>&1 || PY=python
 mode=${1:-bundle}
 [ $# -gt 0 ] && shift
 
-usage() { sed -n '2,19p' "$0"; exit 2; }
+usage() { sed -n '2,20p' "$0"; exit 2; }
 
 extract() {  # <ref> <path> <out dir> <meta file>
     "$PY" scripts/extract_source.py --ref "$1" --path "$2" --type "$type" --nexus-hosts "$nexus_hosts" \
@@ -89,6 +90,7 @@ if [ "$mode" = "bundle" ]; then
         "$PY" scripts/install_components.py --manifest out/bundle-manifest.json --settings work/settings.xml \
             --repo-url "$maven_repo_url" --local-repo "$local_repo"
         mvn -B -ntp -s work/settings.xml -Dmaven.repo.local="$local_repo" -f work/bundle/pom.xml clean verify
+        "$PY" scripts/finalize_bundle_pom.py --manifest out/bundle-manifest.json --report out/bundle-pom.json
         "$PY" scripts/verify_bundle.py --manifest out/bundle-manifest.json --out out/bundle-verification.json
         if [ "$publish" = true ]; then
             "$PY" scripts/publish_bundle.py --manifest out/bundle-manifest.json --verification out/bundle-verification.json \
@@ -139,11 +141,13 @@ elif [ "$mode" = "consumer" ]; then
 
 elif [ "$mode" = "verify" ]; then
     old="" new="" bundle_artifact_id="" path=/app/app.jar type=auto image_tool=auto platform="" aws_region="" maven_repo_url="" nexus_hosts=""
+    strict=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --old) old=$2; shift 2;;
             --new) new=$2; shift 2;;
             --bundle-artifact-id) bundle_artifact_id=$2; shift 2;;
+            --strict) strict=(--strict); shift;;
             --path) path=$2; shift 2;;
             --image-tool) image_tool=$2; shift 2;;
             --platform) platform=$2; shift 2;;
@@ -158,7 +162,7 @@ elif [ "$mode" = "verify" ]; then
     extract "$old" "$path" work/old out/old-source.json
     extract "$new" "$path" work/new out/new-source.json
     "$PY" scripts/verify_app_equivalence.py --old-source out/old-source.json --new-source out/new-source.json \
-        --bundle-artifact-id "$bundle_artifact_id" --policy config/policy.json --out out/equivalence.json
+        --bundle-artifact-id "$bundle_artifact_id" --policy config/policy.json "${strict[@]}" --out out/equivalence.json
     "$PY" scripts/write_summary.py --out-dir out
     echo "done: see out/SUMMARY.md"
 else
