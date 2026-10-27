@@ -57,6 +57,7 @@ def main() -> None:
     patch = load(out / "consumer-patch.json")
     applied = load(out / "consumer-apply.json")
     equivalence = load(out / "equivalence.json")
+    plugin_check = load(out / "plugin-trees-check.json")
     publish = load(out / "publish.json")
 
     md = ["# Run summary", ""]
@@ -117,7 +118,19 @@ def main() -> None:
     if patch:
         md += ["## Consumer patch proposal", "", "See consumer-patch.md. %s" % (
             "Exact per-module change list derived from the dependency tree." if patch.get("tree_provided")
-            else "No consumer dependency tree was provided; generic instructions only."), ""]
+            else "No consumer dependency tree was provided; generic instructions only.")]
+        if patch.get("plugin_tree_provided"):
+            entries = patch.get("plugins") or []
+            md.append("")
+            md.append("Build plugins: %d with an embedded coordinate in their dependency tree (%d to patch, %d skipped), %d without." % (
+                len(entries), sum(1 for e in entries if e.get("action") == "patch"), sum(1 for e in entries if e.get("action") != "patch"),
+                patch.get("plugins_without_hits", 0)))
+            for e in entries:
+                md.append("- `%s` (%s): remove %d, exclude on %d, re-declare %d, shadowed %s%s" % (
+                    e["plugin"], e.get("action"), len(e.get("remove_declared") or {}), len(e.get("declared_exclusions") or {}),
+                    len(e.get("redeclare") or {}), ", ".join("`%s`" % ga for ga in (e.get("shadowed") or {})) or "none",
+                    (": " + e["reason"]) if e.get("reason") else ""))
+        md.append("")
     if applied:
         md += ["## Consumer POMs %s" % ("(dry run)" if applied.get("dry_run") else "changed"), "", "- Branch: `%s`" % applied.get("branch")]
         for f in applied.get("changed_files", []):
@@ -128,6 +141,19 @@ def main() -> None:
         if plugin:
             md.append("- `spring-boot-maven-plugin` aligned to %s, Spring Boot is inside the bundle%s" % (
                 plugin.get("version"), (": " + "; ".join(plugin["notes"])) if plugin.get("notes") else ""))
+        for p in applied.get("plugins") or []:
+            md.append("- plugin `%s`: %s%s" % (p["plugin"], p.get("action"), ("; " + "; ".join(p["notes"])) if p.get("notes") else ""))
+        md.append("")
+    if plugin_check:
+        md += ["## Plugin dependency check: %s" % (
+            "ok, every patched plugin sees the bundle and no embedded coordinate beyond the shadowed ones" if plugin_check.get("ok")
+            else "%d finding(s) to review" % len(plugin_check.get("findings") or [])), ""]
+        for f in plugin_check.get("findings") or []:
+            md.append("- %s" % f)
+        for p in plugin_check.get("plugins") or []:
+            md.append("- `%s`: %s%s%s" % (p["plugin"], p.get("status"),
+                                          (", shadowed: " + ", ".join("`%s`" % s for s in p["shadowed"])) if p.get("shadowed") else "",
+                                          (", remaining: " + ", ".join("`%s`" % r for r in p["remaining"])) if p.get("remaining") else ""))
         md.append("")
     if equivalence:
         md += ["## Application equivalence: %s" % outcome(equivalence), "",

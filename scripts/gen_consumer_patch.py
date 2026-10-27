@@ -17,6 +17,15 @@ gives the generic snippets.
 The Enforcer rule in the proposal is the real gate: the consumer build fails whenever an
 embedded coordinate sneaks back through any path, and, when Spring Boot itself is not inside
 the bundle, whenever the consumer leaves the Boot minor line the bundle was built from.
+
+With --plugin-tree (the dependency:tree output of the reactor plugin_trees.py writes) and --plugins
+(its JSON) the proposal also covers the build plugins: a plugin whose class realm contains an
+embedded coordinate gets the bundle as its first dependency, and the coordinate is taken away as far
+as Maven allows: removed when the POMs add it to the plugin, excluded on the added dependency that
+brings it, cut by re-declaring the plugin's own direct dependency with an exclusion when it is
+transitive, and only shadowed (the bundle precedes it on the realm classpath) when it is a direct
+dependency of the plugin itself, which no POM configuration can exclude. No Enforcer rule covers
+plugin realms; verify_plugin_trees.py checks the result after the build instead.
 """
 from __future__ import annotations
 
@@ -131,6 +140,84 @@ def boot_line_excludes(boot_version: str):
             "org.springframework.boot:spring-boot:[%d.%d,)" % (major, minor + 1)]
 
 
+# Artifacts the Maven core realm exports to every plugin realm (maven-core's META-INF/maven/extension.xml):
+# a plugin never loads them from its own dependencies, so an embedded coordinate among them is not a hit.
+MAVEN_CORE_ARTIFACTS = {
+    "classworlds:classworlds", "org.codehaus.plexus:plexus-classworlds", "org.codehaus.plexus:plexus-component-api",
+    "org.codehaus.plexus:plexus-container-default", "plexus:plexus-container-default", "org.sonatype.spice:spice-inject-plexus",
+    "org.sonatype.sisu:sisu-inject-plexus", "org.eclipse.sisu:org.eclipse.sisu.plexus",
+    "org.apache.maven:maven-artifact", "org.apache.maven:maven-aether-provider", "org.apache.maven:maven-resolver-provider",
+    "org.apache.maven:maven-artifact-manager", "org.apache.maven:maven-compat", "org.apache.maven:maven-core",
+    "org.apache.maven:maven-error-diagnostics", "org.apache.maven:maven-lifecycle", "org.apache.maven:maven-model",
+    "org.apache.maven:maven-model-builder", "org.apache.maven:maven-monitor", "org.apache.maven:maven-plugin-api",
+    "org.apache.maven:maven-plugin-descriptor", "org.apache.maven:maven-plugin-parameter-documenter",
+    "org.apache.maven:maven-plugin-registry", "org.apache.maven:maven-profile", "org.apache.maven:maven-project",
+    "org.apache.maven:maven-repository-metadata", "org.apache.maven:maven-settings", "org.apache.maven:maven-settings-builder",
+    "org.apache.maven:maven-toolchain", "org.apache.maven.wagon:wagon-provider-api",
+    "org.apache.maven.resolver:maven-resolver-api", "org.apache.maven.resolver:maven-resolver-spi",
+    "org.apache.maven.resolver:maven-resolver-impl", "org.apache.maven.resolver:maven-resolver-util",
+    "org.apache.maven.resolver:maven-resolver-connector-basic",
+    "javax.inject:javax.inject", "javax.annotation:javax.annotation-api", "org.slf4j:slf4j-api", "org.fusesource.jansi:jansi",
+    "org.sonatype.aether:aether-api", "org.sonatype.aether:aether-spi", "org.sonatype.aether:aether-impl",
+    "org.eclipse.aether:aether-api", "org.eclipse.aether:aether-spi", "org.eclipse.aether:aether-impl",
+    "org.eclipse.aether:aether-util", "org.eclipse.aether:aether-connector-basic",
+}
+
+PLUGIN_POLICY_DEFAULT = {"direct_hits": "shadow", "skip": []}
+
+
+def plugin_policy(path) -> dict:
+    """The plugins section of policy.json: direct_hits (shadow or skip) and the plugins never to touch."""
+    policy = {"direct_hits": PLUGIN_POLICY_DEFAULT["direct_hits"], "skip": []}
+    try:
+        section = read_json(Path(path)).get("plugins") or {}
+    except (OSError, ValueError):
+        return policy
+    if section.get("direct_hits") in ("shadow", "skip"):
+        policy["direct_hits"] = section["direct_hits"]
+    policy["skip"] = [s for s in (section.get("skip") or []) if isinstance(s, str)]
+    return policy
+
+
+def hit_ga(node, embedded_ga, hints, resolved):
+    """groupId:artifactId when the node is an embedded coordinate, by coordinates or through a synthetic
+    hint (artifactId and, when known, version); the hint's real coordinates are recorded in resolved."""
+    ga = ga_str(node)
+    if ga in embedded_ga:
+        return ga
+    hit = next((h for h in (hints or []) if h["artifactId"] == node["artifactId"]
+                and (not h.get("version") or h["version"] == node.get("version"))), None)
+    if hit is None:
+        return None
+    if resolved is not None:
+        resolved[hit["artifactId"]] = ga
+    return ga
+
+
+def promoted_dispositions(nodes, matched, promoted_ga, what="module"):
+    """Per transitive dependency the bundle POM still declares: excluded on the bundle dependency (never
+    in this tree, already reached through a path without embedded coordinates, or only in test/provided
+    scope) or kept (reachable only through an embedded coordinate)."""
+    exclusions, kept = OrderedDict(), OrderedDict()
+    occurrences = defaultdict(list)
+    for node in nodes:
+        occurrences[ga_str(node)].append(node)
+    for ga in promoted_ga or []:
+        occ = occurrences.get(ga, [])
+        if not occ:
+            exclusions[ga] = "not in this %s's dependency tree" % what
+            continue
+        runtime = [n for n in occ if (n.get("scope") or "compile") in ("compile", "runtime")]
+        own = [n for n in runtime if not any(p in matched for p in n["path"][1:-1])]
+        if own:
+            exclusions[ga] = "already reached through " + " -> ".join(own[0]["path"][1:])
+        elif runtime:
+            kept[ga] = "reached only through " + " -> ".join(runtime[0]["path"][1:])
+        else:
+            exclusions[ga] = "only in %s scope here" % (occ[0].get("scope") or "unknown")
+    return exclusions, kept
+
+
 def analyse_trees(texts, embedded_ga, hints=None, resolved=None, promoted_ga=None):
     """Modules with the changes they need. Nodes matching a synthetic hint (artifactId and, when
     known, version) count as embedded too; their real coordinates are recorded in `resolved`.
@@ -149,13 +236,9 @@ def analyse_trees(texts, embedded_ga, hints=None, resolved=None, promoted_ga=Non
                       "direct": list(OrderedDict.fromkeys(ga_str(n) for n in tree["nodes"] if n["depth"] == 1))}
             matched = set()
             for node in tree["nodes"]:
-                ga = ga_str(node)
-                if ga not in embedded_ga:
-                    hit = next((h for h in (hints or []) if h["artifactId"] == node["artifactId"]
-                                and (not h.get("version") or h["version"] == node.get("version"))), None)
-                    if hit is None:
-                        continue
-                    resolved[hit["artifactId"]] = ga
+                ga = hit_ga(node, embedded_ga, hints, resolved)
+                if ga is None:
+                    continue
                 matched.add(ga)
                 path = node["path"]
                 module["paths"].append(" -> ".join(path[1:]) + (" (%s)" % node["note"] if node.get("note") else ""))
@@ -169,24 +252,104 @@ def analyse_trees(texts, embedded_ga, hints=None, resolved=None, promoted_ga=Non
             for node in tree["nodes"]:
                 if node["depth"] == 1 and ga_str(node) in module["exclusions"]:
                     module["exclusions"][ga_str(node)]["version"] = node.get("version")
-            occurrences = defaultdict(list)
-            for node in tree["nodes"]:
-                occurrences[ga_str(node)].append(node)
-            for ga in promoted_ga or []:
-                occ = occurrences.get(ga, [])
-                if not occ:
-                    module["bundle_exclusions"][ga] = "not in this module's dependency tree"
-                    continue
-                runtime = [n for n in occ if (n.get("scope") or "compile") in ("compile", "runtime")]
-                own = [n for n in runtime if not any(p in matched for p in n["path"][1:-1])]
-                if own:
-                    module["bundle_exclusions"][ga] = "already reached through " + " -> ".join(own[0]["path"][1:])
-                elif runtime:
-                    module["promoted_kept"][ga] = "reached only through " + " -> ".join(runtime[0]["path"][1:])
-                else:
-                    module["bundle_exclusions"][ga] = "only in %s scope here" % (occ[0].get("scope") or "unknown")
+            module["bundle_exclusions"], module["promoted_kept"] = promoted_dispositions(tree["nodes"], matched, promoted_ga, "module")
             modules.append(module)
     return modules
+
+
+def classify_plugin_tree(tree, plugin_ga, embedded_ga, hints=None, resolved=None):
+    """Embedded coordinates in one plugin's dependency tree (a plugin_trees.py reactor module: the
+    dependencies the POMs add to the plugin and the plugin artifact at depth 1, the plugin's own
+    dependencies below it), sorted by where Maven lets the consumer act:
+
+      remove_declared      an added dependency that is itself embedded: delete it
+      declared_exclusions  an added dependency that brings one transitively: <exclusions> on it
+      redeclare            a transitive dependency of the plugin: re-declare the plugin's own direct
+                           dependency that brings it, with an exclusion (added dependencies dominate the
+                           plugin's own ones, so Maven takes the re-declaration)
+      shadowed             a direct dependency of the plugin itself, or reached only through one: no POM
+                           configuration can exclude it, the bundle merely precedes it on the realm classpath
+    """
+    nodes = tree["nodes"]
+    result = {"remove_declared": OrderedDict(), "declared_exclusions": OrderedDict(), "redeclare": OrderedDict(),
+              "shadowed": OrderedDict(), "paths": [], "hits": set(),
+              "direct": list(OrderedDict.fromkeys(ga_str(n) for n in nodes if n["depth"] == 1))}
+    hits = [(n, hit_ga(n, embedded_ga, hints, resolved)) for n in nodes]
+    hits = [(n, ga) for n, ga in hits if ga is not None and ga not in MAVEN_CORE_ARTIFACTS]
+    hit_set = {ga for _, ga in hits}
+    own_direct = {ga for n, ga in hits if n["depth"] == 2 and n["path"][1] == plugin_ga}
+    versions = {}
+    for n in nodes:
+        if not n.get("omitted"):
+            versions.setdefault(ga_str(n), n.get("version"))
+    for n, ga in hits:
+        path = n["path"]
+        result["hits"].add(ga)
+        result["paths"].append(" -> ".join(path[1:]) + (" (%s)" % n["note"] if n.get("note") else ""))
+        if path[1] != plugin_ga:  # below a dependency the POMs add to the plugin
+            if n["depth"] == 1:
+                result["remove_declared"].setdefault(ga, {"version": n.get("version"), "scope": n.get("scope")})
+            else:
+                entry = result["declared_exclusions"].setdefault(path[1], {"version": versions.get(path[1]), "targets": []})
+                if ga not in entry["targets"]:
+                    entry["targets"].append(ga)
+            continue
+        if n["depth"] == 2 or ga in own_direct or any(p in hit_set for p in path[2:-1]):
+            result["shadowed"].setdefault(ga, versions.get(ga) or n.get("version"))
+            continue
+        direct = path[2]
+        entry = result["redeclare"].setdefault(direct, {"version": versions.get(direct), "targets": []})
+        if ga not in entry["targets"]:
+            entry["targets"].append(ga)
+    return result
+
+
+def analyse_plugin_trees(texts, plugins_map, embedded_ga, hints=None, resolved=None, promoted_ga=None, policy=None):
+    """Entries for the plugin configurations whose dependency tree contains an embedded coordinate, with
+    the action the policy allows, and the number of configurations without any."""
+    policy = policy or PLUGIN_POLICY_DEFAULT
+    by_id = {p["id"]: p for p in (plugins_map or {}).get("plugins", [])}
+    entries, clean = [], 0
+    for text in texts:
+        for tree in parse_dependency_trees(text):
+            mapping = by_id.get(tree["root"]["artifactId"])
+            if mapping is None:
+                continue
+            plugin = mapping["plugin"]
+            plugin_ga = "%s:%s" % (plugin["groupId"], plugin["artifactId"])
+            c = classify_plugin_tree(tree, plugin_ga, embedded_ga, hints, resolved)
+            if not c["hits"]:
+                clean += 1
+                continue
+            excl, kept = promoted_dispositions(tree["nodes"], c["hits"], promoted_ga, "plugin")
+            entry = {"id": mapping["id"], "plugin": "%s:%s:%s" % (plugin["groupId"], plugin["artifactId"], plugin["version"]),
+                     "plugin_ga": plugin_ga, "modules": list(mapping.get("modules", [])),
+                     "remove_declared": c["remove_declared"], "declared_exclusions": c["declared_exclusions"],
+                     "redeclare": c["redeclare"], "shadowed": c["shadowed"],
+                     "bundle_exclusions": excl, "promoted_kept": kept, "paths": c["paths"], "action": "patch", "reason": None}
+            if plugin_ga in policy["skip"]:
+                entry["action"], entry["reason"] = "skip", "listed in policy plugins.skip"
+            elif c["shadowed"] and policy["direct_hits"] == "skip":
+                entry["action"], entry["reason"] = "skip", "its own direct dependencies %s are embedded: they cannot be excluded, and policy plugins.direct_hits is skip" % ", ".join(c["shadowed"])
+            entries.append(entry)
+    return entries, clean
+
+
+def plugin_management_snippet(entry: dict, bundle: dict) -> str:
+    g, a = entry["plugin_ga"].split(":", 1)
+    lines = ["<pluginManagement>", "  <plugins>", "    <plugin>", "      <groupId>%s</groupId>" % g,
+             "      <artifactId>%s</artifactId>" % a, "      <dependencies>"]
+    lines += ["        " + l for l in dependency_snippet(bundle, list(entry["bundle_exclusions"])).splitlines()]
+    for direct, info in entry["redeclare"].items():
+        dg, da = direct.split(":", 1)
+        lines += ["        <dependency>", "          <groupId>%s</groupId>" % dg, "          <artifactId>%s</artifactId>" % da,
+                  "          <version>%s</version>" % (info.get("version") or "the version the plugin resolves"), "          <exclusions>"]
+        for t in info["targets"]:
+            tg, ta = t.split(":", 1)
+            lines += ["            <exclusion>", "              <groupId>%s</groupId>" % tg, "              <artifactId>%s</artifactId>" % ta, "            </exclusion>"]
+        lines += ["          </exclusions>", "        </dependency>"]
+    lines += ["      </dependencies>", "    </plugin>", "  </plugins>", "</pluginManagement>"]
+    return "\n".join(lines)
 
 
 def dependency_snippet(bundle: dict, exclusions=None) -> str:
@@ -228,6 +391,10 @@ def main() -> None:
     ap.add_argument("--embedded-file", default="", help="with --bundle: file holding the embedded coordinates")
     ap.add_argument("--tree", action="append", default=[], help="dependency:tree text output (repeatable)")
     ap.add_argument("--reduced-pom", help="POM published with the bundle: the one finalize_bundle_pom.py wrote, or Shade's dependency-reduced POM (default from the manifest)")
+    ap.add_argument("--plugin-tree", action="append", default=[], help="dependency:tree text output of the reactor plugin_trees.py wrote (repeatable)")
+    ap.add_argument("--plugins", default="", help="consumer-plugins.json written by plugin_trees.py: the plugin configurations behind the reactor modules")
+    ap.add_argument("--policy", default=str(Path(__file__).resolve().parent.parent / "config" / "policy.json"),
+                    help="policy.json; its plugins section says how to treat plugins whose own direct dependencies are embedded")
     ap.add_argument("--out", default="out/consumer-patch.md")
     ap.add_argument("--out-json", default="out/consumer-patch.json")
     args = ap.parse_args()
@@ -264,6 +431,20 @@ def main() -> None:
             log("WARN: tree file not found: %s" % t)
     resolved_synthetic = {}
     modules = analyse_trees(texts, embedded_ga, [h for _, h in synthetic], resolved_synthetic, promoted_ga) if texts else []
+    plugin_texts = []
+    for t in args.plugin_tree:
+        p = Path(t)
+        if p.is_file():
+            plugin_texts.append(p.read_text(encoding="utf-8", errors="replace"))
+        else:
+            log("WARN: plugin tree file not found: %s" % t)
+    plugins_map = read_json(args.plugins) if args.plugins and Path(args.plugins).is_file() else None
+    if plugin_texts and plugins_map is None:
+        log("WARN: --plugin-tree without --plugins (consumer-plugins.json): the plugin trees cannot be mapped to plugins and are ignored")
+    policy = plugin_policy(args.policy)
+    plugins_checked = bool(plugin_texts and plugins_map)
+    plugin_entries, plugins_clean = analyse_plugin_trees(plugin_texts, plugins_map, embedded_ga, [h for _, h in synthetic],
+                                                         resolved_synthetic, promoted_ga, policy) if plugins_checked else ([], 0)
     banned_ga = sorted(embedded_ga | set(resolved_synthetic.values()))
 
     includes_arg = ",".join(banned_ga)
@@ -377,7 +558,50 @@ def main() -> None:
     else:
         md.append("None (or the bundle POM was not available).")
     md.append("")
-    md.append("## 6. Verification")
+    if plugins_checked:
+        md.append("## 6. Build plugins whose dependency tree contains an embedded coordinate")
+        md.append("")
+        md.append("A plugin's class realm is its artifact, its compile and runtime dependencies, and the dependencies the POMs add to it; the added ones come first and dominate the plugin's own. %d plugin configuration(s) checked: %d with an embedded coordinate in the realm, %d without. For a hit the bundle becomes the plugin's first dependency, in the root POM's `pluginManagement` so every module's use of the plugin inherits it, and the coordinate is taken away as far as Maven allows: an added dependency that is embedded is removed, an added dependency that brings one gets an exclusion, a transitive dependency of the plugin itself is cut by re-declaring the plugin's own direct dependency with an exclusion (that version is then pinned in the POM), and a direct dependency of the plugin itself cannot be excluded at all: the bundle precedes it on the realm classpath, so its classes come from the bundle while the jar is still resolved. No Enforcer rule covers plugin realms; the consumer job regenerates the plugin trees after the build and checks them instead." % (
+            len(plugin_entries) + plugins_clean, len(plugin_entries), plugins_clean))
+        md.append("")
+        for e in plugin_entries:
+            md.append("### %s" % e["plugin"])
+            md.append("")
+            md.append("Used by: %s." % ", ".join("`%s`" % m for m in e["modules"]))
+            md.append("")
+            if e["action"] != "patch":
+                md.append("**Left untouched**: %s." % e["reason"])
+                md.append("")
+            if e["remove_declared"]:
+                md.append("Remove from the dependencies the POMs add to the plugin: " + ", ".join("`%s` (%s)" % (ga, info.get("version")) for ga, info in e["remove_declared"].items()))
+                md.append("")
+            for direct, info in e["declared_exclusions"].items():
+                md.append("Add exclusions on the added dependency `%s`: %s" % (direct, ", ".join("`%s`" % t for t in info["targets"])))
+                md.append("")
+            for direct, info in e["redeclare"].items():
+                md.append("Re-declare the plugin's own dependency `%s` (version %s) with exclusions: %s" % (direct, info.get("version"), ", ".join("`%s`" % t for t in info["targets"])))
+                md.append("")
+            if e["shadowed"]:
+                md.append("Shadowed only, no exclusion is possible: " + ", ".join("`%s` (%s)" % (ga, v) for ga, v in e["shadowed"].items()))
+                md.append("")
+            if e["bundle_exclusions"]:
+                md.append("Exclusions on the bundle dependency: " + ", ".join("`%s` (%s)" % (ga, why) for ga, why in e["bundle_exclusions"].items()))
+                md.append("")
+            if e["promoted_kept"]:
+                md.append("Transitive dependencies the plugin keeps through the bundle: " + ", ".join("`%s` (%s)" % (ga, why) for ga, why in e["promoted_kept"].items()))
+                md.append("")
+            if e["action"] == "patch":
+                md.append("```xml\n%s\n```" % plugin_management_snippet(e, bundle))
+                md.append("")
+            md.append("<details><summary>Paths found in the plugin's dependency tree (%d)</summary>\n" % len(e["paths"]))
+            for p in e["paths"]:
+                md.append("- %s" % p)
+            md.append("\n</details>")
+            md.append("")
+        verification_section = "## 7. Verification"
+    else:
+        verification_section = "## 6. Verification"
+    md.append(verification_section)
     md.append("")
     md.append("1. Consumer `mvn -B clean verify`: a passing Enforcer check means no path brings the original coordinates back.")
     md.append("2. Run the verify job on the app.jar or image built before and after the change: every class and resource on the dependency classpath must be byte-identical, with only the replaced jars gone and the bundle added.")
@@ -400,12 +624,23 @@ def main() -> None:
                      "direct": m["direct"]} for m in modules],
         "promoted_dependencies": promoted,
         "tree_provided": bool(texts),
+        "plugins": plugin_entries,
+        "plugins_without_hits": plugins_clean,
+        "plugin_tree_provided": plugins_checked,
+        "plugin_policy": policy,
     })
     log("Consumer patch proposal written to %s" % args.out)
     for m in modules:
         log("  %s: remove %d direct, exclusions on %d direct dependencies, %d paths%s" % (
             m["module"], len(m["remove_direct"]), len(m["exclusions"]), len(m["paths"]),
             (", exclude on the bundle: %s" % ", ".join(m["bundle_exclusions"])) if m["bundle_exclusions"] else ""))
+    if plugins_checked:
+        log("  build plugins: %d with an embedded coordinate in their dependency tree (%d to patch, %d skipped), %d without" % (
+            len(plugin_entries), sum(1 for e in plugin_entries if e["action"] == "patch"), sum(1 for e in plugin_entries if e["action"] != "patch"), plugins_clean))
+        for e in plugin_entries:
+            log("    %s (%s): remove %d, exclude on %d, re-declare %d, shadowed %d%s" % (
+                e["plugin"], e["action"], len(e["remove_declared"]), len(e["declared_exclusions"]), len(e["redeclare"]), len(e["shadowed"]),
+                (": " + e["reason"]) if e.get("reason") else ""))
 
 
 if __name__ == "__main__":

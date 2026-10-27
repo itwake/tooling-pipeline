@@ -5,7 +5,11 @@
 // copied with the Copy Artifact plugin) or, with BUNDLE_COORDINATES, from Nexus (the bundle jar and its
 // POM are downloaded; the jar's manifest lists what it embeds). With CONSUMER_GIT_URL the consumer
 // project is checked out and `dependency:tree -Dverbose` runs there, so the proposal lists the
-// exclusions per module and per path; without it the proposal holds the generic snippets.
+// exclusions per module and per path; without it the proposal holds the generic snippets. The build
+// plugins are covered too: `help:effective-pom` lists the plugins every module uses (declared ones and
+// lifecycle defaults), plugin_trees.py turns them into a throwaway reactor whose dependency trees show each
+// plugin's class realm, and a plugin whose realm contains an embedded coordinate gets the bundle as its
+// first dependency, the coordinate removed or excluded where Maven allows it (config/policy.json, plugins).
 //
 // APPLY=true turns the proposal into a branch of the consumer project: the POMs are edited in place
 // (formatting and comments preserved), the project is built with the Enforcer gate, the rebuilt Spring
@@ -73,6 +77,14 @@ def equivalenceFindings() {
         return []
     }
     return readFile('out/equivalence-findings.txt').tokenize('\n').findAll { it.trim() }
+}
+
+// Findings of the plugin dependency check after the patch, prefixed [plugins]; empty when it did not run.
+def pluginFindings() {
+    if (!fileExists('out/plugin-trees-findings.txt')) {
+        return []
+    }
+    return readFile('out/plugin-trees-findings.txt').tokenize('\n').findAll { it.trim() }
 }
 
 // Git over https with a username/password credential; ssh remotes rely on the agent's keys.
@@ -199,8 +211,25 @@ pipeline {
                                     org.apache.maven.plugins:maven-dependency-plugin:3.7.1:tree \
                                     -Dverbose -DoutputType=text -DappendOutput=true \
                                     -DoutputFile="$WORKSPACE/out/consumer-dependency-tree.txt" $CONSUMER_MAVEN_ARGS
+                                mvn -B -ntp -s "$WORKSPACE/work/settings.xml" \
+                                    org.apache.maven.plugins:maven-help-plugin:3.4.1:effective-pom \
+                                    -Doutput="$WORKSPACE/out/consumer-effective-pom.xml" $CONSUMER_MAVEN_ARGS
                             '''
                         }
+                    }
+                }
+                // the build plugins: a throwaway reactor with one module per plugin configuration, whose
+                // dependency trees are the plugins' class realms
+                script {
+                    withNexusCredentials {
+                        sh '''
+                            "$PY" scripts/plugin_trees.py --effective-pom out/consumer-effective-pom.xml \
+                                --reactor work/plugin-trees --plugins-out out/consumer-plugins.json
+                            mvn -B -ntp -s "$WORKSPACE/work/settings.xml" -f work/plugin-trees/pom.xml \
+                                org.apache.maven.plugins:maven-dependency-plugin:3.7.1:tree \
+                                -Dverbose -DoutputType=text -DappendOutput=true \
+                                -DoutputFile="$WORKSPACE/out/consumer-plugin-trees.txt"
+                        '''
                     }
                 }
             }
@@ -211,6 +240,9 @@ pipeline {
                 sh '''
                     ARGS=""
                     if [ -f out/consumer-dependency-tree.txt ]; then ARGS="--tree out/consumer-dependency-tree.txt"; fi
+                    if [ -f out/consumer-plugin-trees.txt ] && [ -f out/consumer-plugins.json ]; then
+                        ARGS="$ARGS --plugin-tree out/consumer-plugin-trees.txt --plugins out/consumer-plugins.json"
+                    fi
                     if [ -n "$BUNDLE_COORDINATES" ]; then
                         JAR=$(ls work/bundle-jar/*.jar | head -1)
                         POM=$(ls work/bundle-pom/*.pom | head -1)
@@ -248,6 +280,40 @@ pipeline {
                         withNexusCredentials {
                             sh 'mvn -B -ntp -s "$WORKSPACE/work/settings.xml" $CONSUMER_BUILD_ARGS verify'
                         }
+                    }
+                }
+            }
+        }
+
+        stage('Verify plugin dependencies') {
+            when { allOf { expression { params.APPLY }; expression { params.CONSUMER_GIT_URL?.trim() }; expression { fileExists('out/consumer-plugins.json') } } }
+            steps {
+                script {
+                    // the plugin trees are regenerated from the changed POMs: every patched plugin must see the
+                    // bundle and no embedded coordinate beyond the shadowed ones (report only, UNSTABLE)
+                    withNexusCredentials {
+                        sh '''
+                            mvn -B -ntp -s "$WORKSPACE/work/settings.xml" -f work/consumer/pom.xml \
+                                org.apache.maven.plugins:maven-help-plugin:3.4.1:effective-pom \
+                                -Doutput="$WORKSPACE/out/consumer-effective-pom-after.xml" $CONSUMER_MAVEN_ARGS
+                            "$PY" scripts/plugin_trees.py --effective-pom out/consumer-effective-pom-after.xml \
+                                --reactor work/plugin-trees-after --plugins-out out/consumer-plugins-after.json
+                            mvn -B -ntp -s "$WORKSPACE/work/settings.xml" -f work/plugin-trees-after/pom.xml \
+                                org.apache.maven.plugins:maven-dependency-plugin:3.7.1:tree \
+                                -Dverbose -DoutputType=text -DappendOutput=true \
+                                -DoutputFile="$WORKSPACE/out/consumer-plugin-trees-after.txt"
+                            "$PY" scripts/verify_plugin_trees.py --patch out/consumer-patch.json --plugins out/consumer-plugins-after.json \
+                                --tree out/consumer-plugin-trees-after.txt --out out/plugin-trees-check.json \
+                                --findings-out out/plugin-trees-findings.txt
+                        '''
+                    }
+                    def findings = pluginFindings()
+                    if (findings) {
+                        echo "Plugin dependency check: ${findings.size()} finding(s):\n - " + findings.join('\n - ')
+                        env.PLUGIN_NOTE = "${findings.size()} finding(s), see ${env.BUILD_URL}artifact/out/SUMMARY.md"
+                        currentBuild.result = 'UNSTABLE'
+                    } else {
+                        env.PLUGIN_NOTE = 'every patched plugin sees the bundle and no embedded coordinate beyond the shadowed ones'
                     }
                 }
             }
@@ -300,16 +366,16 @@ pipeline {
             steps {
                 script {
                     def branch = readFile('out/consumer-apply.branch').trim()
-                    def lines = equivalenceFindings()
+                    def lines = equivalenceFindings() + pluginFindings()
                     def findings = lines.findAll { !it.startsWith('[info]') }
                     def push = true
                     if (findings && env.ON_DIFFERENCES == 'stop') {
-                        echo "ON_DIFFERENCES=stop: the rebuilt application differs from the original artifact, ${branch} is not pushed (the change is archived as out/consumer-apply.diff)"
+                        echo "ON_DIFFERENCES=stop: there are findings to review (comparison with the original artifact, plugin dependency check), ${branch} is not pushed (the change is archived as out/consumer-apply.diff)"
                         push = false
                     } else if (findings && env.ON_DIFFERENCES != 'push') {
                         try {
                             timeout(time: env.ON_DIFFERENCES_TIMEOUT.toInteger(), unit: 'MINUTES') {
-                                input message: "The rebuilt application differs from the original artifact in ${findings.size()} way(s):\n - ${lines.join('\n - ')}\n\nFull report: ${env.BUILD_URL}artifact/out/SUMMARY.md\n\nPush ${branch} anyway?",
+                                input message: "${findings.size()} finding(s) to review before pushing ${branch}:\n - ${lines.join('\n - ')}\n\nFull report: ${env.BUILD_URL}artifact/out/SUMMARY.md\n\nPush ${branch} anyway?",
                                       ok: 'Push the branch'
                             }
                         } catch (err) {
@@ -319,7 +385,7 @@ pipeline {
                     }
                     if (push) {
                         dir('work/consumer') {
-                            withEnv(["EQUIVALENCE_NOTE=${env.EQUIVALENCE_NOTE ?: 'not run'}"]) {
+                            withEnv(["EQUIVALENCE_NOTE=${env.EQUIVALENCE_NOTE ?: 'not run'}", "PLUGIN_NOTE=${env.PLUGIN_NOTE ?: 'not run'}"]) {
                                 sh '''
                                     git config user.name "$GIT_USER_NAME"
                                     git config user.email "$GIT_USER_EMAIL"
@@ -328,8 +394,10 @@ pipeline {
 Replace bundled dependencies with $(sed 's#^rebundle/##' "$WORKSPACE/out/consumer-apply.branch")
 
 Generated by mvn-rebundle: direct dependencies removed, exclusions added on the
-paths that reintroduce embedded coordinates, Enforcer gate installed.
+paths that reintroduce embedded coordinates, Enforcer gate installed, build plugins
+whose dependencies contained embedded coordinates given the bundle as first dependency.
 Comparison with the original artifact: $EQUIVALENCE_NOTE
+Plugin dependency check: $PLUGIN_NOTE
 EOF
                                 '''
                             }

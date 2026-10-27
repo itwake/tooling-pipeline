@@ -9,7 +9,9 @@
 #
 #   ./run-local.sh consumer [--manifest out/bundle-manifest.json | --bundle-jar X.jar [--reduced-pom X.pom]
 #        | --bundle g:a:v --embedded "g:a:v,g:a:v"] [--tree dependency-tree.txt] [--project DIR [--apply]]
-#        (--project with a tree: edits the consumer POMs; without --apply only the diff is produced)
+#        [--plugin-tree plugin-trees.txt --plugins consumer-plugins.json]
+#        (--project with a tree: edits the consumer POMs; without --apply only the diff is produced;
+#         --plugin-tree/--plugins: build plugins, from plugin_trees.py and its reactor's dependency:tree)
 #
 #   ./run-local.sh verify --old REF --new REF [--bundle-artifact-id ID] [--fail-on dependencies|any] [--path /app/app.jar] \
 #        [--maven-repo-url URL] [--nexus-hosts host1,host2] [--aws-region R]
@@ -104,7 +106,7 @@ if [ "$mode" = "bundle" ]; then
     echo "done: see out/SUMMARY.md"
 
 elif [ "$mode" = "consumer" ]; then
-    manifest=out/bundle-manifest.json bundle_jar="" reduced_pom="" bundle="" embedded="" tree="" project="" apply=false
+    manifest=out/bundle-manifest.json bundle_jar="" reduced_pom="" bundle="" embedded="" tree="" project="" apply=false plugin_tree="" plugins=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --manifest) manifest=$2; shift 2;;
@@ -113,6 +115,8 @@ elif [ "$mode" = "consumer" ]; then
             --bundle) bundle=$2; shift 2;;
             --embedded) embedded=$2; shift 2;;
             --tree) tree=$2; shift 2;;
+            --plugin-tree) plugin_tree=$2; shift 2;;
+            --plugins) plugins=$2; shift 2;;
             --project) project=$2; shift 2;;
             --apply) apply=true; shift;;
             *) echo "unknown option: $1"; usage;;
@@ -121,6 +125,8 @@ elif [ "$mode" = "consumer" ]; then
     mkdir -p out
     args=()
     [ -n "$tree" ] && args+=(--tree "$tree")
+    [ -n "$plugin_tree" ] && args+=(--plugin-tree "$plugin_tree")
+    [ -n "$plugins" ] && args+=(--plugins "$plugins")
     [ -n "$reduced_pom" ] && args+=(--reduced-pom "$reduced_pom")
     if [ -n "$bundle_jar" ]; then
         "$PY" scripts/gen_consumer_patch.py --bundle-jar "$bundle_jar" "${args[@]}" --out out/consumer-patch.md --out-json out/consumer-patch.json

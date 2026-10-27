@@ -25,6 +25,12 @@
   "warn_native_libs": true,
   "warn_nested_jars": true,
 
+  "plugins": {
+    "_comment": "Build plugins whose dependency tree contains an embedded coordinate get the bundle as their first dependency. direct_hits: 'shadow' patches such a plugin even when the coordinate is a direct dependency of the plugin itself (no exclusion is possible; the bundle precedes it on the realm classpath), 'skip' leaves those plugins untouched. skip: plugins (groupId:artifactId) never touched.",
+    "direct_hits": "shadow",
+    "skip": []
+  },
+
   "equivalence": {
     "_comment": "Non-dependency entries ignored by the application equivalence check: files that always change on a rebuild, and a jar signature of the archive itself",
     "ignore_app_entries": [

@@ -475,6 +475,100 @@ def main() -> None:
         run("apply_consumer_patch.py", "--patch", out / "consumer-patch.json", "--project", prof, "--out", out / "apply-prof2.json", "--diff", out / "apply-prof2.diff")
         ok("profile handling applied twice changes nothing",
            (out / "apply-prof2.diff").read_text(encoding="utf-8") == "" and not read_json(out / "apply-prof2.json")["changed_files"])
+
+        # ---- build plugins whose dependency tree contains embedded coordinates ---------------
+        print("[plugin dependencies]")
+        eff = work / "effective-pom.xml"
+        eff.write_text(fx.SAMPLE_EFFECTIVE_POM, encoding="utf-8")
+        run("plugin_trees.py", "--effective-pom", eff, "--reactor", work / "plugin-trees", "--plugins-out", out / "consumer-plugins.json")
+        plugins_map = read_json(out / "consumer-plugins.json")
+        ids = {p["plugin"]["artifactId"]: p["id"] for p in plugins_map["plugins"]}
+        sonar_module_pom = (work / "plugin-trees" / ids["sonar-maven-plugin"] / "pom.xml").read_text(encoding="utf-8")
+        ok("effective POM turned into one reactor module per plugin configuration, added dependencies first",
+           len(plugins_map["plugins"]) == 5 and sorted(plugins_map["modules"]) == ["com.example:app", "com.example:app-batch"]
+           and plugins_map["plugins"][0]["modules"] == ["com.example:app", "com.example:app-batch"] and ids["sonar-maven-plugin"] == "plugin-4"
+           and sonar_module_pom.split("<dependencies>")[1].index("vendor-tool") < sonar_module_pom.split("<dependencies>")[1].index("sonar-maven-plugin")
+           and "<version>5.8.0.7211</version>" in sonar_module_pom
+           and "<module>%s</module>" % ids["gen-maven-plugin"] in (work / "plugin-trees" / "pom.xml").read_text(encoding="utf-8")
+           and ET.fromstring(sonar_module_pom.encode("utf-8")) is not None)
+        ptree = work / "plugin-trees.txt"
+        ptree.write_text(fx.SAMPLE_PLUGIN_TREES, encoding="utf-8")
+        run("gen_consumer_patch.py", "--manifest", out / "bundle-manifest.json", "--tree", tree, "--plugin-tree", ptree, "--plugins", out / "consumer-plugins.json",
+            "--out", out / "consumer-patch-plugins.md", "--out-json", out / "consumer-patch-plugins.json")
+        pp = read_json(out / "consumer-patch-plugins.json")
+        by_plugin = {e["plugin"].split(":")[1]: e for e in pp["plugins"]}
+        ok("plugins without hits are only counted, hits are classified by where Maven lets the consumer act",
+           pp["plugin_tree_provided"] and pp["plugins_without_hits"] == 1
+           and set(by_plugin) == {"maven-surefire-plugin", "spring-boot-maven-plugin", "sonar-maven-plugin", "gen-maven-plugin"}
+           and list(by_plugin["sonar-maven-plugin"]["remove_declared"]) == ["commons-io:commons-io"]
+           and by_plugin["sonar-maven-plugin"]["declared_exclusions"]["com.vendor:vendor-tool"]["targets"] == ["commons-io:commons-io"]
+           and by_plugin["sonar-maven-plugin"]["redeclare"]["org.sonarsource.scanner.lib:sonar-scanner-java-library"] == {"version": "4.1.2.1663", "targets": ["commons-codec:commons-codec"]}
+           and by_plugin["maven-surefire-plugin"]["redeclare"]["org.apache.maven.surefire:maven-surefire-common"]["targets"] == ["commons-io:commons-io"]
+           and by_plugin["gen-maven-plugin"]["redeclare"]["com.vendor:gen-core"] == {"version": "3.0", "targets": ["commons-io:commons-io"]}
+           and by_plugin["spring-boot-maven-plugin"]["shadowed"] == {"org.springframework:spring-core": "6.1.14", "org.springframework:spring-jcl": "6.1.14"}
+           and not by_plugin["spring-boot-maven-plugin"]["redeclare"]
+           and all(e["action"] == "patch" for e in pp["plugins"])
+           and by_plugin["maven-surefire-plugin"]["bundle_exclusions"]["org.yaml:snakeyaml"] == "not in this plugin's dependency tree"
+           and by_plugin["maven-surefire-plugin"]["modules"] == ["com.example:app", "com.example:app-batch"])
+        md_p = (out / "consumer-patch-plugins.md").read_text(encoding="utf-8")
+        ok("proposal explains the plugin changes", "## 6. Build plugins" in md_p and "<pluginManagement>" in md_p and "Shadowed only" in md_p
+           and "Re-declare the plugin's own dependency `org.sonarsource.scanner.lib:sonar-scanner-java-library`" in md_p and "## 7. Verification" in md_p)
+        pol = work / "policy-skip.json"
+        pol.write_text(json.dumps({"plugins": {"direct_hits": "skip", "skip": ["org.apache.maven.plugins:maven-surefire-plugin"]}}), encoding="utf-8")
+        run("gen_consumer_patch.py", "--manifest", out / "bundle-manifest.json", "--tree", tree, "--plugin-tree", ptree, "--plugins", out / "consumer-plugins.json",
+            "--policy", pol, "--out", out / "cp-skip.md", "--out-json", out / "cp-skip.json")
+        skip_by = {e["plugin"].split(":")[1]: e for e in read_json(out / "cp-skip.json")["plugins"]}
+        ok("policy: listed plugins and plugins whose own direct dependencies are embedded are left untouched",
+           skip_by["maven-surefire-plugin"]["action"] == "skip" and "policy plugins.skip" in skip_by["maven-surefire-plugin"]["reason"]
+           and skip_by["spring-boot-maven-plugin"]["action"] == "skip" and "cannot be excluded" in skip_by["spring-boot-maven-plugin"]["reason"]
+           and skip_by["sonar-maven-plugin"]["action"] == "patch" and "Left untouched" in (out / "cp-skip.md").read_text(encoding="utf-8"))
+        plug = fx.build_consumer_project(work / "consumer-plugins", plugins=True)
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch-plugins.json", "--project", plug, "--out", out / "apply-plug.json", "--diff", out / "apply-plug.diff")
+        applied_plug = read_json(out / "apply-plug.json")
+        plug_app = (plug / "app" / "pom.xml").read_text(encoding="utf-8")
+        plug_root = (plug / "pom.xml").read_text(encoding="utf-8")
+        sonar_decl = plug_app.split("<artifactId>sonar-maven-plugin</artifactId>")[1].split("</plugin>")[0]
+        mgmt = plug_root.split("<pluginManagement>")[1].split("</pluginManagement>")[0]
+        sonar_mgmt = mgmt.split("<artifactId>sonar-maven-plugin</artifactId>")[1].split("</plugin>")[0]
+        boot_mgmt = mgmt.split("<artifactId>spring-boot-maven-plugin</artifactId>")[1].split("</plugin>")[0]
+        ok("dependencies the POM adds to a plugin: the embedded one removed, exclusion added on the one that brings it",
+           "<version>2.16.1</version>" not in sonar_decl and sonar_decl.count("<dependency>") == 1 and "vendor-tool" in sonar_decl
+           and sonar_decl.count("<exclusion>") == 1 and "<artifactId>commons-io</artifactId>" in sonar_decl
+           and "plugin sonar-maven-plugin: removed its dependency commons-io:commons-io (build/plugins)" in next(f["actions"] for f in applied_plug["changed_files"] if f["path"] == "app/pom.xml"))
+        ok("root pluginManagement: bundle first with its exclusions, the plugin's own dependency re-declared, lifecycle defaults included",
+           mgmt.count("<plugin>") == 4 and "maven-compiler-plugin" not in mgmt and "maven-surefire-plugin" in mgmt
+           and sonar_mgmt.index("thirdparty-bundle") < sonar_mgmt.index("sonar-scanner-java-library")
+           and "<artifactId>commons-codec</artifactId>" in sonar_mgmt and "<version>4.1.2.1663</version>" in sonar_mgmt
+           and "<artifactId>maven-surefire-common</artifactId>" in mgmt and "<artifactId>gen-core</artifactId>" in mgmt
+           and mgmt.count("<artifactId>thirdparty-bundle</artifactId>") == 4 and mgmt.count("<version>1.0.0</version>") == 4
+           and mgmt.count("<artifactId>snakeyaml</artifactId>") == 4 and boot_mgmt.count("<dependency>") == 1
+           and all(ET.fromstring(p.encode("utf-8")) is not None for p in (plug_app, plug_root)))
+        boot_report = next(p for p in applied_plug["plugins"] if "spring-boot-maven-plugin" in p["plugin"])
+        ok("apply reports the shadowed coordinates", len(applied_plug["plugins"]) == 4 and all(p["action"] == "patched" for p in applied_plug["plugins"])
+           and set(boot_report["shadowed"]) == {"org.springframework:spring-core", "org.springframework:spring-jcl"}
+           and any("stays in its realm" in n for n in boot_report["notes"]))
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch-plugins.json", "--project", plug, "--out", out / "apply-plug2.json", "--diff", out / "apply-plug2.diff")
+        ok("plugin dependency changes applied twice change nothing", (out / "apply-plug2.diff").read_text(encoding="utf-8") == "")
+        after = work / "plugin-trees-after.txt"
+        after.write_text(fx.SAMPLE_PLUGIN_TREES_AFTER, encoding="utf-8")
+        run("verify_plugin_trees.py", "--patch", out / "consumer-patch-plugins.json", "--plugins", out / "consumer-plugins.json", "--tree", after,
+            "--out", out / "plugin-trees-check.json", "--findings-out", out / "plugin-trees-findings.txt")
+        chk = read_json(out / "plugin-trees-check.json")
+        ok("post-patch plugin trees: bundle present, only the shadowed coordinates remain, the leftover is a finding",
+           not chk["ok"] and len(chk["findings"]) == 1 and "gen-maven-plugin" in chk["findings"][0] and "commons-io:commons-io" in chk["findings"][0]
+           and any(p["plugin"].endswith("spring-boot-maven-plugin:3.3.5") and p["status"] == "ok" and p["shadowed"] == ["org.springframework:spring-core", "org.springframework:spring-jcl"] for p in chk["plugins"])
+           and any(p["plugin"].endswith("sonar-maven-plugin:5.8.0.7211") and p["status"] == "ok" and not p["remaining"] for p in chk["plugins"])
+           and (out / "plugin-trees-findings.txt").read_text(encoding="utf-8").startswith("[plugins] "))
+        summary_dir = work / "summary-plugins"
+        summary_dir.mkdir()
+        shutil.copy(out / "consumer-patch-plugins.json", summary_dir / "consumer-patch.json")
+        shutil.copy(out / "apply-plug.json", summary_dir / "consumer-apply.json")
+        shutil.copy(out / "plugin-trees-check.json", summary_dir / "plugin-trees-check.json")
+        run("write_summary.py", "--out-dir", summary_dir)
+        summary_md = (summary_dir / "SUMMARY.md").read_text(encoding="utf-8")
+        ok("summary covers the plugin proposal, the applied plugin changes and the check",
+           "Build plugins: 4 with an embedded coordinate" in summary_md and "## Plugin dependency check: 1 finding(s) to review" in summary_md
+           and "pluginManagement sonar-maven-plugin" in summary_md)
         run("apply_consumer_patch.py", "--patch", out / "consumer-patch-io.json", "--project", cons, "--out", out / "apply-notree.json", "--diff", out / "apply-notree.diff", expect=2)
         ok("a proposal without a tree cannot be applied", not (out / "apply-notree.json").exists())
         (work / "consumer" / "app" / "target").mkdir(parents=True, exist_ok=True)

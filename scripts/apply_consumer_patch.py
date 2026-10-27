@@ -16,7 +16,13 @@ and edits the POMs in place, preserving their formatting and comments:
     when Spring Boot is not inside the bundle, pins the consumer to the Boot minor line,
   * when Spring Boot itself is inside the bundle, sets the version of spring-boot-maven-plugin to the
     embedded Boot version wherever the changed modules declare or manage the plugin inside the
-    checkout, so the launcher the plugin writes matches the runtime.
+    checkout, so the launcher the plugin writes matches the runtime,
+  * for every build plugin whose dependency tree contains an embedded coordinate (the proposal's
+    `plugins`, from the plugin trees): removes the coordinate from the dependencies the POMs add to
+    the plugin, adds exclusions on the added dependencies that bring one, and in the root POM's
+    pluginManagement puts the bundle first among the plugin's dependencies and re-declares the
+    plugin's own direct dependencies that bring one with exclusions. A direct dependency of the
+    plugin itself cannot be excluded; the bundle precedes it on the realm classpath.
 
 Dependencies declared in a parent POM inside the checkout are edited there. Dependencies that
 profiles declare and that the dependency tree never showed (the profile was not active when it ran)
@@ -252,13 +258,13 @@ def ancestors(pom: Pom, poms: Dict[str, Pom]) -> List[Pom]:
     return chain
 
 
-def boot_plugin_declarations(pom: Pom) -> List[Tuple[str, pomedit.Element]]:
-    """(where, element) for every declaration of spring-boot-maven-plugin in the POM: build/plugins,
-    build/pluginManagement, and the same two places inside each profile."""
+def plugin_declarations(pom: Pom, group: str, artifact: str, default_group: str = "org.apache.maven.plugins") -> List[Tuple[str, pomedit.Element]]:
+    """(where, element) for every declaration of a plugin in the POM: build/plugins, build/pluginManagement,
+    and the same two places inside each profile. A declaration without groupId means default_group."""
     def plugins_in(container, where):
         found = []
         for p in (container.children_named("plugin") if container is not None else []):
-            if p.child_text(pom.src, "artifactId") == BOOT_PLUGIN and p.child_text(pom.src, "groupId") in (None, BOOT_PLUGIN_GROUP):
+            if p.child_text(pom.src, "artifactId") == artifact and (p.child_text(pom.src, "groupId") or default_group) == group:
                 found.append((where, p))
         return found
 
@@ -274,6 +280,10 @@ def boot_plugin_declarations(pom: Pom) -> List[Tuple[str, pomedit.Element]]:
     for profile in (profiles.children_named("profile") if profiles is not None else []):
         found += in_build(profile.child("build"), "profile %s " % (profile.child_text(pom.src, "id") or "?"))
     return found
+
+
+def boot_plugin_declarations(pom: Pom) -> List[Tuple[str, pomedit.Element]]:
+    return plugin_declarations(pom, BOOT_PLUGIN_GROUP, BOOT_PLUGIN, default_group=BOOT_PLUGIN_GROUP)
 
 
 def resolve_property(pom: Pom, poms: Dict[str, Pom], expr: str, depth: int = 0) -> Optional[str]:
@@ -346,6 +356,8 @@ def align_boot_plugin(modules: List[Pom], poms: Dict[str, Pom], project: Path, v
                     break
                 if where.endswith("build/plugins") and (managed or parent_version == version):
                     continue
+                if where.endswith("pluginManagement") and parent_version == version:
+                    continue  # the entry only carries configuration or dependencies; the matching starter parent provides the version
                 change = ("insert", where, plugin, None, None, None)
                 break
             if change is None:
@@ -366,7 +378,7 @@ def align_boot_plugin(modules: List[Pom], poms: Dict[str, Pom], project: Path, v
                 continue
             ver = plugin.child("version")
             if ver is None:
-                source = "a pluginManagement entry inside the checkout" if managed else "spring-boot-starter-parent %s" % parent_version
+                source = ("spring-boot-starter-parent %s" % parent_version) if (where.endswith("pluginManagement") or not managed) else "a pluginManagement entry inside the checkout"
                 notes.append("%s: %s declares %s without a version, %s provides %s" % (rel, where, BOOT_PLUGIN, source, version))
             elif ver.text(pom.src) != version:
                 notes.append("%s: %s has %s %s, which resolves to %s" % (rel, where, BOOT_PLUGIN, ver.text(pom.src), version))
@@ -375,6 +387,164 @@ def align_boot_plugin(modules: List[Pom], poms: Dict[str, Pom], project: Path, v
     if not declared:
         warnings.append("%s is not declared in the changed modules or their parents inside the checkout; where the application is repackaged, set the plugin version to %s so the launcher matches the embedded Spring Boot runtime" % (BOOT_PLUGIN, version))
     return notes
+
+
+def find_plugin_dependency(owner: Pom, plugin, g: str, a: str):
+    """The <dependency> g:a among the dependencies a plugin declaration adds to the plugin."""
+    deps = plugin.child("dependencies")
+    if deps is None:
+        return None
+    for d in deps.children_named("dependency"):
+        if pomedit.dependency_ga(d, owner.src, owner.group) == (g, a):
+            return d
+    return None
+
+
+def plugin_declarations_seen(modules: List[Pom], poms: Dict[str, Pom], plugin_ga: str):
+    """(owner, where, element) for every declaration of the plugin the modules see, each POM once."""
+    g, a = plugin_ga.split(":", 1)
+    found, done = [], []
+    for module in modules:
+        for owner in ancestors(module, poms):
+            if any(owner is p for p in done):
+                continue
+            done.append(owner)
+            found += [(owner, where, el) for where, el in plugin_declarations(owner, g, a)]
+    return found
+
+
+def edit_plugin_added_dependencies(entry: dict, modules: List[Pom], poms: Dict[str, Pom], warnings: List[str]) -> None:
+    """The dependencies the POMs add to the plugin: delete the embedded ones and add exclusions on those
+    that bring one, in every declaration of the plugin the modules see."""
+    plugin_ga = entry["plugin_ga"]
+    name = plugin_ga.split(":", 1)[1]
+    for ga in entry.get("remove_declared") or {}:
+        g, a = ga.split(":", 1)
+        removed = False
+        while True:
+            hit = None
+            for owner, where, plugin in plugin_declarations_seen(modules, poms, plugin_ga):
+                d = find_plugin_dependency(owner, plugin, g, a)
+                if d is not None:
+                    hit = (owner, where, d)
+                    break
+            if hit is None:
+                break
+            owner, where, d = hit
+            owner.src = pomedit.remove_element(owner.src, d)
+            owner.reparse()
+            owner.actions.append("plugin %s: removed its dependency %s (%s)" % (name, ga, where))
+            removed = True
+        if not removed:
+            warnings.append("plugin %s: its dependency %s is in the effective POM but was not found in the checkout (declared in a parent outside it?)" % (entry["plugin"], ga))
+    for direct_ga, info in (entry.get("declared_exclusions") or {}).items():
+        g, a = direct_ga.split(":", 1)
+        targets = info.get("targets", [])
+
+        def matches():
+            return [(owner, where, plugin) for owner, where, plugin in plugin_declarations_seen(modules, poms, plugin_ga)
+                    if find_plugin_dependency(owner, plugin, g, a) is not None]
+
+        count = len(matches())
+        if not count:
+            warnings.append("plugin %s: its dependency %s (needs exclusions for %s) was not found in the checkout" % (entry["plugin"], direct_ga, ", ".join(targets)))
+            continue
+        for i in range(count):
+            owner, where, plugin = matches()[i]
+            added = ensure_exclusions(owner, find_plugin_dependency(owner, plugin, g, a), targets)
+            if added:
+                owner.actions.append("plugin %s: excluded %s from its dependency %s (%s)" % (name, ", ".join(added), direct_ga, where))
+    while True:  # a <dependencies> element left empty is dropped
+        empty = next(((owner, plugin.child("dependencies")) for owner, _, plugin in plugin_declarations_seen(modules, poms, plugin_ga)
+                      if plugin.child("dependencies") is not None and not plugin.child("dependencies").children_named("dependency")), None)
+        if empty is None:
+            break
+        owner, deps = empty
+        owner.src = pomedit.remove_element(owner.src, deps)
+        owner.reparse()
+
+
+def manage_plugin_dependencies(root_pom: Pom, entry: dict, bundle: dict, warnings: List[str]) -> None:
+    """Root POM pluginManagement: the bundle first among the plugin's dependencies, with the exclusions the
+    plugin needs, then the plugin's own direct dependencies re-declared with exclusions on the embedded
+    coordinates they bring. Every module's use of the plugin inherits it, lifecycle defaults included."""
+    g, a = entry["plugin_ga"].split(":", 1)
+    root_pom.src, _ = pomedit.ensure_child(root_pom.src, ["build", "pluginManagement", "plugins"], {})
+    root_pom.reparse()
+
+    def plugin_el():
+        plugins = root_pom.root.child("build").child("pluginManagement").child("plugins")
+        for p in plugins.children_named("plugin"):
+            if p.child_text(root_pom.src, "artifactId") == a and (p.child_text(root_pom.src, "groupId") or "org.apache.maven.plugins") == g:
+                return plugins, p
+        return plugins, None
+
+    def dependency(dg, da):
+        return find_plugin_dependency(root_pom, plugin_el()[1], dg, da)
+
+    plugins, plugin = plugin_el()
+    if plugin is None:
+        root_pom.src = pomedit.insert_child(root_pom.src, plugins, "<plugin>\n  <groupId>%s</groupId>\n  <artifactId>%s</artifactId>\n</plugin>" % (g, a), root_pom.root)
+        root_pom.reparse()
+        plugins, plugin = plugin_el()
+        root_pom.actions.append("pluginManagement: added %s to hold its dependencies" % a)
+    if plugin.child("dependencies") is None:
+        root_pom.src = pomedit.insert_child(root_pom.src, plugin, "<dependencies>\n</dependencies>", root_pom.root)
+        root_pom.reparse()
+
+    dep = dependency(bundle["groupId"], bundle["artifactId"])
+    if dep is None:
+        block = "<dependency>\n  <groupId>%s</groupId>\n  <artifactId>%s</artifactId>\n  <version>%s</version>\n</dependency>" % (
+            bundle["groupId"], bundle["artifactId"], bundle["version"])
+        root_pom.src = pomedit.insert_child(root_pom.src, plugin_el()[1].child("dependencies"), block, root_pom.root, first=True)
+        root_pom.reparse()
+        root_pom.actions.append("pluginManagement %s: bundle %s:%s:%s added as its first dependency" % (a, bundle["groupId"], bundle["artifactId"], bundle["version"]))
+    else:
+        v = dep.child("version")
+        if v is not None and v.text(root_pom.src) != bundle["version"]:
+            root_pom.src = pomedit.set_text(root_pom.src, v, bundle["version"])
+            root_pom.reparse()
+            root_pom.actions.append("pluginManagement %s: bundle version set to %s" % (a, bundle["version"]))
+    added = ensure_exclusions(root_pom, dependency(bundle["groupId"], bundle["artifactId"]), list(entry.get("bundle_exclusions") or {}))
+    if added:
+        root_pom.actions.append("pluginManagement %s: excluded %s from the bundle dependency" % (a, ", ".join(added)))
+    for direct, info in (entry.get("redeclare") or {}).items():
+        dg, da = direct.split(":", 1)
+        targets = info.get("targets", [])
+        inserted = False
+        if dependency(dg, da) is None:
+            if not info.get("version"):
+                warnings.append("plugin %s: the version of its dependency %s is unknown, it was not re-declared; exclude %s from it by hand" % (entry["plugin"], direct, ", ".join(targets)))
+                continue
+            block = "<dependency>\n  <groupId>%s</groupId>\n  <artifactId>%s</artifactId>\n  <version>%s</version>\n</dependency>" % (dg, da, info["version"])
+            root_pom.src = pomedit.insert_child(root_pom.src, plugin_el()[1].child("dependencies"), block, root_pom.root)
+            root_pom.reparse()
+            inserted = True
+        added = ensure_exclusions(root_pom, dependency(dg, da), targets)
+        if inserted:
+            root_pom.actions.append("pluginManagement %s: re-declared the plugin's dependency %s %s with exclusions %s" % (a, direct, info["version"], ", ".join(targets)))
+        elif added:
+            root_pom.actions.append("pluginManagement %s: excluded %s from the plugin's dependency %s" % (a, ", ".join(added), direct))
+
+
+def apply_plugin_entry(entry: dict, poms: Dict[str, Pom], root_pom: Pom, bundle: dict, warnings: List[str]) -> dict:
+    """One build plugin of the proposal: the edits above, or nothing when the proposal says skip."""
+    report = {"plugin": entry["plugin"], "modules": list(entry.get("modules") or []), "action": entry.get("action"),
+              "reason": entry.get("reason"), "shadowed": dict(entry.get("shadowed") or {}), "notes": []}
+    if entry.get("action") != "patch":
+        report["notes"].append("left untouched: %s" % entry.get("reason"))
+        return report
+    modules = [poms[m] for m in report["modules"] if m in poms]
+    missing = [m for m in report["modules"] if m not in poms]
+    if missing:
+        warnings.append("plugin %s: module(s) %s not found in the checkout, their declarations of the plugin were not edited" % (entry["plugin"], ", ".join(missing)))
+    if modules and (entry.get("remove_declared") or entry.get("declared_exclusions")):
+        edit_plugin_added_dependencies(entry, modules, poms, warnings)
+    manage_plugin_dependencies(root_pom, entry, bundle, warnings)
+    report["action"] = "patched"
+    for ga, v in report["shadowed"].items():
+        report["notes"].append("%s %s stays in its realm (direct dependency of the plugin, no exclusion possible); the bundle precedes it" % (ga, v))
+    return report
 
 
 def install_enforcer(root_pom: Pom, banned: List[str], boot_excludes: List[str], coordinate: str, boot_version: Optional[str]) -> None:
@@ -468,6 +638,9 @@ def main() -> None:
                 warnings.append("%s: not in the dependency tree because the profile was not active when it ran: %s. If they bring an embedded coordinate, rerun the consumer tree with the profile active (CONSUMER_MAVEN_ARGS=-P<id>) or add the exclusions by hand" % (pom.ga, ", ".join(unseen)))
     if multi_module and touched:
         manage_bundle_version(root_pom, bundle)
+    # before the Boot plugin alignment: a pluginManagement entry created here for the plugin's dependencies
+    # is then seen by the alignment, so a first and a second run make the same decision about its version
+    plugins_report = [apply_plugin_entry(e, poms, root_pom, bundle, warnings) for e in (patch.get("plugins") or [])]
     plugin_report = None
     if touched and patch.get("boot_embedded") and patch.get("spring_boot_version"):
         plugin_report = {"version": patch["spring_boot_version"],
@@ -499,6 +672,7 @@ def main() -> None:
         "changed_files": [{"path": p.path.relative_to(project).as_posix(), "actions": p.actions} for p in changed],
         "warnings": warnings,
         "spring_boot_plugin": plugin_report,
+        "plugins": plugins_report,
         "dry_run": args.dry_run,
     }
     write_json(args.out, result)
@@ -511,6 +685,9 @@ def main() -> None:
         log("  [WARN] %s" % w)
     for n in (plugin_report or {}).get("notes", []):
         log("  [plugin] %s" % n)
+    for pr in plugins_report:
+        for n in pr["notes"]:
+            log("  [plugin] %s: %s" % (pr["plugin"], n))
     log("Diff written to %s; suggested branch %s" % (args.diff, branch))
 
 
