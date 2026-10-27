@@ -1,4 +1,5 @@
-// mvn-rebundle / consumer: propose the POM change of a project that will consume a bundle.
+// mvn-rebundle / consumer: propose, and on request apply, the POM change of a project that will
+// consume a bundle.
 //
 // The bundle comes from an mvn-rebundle build (its archived bundle-manifest.json and dependency-reduced
 // POM are copied with the Copy Artifact plugin) or, with BUNDLE_COORDINATES, from Nexus (the bundle jar
@@ -6,7 +7,13 @@
 // consumer project is checked out and `dependency:tree -Dverbose` runs there, so the proposal lists the
 // exclusions per module and per path; without it the proposal holds the generic snippets.
 //
-// Agent requirements (Linux): Python 3.8+; Maven 3.6+ and a JDK when CONSUMER_GIT_URL is used.
+// APPLY=true turns the proposal into a branch of the consumer project: the POMs are edited in place
+// (formatting and comments preserved), the project is built with the Enforcer gate, the rebuilt Spring
+// Boot archive is compared with the artifact the bundle was built from, and the branch is pushed for
+// review. Nothing is merged automatically.
+//
+// Agent requirements (Linux): Python 3.8+; Maven 3.6+ and a JDK when CONSUMER_GIT_URL is used;
+// docker or crane (and the aws CLI for ECR) when the original artifact is an image.
 // Plugins: Copy Artifact (unless BUNDLE_COORDINATES is used), Git, Credentials Binding.
 // The upstream job may need "Permission to Copy Artifact" granted to this job.
 // Job setup: "Pipeline script from SCM", Script Path = jenkins/Jenkinsfile.consumer.
@@ -23,11 +30,57 @@ def withNexusCredentials(Closure body) {
     }
 }
 
-def withSourceCredentials(Closure body) {
-    if (env.SOURCE_CREDENTIALS_ID?.trim()) {
+// Credentials needed to read a source artifact; `auth` is what `extract_source.py --detect` printed.
+def withSourceCredentials(String auth, Closure body) {
+    if (auth == 'ecr' && env.AWS_CREDENTIALS_ID?.trim()) {
+        withCredentials([aws(credentialsId: env.AWS_CREDENTIALS_ID,
+                             accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+            body()
+        }
+    } else if (auth == 'nexus' && env.SOURCE_CREDENTIALS_ID?.trim()) {
         withCredentials([usernamePassword(credentialsId: env.SOURCE_CREDENTIALS_ID,
                                           usernameVariable: 'SOURCE_USERNAME', passwordVariable: 'SOURCE_PASSWORD')]) {
             body()
+        }
+    } else {
+        body()
+    }
+}
+
+// Detects one reference, binds the credentials it needs and extracts it to work/<label>.
+def fetchSource(String label, String ref) {
+    withEnv(["FETCH_REF=${ref}", "FETCH_LABEL=${label}"]) {
+        def detected = sh(returnStdout: true,
+                          script: '"$PY" scripts/extract_source.py --detect --ref "$FETCH_REF" --nexus-hosts "$NEXUS_HOSTS"').trim()
+        echo "${label} source detected: ${detected}"
+        withSourceCredentials(detected.tokenize()[1]) {
+            sh '''
+                "$PY" scripts/extract_source.py --ref "$FETCH_REF" --path "$DEFAULT_APP_PATH" --nexus-hosts "$NEXUS_HOSTS" \
+                    --image-tool "$IMAGE_TOOL" --platform "$IMAGE_PLATFORM" --maven-repo-url "$NEXUS_MAVEN_REPO_URL" \
+                    --out "work/$FETCH_LABEL" --meta "out/$FETCH_LABEL-source.json"
+            '''
+        }
+    }
+}
+
+// Git over https with a username/password credential; ssh remotes rely on the agent's keys.
+def withGitCredentials(Closure body) {
+    if (env.GIT_CREDENTIALS_ID?.trim()) {
+        withCredentials([usernamePassword(credentialsId: env.GIT_CREDENTIALS_ID,
+                                          usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD')]) {
+            sh '''
+                cat > work/git-askpass.sh <<'EOF'
+#!/bin/sh
+case "$1" in
+  Username*) printf '%s\\n' "$GIT_USERNAME" ;;
+  Password*) printf '%s\\n' "$GIT_PASSWORD" ;;
+esac
+EOF
+                chmod +x work/git-askpass.sh
+            '''
+            withEnv(["GIT_ASKPASS=${env.WORKSPACE}/work/git-askpass.sh", 'GIT_TERMINAL_PROMPT=0']) {
+                body()
+            }
         }
     } else {
         body()
@@ -39,35 +92,52 @@ pipeline {
 
     options {
         buildDiscarder(logRotator(numToKeepStr: '30'))
-        timeout(time: 30, unit: 'MINUTES')
+        timeout(time: 60, unit: 'MINUTES')
     }
 
     parameters {
         string(name: 'UPSTREAM_BUILD', defaultValue: '', description: 'Build number of the UPSTREAM_JOB run to take the bundle from; empty = last successful build')
         string(name: 'BUNDLE_COORDINATES', defaultValue: '',
                description: 'Alternative to the upstream build: groupId:artifactId:version of a bundle already published to Nexus')
-        string(name: 'CONSUMER_GIT_URL', defaultValue: '', description: 'Optional: git URL of the consumer project; enables the per-path exclusion list')
+        string(name: 'CONSUMER_GIT_URL', defaultValue: '', description: 'Git URL of the consumer project; enables the per-path exclusion list and APPLY')
         string(name: 'CONSUMER_GIT_REF', defaultValue: 'main', description: 'Consumer branch, tag or commit')
         string(name: 'CONSUMER_MAVEN_ARGS', defaultValue: '', description: 'Extra arguments for the consumer dependency:tree run, e.g. -Pprod')
+        booleanParam(name: 'APPLY', defaultValue: false,
+                     description: 'Edit the consumer POMs on a branch, build with the Enforcer gate, compare the rebuilt archive with the original artifact and push the branch for review')
+        string(name: 'VERIFY_AGAINST', defaultValue: '',
+               description: 'APPLY: artifact to compare the rebuilt archive with (image reference, coordinates, URL or agent path); empty = the artifact the bundle was built from')
     }
 
     environment {
         // ---- site specific: edit once -------------------------------------------------------
         UPSTREAM_JOB          = 'mvn-rebundle'   // name of the build job whose archives hold bundle-manifest.json
-        NEXUS_MAVEN_REPO_URL  = 'https://nexus.example.com/repository/maven-public/'   // BUNDLE_COORDINATES are downloaded from here
-        SOURCE_CREDENTIALS_ID = 'nexus-deploy'   // Nexus credential for downloading the bundle
+        NEXUS_MAVEN_REPO_URL  = 'https://nexus.example.com/repository/maven-public/'   // bundle coordinates and the original artifact are resolved here
+        NEXUS_DOCKER_REGISTRY = 'nexus-docker.example.com'   // host[:port] of the Nexus Docker registry (original artifact as an image)
+        SOURCE_CREDENTIALS_ID = 'nexus-deploy'   // Nexus credential for downloading the bundle / the original artifact
+        AWS_CREDENTIALS_ID    = ''               // original artifact in ECR: AWS credential ID; empty = the agent's instance role
         NEXUS_CREDENTIALS_ID  = ''               // only needed when MAVEN_MIRROR_URL requires authentication
-        MAVEN_MIRROR_URL      = ''               // Maven mirror for the consumer dependency:tree run; empty = Maven Central
-        GIT_CREDENTIALS_ID    = ''               // optional: credential ID for checking out CONSUMER_GIT_URL
+        MAVEN_MIRROR_URL      = ''               // Maven mirror for the consumer builds; empty = Maven Central
+        GIT_CREDENTIALS_ID    = ''               // username/password credential with push rights on CONSUMER_GIT_URL (https); empty = agent keys
+        GIT_USER_NAME         = 'mvn-rebundle'
+        GIT_USER_EMAIL        = 'mvn-rebundle@example.com'
+        CONSUMER_BUILD_ARGS   = '-DskipTests'    // APPLY: arguments of the consumer build (`mvn ... verify`)
+        PUSH_BRANCH           = 'true'           // APPLY: push the branch to the consumer repository
+        DEFAULT_APP_PATH      = '/app/app.jar'   // original artifact as an image: application path inside it
+        IMAGE_PLATFORM        = ''
+        IMAGE_TOOL            = 'auto'
         // -----------------------------------------------------------------------------------
-        NEXUS_HOSTS = "${NEXUS_MAVEN_REPO_URL}"
+        NEXUS_HOSTS = "${NEXUS_DOCKER_REGISTRY},${NEXUS_MAVEN_REPO_URL}"
         PY = 'python3'
     }
 
     stages {
         stage('Prepare') {
             steps {
-                sh 'rm -rf work out && mkdir -p work out && "$PY" --version'
+                sh '''
+                    rm -rf work out && mkdir -p work out
+                    echo "mvn-rebundle revision: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+                    "$PY" --version
+                '''
                 sh '"$PY" scripts/gen_maven_settings.py --server-id nexus --mirror-url "$MAVEN_MIRROR_URL" --out work/settings.xml'
             }
         }
@@ -88,7 +158,7 @@ pipeline {
             when { expression { params.BUNDLE_COORDINATES?.trim() } }
             steps {
                 script {
-                    withSourceCredentials {
+                    withSourceCredentials('nexus') {
                         sh '''
                             "$PY" scripts/extract_source.py --ref "$BUNDLE_COORDINATES" --nexus-hosts "$NEXUS_HOSTS" \
                                 --maven-repo-url "$NEXUS_MAVEN_REPO_URL" --out work/bundle-jar --meta out/bundle-jar-source.json
@@ -138,6 +208,87 @@ pipeline {
                             --out out/consumer-patch.md --out-json out/consumer-patch.json
                     fi
                 '''
+            }
+        }
+
+        stage('Apply patch') {
+            when { allOf { expression { params.APPLY }; expression { params.CONSUMER_GIT_URL?.trim() } } }
+            steps {
+                sh '''
+                    "$PY" scripts/apply_consumer_patch.py --patch out/consumer-patch.json --project work/consumer \
+                        --out out/consumer-apply.json --diff out/consumer-apply.diff
+                    "$PY" -c "import json; print(json.load(open('out/consumer-apply.json'))['branch'])" > out/consumer-apply.branch
+                    git -C work/consumer checkout -B "$(cat out/consumer-apply.branch)"
+                    echo "--- changes ---"; cat out/consumer-apply.diff
+                '''
+            }
+        }
+
+        stage('Build consumer with the Enforcer gate') {
+            when { allOf { expression { params.APPLY }; expression { params.CONSUMER_GIT_URL?.trim() } } }
+            steps {
+                dir('work/consumer') {
+                    script {
+                        withNexusCredentials {
+                            sh 'mvn -B -ntp -s "$WORKSPACE/work/settings.xml" $CONSUMER_BUILD_ARGS verify'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Verify rebuilt application') {
+            when { allOf { expression { params.APPLY }; expression { params.CONSUMER_GIT_URL?.trim() } } }
+            steps {
+                script {
+                    sh '"$PY" scripts/find_app_jar.py --project work/consumer --manifest out/bundle-manifest.json --out out/rebuilt-app.json'
+                    def oldRef = params.VERIFY_AGAINST?.trim()
+                    if (!oldRef) {
+                        oldRef = sh(returnStdout: true, script: '"$PY" -c "import json; print(json.load(open(\'out/rebuilt-app.json\')).get(\'old_ref\') or \'\')"').trim()
+                    }
+                    if (!oldRef) {
+                        echo 'The original artifact is unknown (bundle taken from Nexus and VERIFY_AGAINST empty): equivalence check skipped'
+                        return
+                    }
+                    fetchSource('old', oldRef)
+                    sh '''
+                        NEW=$("$PY" -c "import json; print(json.load(open('out/rebuilt-app.json'))['new_jar'])")
+                        "$PY" scripts/verify_app_equivalence.py --old-source out/old-source.json --new "$NEW" \
+                            --policy config/policy.json --out out/equivalence.json
+                    '''
+                }
+            }
+        }
+
+        stage('Push branch') {
+            when {
+                allOf {
+                    expression { params.APPLY }
+                    expression { params.CONSUMER_GIT_URL?.trim() }
+                    expression { env.PUSH_BRANCH == 'true' }
+                }
+            }
+            steps {
+                script {
+                    def branch = readFile('out/consumer-apply.branch').trim()
+                    dir('work/consumer') {
+                        sh '''
+                            git config user.name "$GIT_USER_NAME"
+                            git config user.email "$GIT_USER_EMAIL"
+                            git add -A -- '*pom.xml'
+                            git commit -q -F - <<EOF
+Replace bundled dependencies with $(sed 's#^rebundle/##' "$WORKSPACE/out/consumer-apply.branch")
+
+Generated by mvn-rebundle: direct dependencies removed, exclusions added on the
+paths that reintroduce embedded coordinates, Enforcer gate installed.
+EOF
+                        '''
+                        withGitCredentials {
+                            sh "git push origin HEAD:refs/heads/${branch}"
+                        }
+                        echo "Pushed ${branch}: open a merge request from it"
+                    }
+                }
             }
         }
     }

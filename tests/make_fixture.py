@@ -334,6 +334,154 @@ def build_new_app(old_app: Path, bundle_jar: Path, replaced_names: list, out: Pa
     return out
 
 
+CONSUMER_ROOT_POM = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.5</version>
+        <relativePath/> <!-- lookup parent from repository -->
+    </parent>
+    <groupId>com.example</groupId>
+    <artifactId>consumer-parent</artifactId>
+    <version>1.0.0</version>
+    <packaging>pom</packaging>
+
+    <modules>
+        <module>app</module>
+        <module>app-batch</module>
+    </modules>
+
+    <!-- shared build settings -->
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>enforce-versions</id>
+                        <goals><goal>enforce</goal></goals>
+                        <configuration>
+                            <rules><requireMavenVersion><version>3.6</version></requireMavenVersion></rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+"""
+
+CONSUMER_APP_POM = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>consumer-parent</artifactId>
+        <version>1.0.0</version>
+    </parent>
+    <artifactId>app</artifactId>
+
+    <dependencies>
+        <!-- web stack -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-logging</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>commons-io</groupId>
+            <artifactId>commons-io</artifactId>
+            <version>2.16.1</version>
+        </dependency>
+        <dependency>
+            <groupId>com.vendor</groupId>
+            <artifactId>vendor-sdk</artifactId>
+            <version>2.0.0</version>
+        </dependency>
+        <dependency>
+            <groupId>org.yaml</groupId>
+            <artifactId>snakeyaml</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-text</artifactId>
+            <version>1.12.0</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>
+"""
+
+CONSUMER_BATCH_POM = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>consumer-parent</artifactId>
+        <version>1.0.0</version>
+    </parent>
+    <artifactId>app-batch</artifactId>
+    <dependencies>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>app</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency><groupId>org.yaml</groupId><artifactId>snakeyaml</artifactId></dependency>
+    </dependencies>
+</project>
+"""
+
+CONSUMER_SINGLE_POM = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>app</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+      <version>3.3.5</version>
+    </dependency>
+    <dependency>
+      <groupId>commons-io</groupId>
+      <artifactId>commons-io</artifactId>
+      <version>2.16.1</version>
+    </dependency>
+  </dependencies>
+</project>
+"""
+
+
+def build_consumer_project(target: Path, single: bool = False) -> Path:
+    """A consumer project matching SAMPLE_TREE: multi-module with comments and 4-space indentation,
+    or a single module with 2-space indentation and no build section."""
+    if target.exists():
+        import shutil
+
+        shutil.rmtree(target)
+    if single:
+        target.mkdir(parents=True)
+        (target / "pom.xml").write_text(CONSUMER_SINGLE_POM, encoding="utf-8")
+        return target
+    (target / "app").mkdir(parents=True)
+    (target / "app-batch").mkdir(parents=True)
+    (target / "pom.xml").write_text(CONSUMER_ROOT_POM, encoding="utf-8")
+    (target / "app" / "pom.xml").write_text(CONSUMER_APP_POM, encoding="utf-8")
+    (target / "app-batch" / "pom.xml").write_text(CONSUMER_BATCH_POM, encoding="utf-8")
+    return target
+
+
 SAMPLE_TREE = """com.example:app:jar:1.0.0
 +- org.springframework.boot:spring-boot-starter-web:jar:3.3.5:compile
 |  +- org.springframework.boot:spring-boot-starter:jar:3.3.5:compile

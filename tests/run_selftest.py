@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import xml.etree.ElementTree as ET
 import zipfile
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -336,6 +337,50 @@ def main() -> None:
         ok("standalone mode from explicit coordinates", list(sa["com.example:app"]["remove_direct"]) == ["commons-io:commons-io"])
         run("gen_consumer_patch.py", "--bundle", "bad-coordinates", "--embedded", "x:y:1", "--out", out / "cp-bad.md", "--out-json", out / "cp-bad.json", expect=2)
         ok("standalone mode validates the bundle coordinates", not (out / "cp-bad.json").exists())
+
+        # ---- apply the proposal to a consumer project ---------------------------------------
+        print("[apply consumer patch]")
+        cons = fx.build_consumer_project(work / "consumer")
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch.json", "--project", cons, "--out", out / "apply.json", "--diff", out / "apply.diff")
+        applied = read_json(out / "apply.json")
+        app_pom = (cons / "app" / "pom.xml").read_text(encoding="utf-8")
+        root_pom = (cons / "pom.xml").read_text(encoding="utf-8")
+        batch_pom = (cons / "app-batch" / "pom.xml").read_text(encoding="utf-8")
+        ok("direct dependency removed and bundle added first",
+           "<artifactId>commons-io</artifactId>\n            <version>2.16.1</version>" not in app_pom
+           and app_pom.index("thirdparty-bundle") < app_pom.index("spring-boot-starter-web")
+           and sorted(c["path"] for c in applied["changed_files"]) == ["app-batch/pom.xml", "app/pom.xml", "pom.xml"])
+        ok("exclusions merged into the existing block and added where missing",
+           app_pom.count("<exclusion>") == 5 and "spring-boot-starter-logging" in app_pom
+           and "<artifactId>spring-core</artifactId>" in app_pom and batch_pom.count("<exclusion>") == 1)
+        ok("enforcer execution added next to the existing one",
+           root_pom.count("<execution>") == 2 and "ban-bundled-coordinates" in root_pom and "enforce-versions" in root_pom
+           and "<exclude>org.springframework:spring-core</exclude>" in root_pom)
+        ok("bundle version managed in the multi-module root",
+           "<version>1.0.0</version>" in root_pom.split("<dependencyManagement>")[1] and "<version>" not in app_pom.split("thirdparty-bundle")[1].split("</dependency>")[0])
+        ok("formatting, comments and indentation preserved",
+           "<!-- web stack -->" in app_pom and "<!-- shared build settings -->" in root_pom
+           and "<relativePath/> <!-- lookup parent from repository -->" in root_pom
+           and "\n            <groupId>com.company.platform</groupId>" in app_pom
+           and all(ET.fromstring(p.encode("utf-8")) is not None for p in (app_pom, root_pom, batch_pom)))
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch.json", "--project", cons, "--out", out / "apply2.json", "--diff", out / "apply2.diff")
+        ok("applying twice changes nothing", (out / "apply2.diff").read_text(encoding="utf-8") == "" and not read_json(out / "apply2.json")["changed_files"])
+        single = fx.build_consumer_project(work / "consumer-single", single=True)
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch.json", "--project", single, "--dry-run", "--out", out / "apply-single.json", "--diff", out / "apply-single.diff")
+        single_diff = (out / "apply-single.diff").read_text(encoding="utf-8")
+        ok("single module: explicit bundle version, build/plugins created, dry run leaves the file untouched",
+           "+      <version>1.0.0</version>" in single_diff and "+  <build>" in single_diff and "maven-enforcer-plugin" in single_diff
+           and (single / "pom.xml").read_text(encoding="utf-8") == fx.CONSUMER_SINGLE_POM
+           and any("app-batch" in w for w in read_json(out / "apply-single.json")["warnings"]))
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch-io.json", "--project", cons, "--out", out / "apply-notree.json", "--diff", out / "apply-notree.diff", expect=2)
+        ok("a proposal without a tree cannot be applied", not (out / "apply-notree.json").exists())
+        (work / "consumer" / "app" / "target").mkdir(parents=True, exist_ok=True)
+        rebuilt = fx.build_new_app(app, good, selected_jars, work / "consumer" / "app" / "target" / "app-1.0.0.jar")
+        (work / "consumer" / "app" / "target" / "app-1.0.0.jar.original").write_bytes(b"not a jar")
+        run("find_app_jar.py", "--project", cons, "--manifest", out / "bundle-manifest.json", "--out", out / "rebuilt-app.json")
+        found = read_json(out / "rebuilt-app.json")
+        ok("rebuilt boot archive located and the original artifact remembered",
+           Path(found["new_jar"]) == rebuilt and found["old_ref"] == str(app) and found["old_type"] == "file")
 
         # ---- unidentified jar end to end: synthetic coordinates ---------------------------
         print("[synthetic coordinates]")

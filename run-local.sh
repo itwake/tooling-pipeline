@@ -8,7 +8,8 @@
 #        (no --select: inventory only; --gav is required with --select)
 #
 #   ./run-local.sh consumer [--manifest out/bundle-manifest.json | --bundle-jar X.jar [--reduced-pom X.pom]
-#        | --bundle g:a:v --embedded "g:a:v,g:a:v"] [--tree dependency-tree.txt]
+#        | --bundle g:a:v --embedded "g:a:v,g:a:v"] [--tree dependency-tree.txt] [--project DIR [--apply]]
+#        (--project with a tree: edits the consumer POMs; without --apply only the diff is produced)
 #
 #   ./run-local.sh verify --old REF --new REF [--bundle-artifact-id ID] [--path /app/app.jar] \
 #        [--maven-repo-url URL] [--nexus-hosts host1,host2] [--aws-region R]
@@ -101,7 +102,7 @@ if [ "$mode" = "bundle" ]; then
     echo "done: see out/SUMMARY.md"
 
 elif [ "$mode" = "consumer" ]; then
-    manifest=out/bundle-manifest.json bundle_jar="" reduced_pom="" bundle="" embedded="" tree=""
+    manifest=out/bundle-manifest.json bundle_jar="" reduced_pom="" bundle="" embedded="" tree="" project="" apply=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --manifest) manifest=$2; shift 2;;
@@ -110,6 +111,8 @@ elif [ "$mode" = "consumer" ]; then
             --bundle) bundle=$2; shift 2;;
             --embedded) embedded=$2; shift 2;;
             --tree) tree=$2; shift 2;;
+            --project) project=$2; shift 2;;
+            --apply) apply=true; shift;;
             *) echo "unknown option: $1"; usage;;
         esac
     done
@@ -124,6 +127,13 @@ elif [ "$mode" = "consumer" ]; then
     else
         [ -f "$manifest" ] || { echo "manifest not found: $manifest (run the bundle mode first, or pass --bundle-jar / --bundle)"; exit 2; }
         "$PY" scripts/gen_consumer_patch.py --manifest "$manifest" "${args[@]}" --out out/consumer-patch.md --out-json out/consumer-patch.json
+    fi
+    if [ -n "$project" ]; then
+        dry=(--dry-run)
+        [ "$apply" = true ] && dry=()
+        "$PY" scripts/apply_consumer_patch.py --patch out/consumer-patch.json --project "$project" "${dry[@]}" \
+            --out out/consumer-apply.json --diff out/consumer-apply.diff
+        echo "diff in out/consumer-apply.diff$([ "$apply" = true ] || echo ' (dry run: pass --apply to edit the POMs)')"
     fi
     echo "done: see out/consumer-patch.md"
 

@@ -119,8 +119,20 @@ Suggested first runs: `SELECT` empty with `SOURCE_REF` pointing at any Spring Bo
 | `UPSTREAM_BUILD` | Build number of the `UPSTREAM_JOB` run to take the bundle from; empty means the last successful one |
 | `BUNDLE_COORDINATES` | Alternative to the upstream build: `g:a:v` of a bundle already in Nexus. The jar's manifest lists what it embeds |
 | `CONSUMER_GIT_URL` / `CONSUMER_GIT_REF` / `CONSUMER_MAVEN_ARGS` | Optional. When given, `dependency:tree -Dverbose` runs on the consumer project and the proposal lists the direct dependencies to delete and the exclusions to add, per module and per path |
+| `APPLY` / `VERIFY_AGAINST` | Apply the proposal on a branch, build with the Enforcer gate, compare the rebuilt archive with the original artifact (or `VERIFY_AGAINST`) and push the branch, see below |
 
 The proposal always contains the bundle dependency snippet and the Enforcer rule. When Spring Boot itself is not inside the bundle, the rule also pins the consumer to the Boot minor line the bundle was built from, so an upgrade of Boot fails the build until the bundle is rebuilt. When Boot is inside the bundle, the proposal asks for the `spring-boot-maven-plugin` version to match instead.
+
+### Applying the change automatically (`APPLY=true`)
+
+With `CONSUMER_GIT_URL` and `APPLY=true` the job turns the proposal into a reviewable branch of the consumer project:
+
+1. **Apply patch**: `apply_consumer_patch.py` edits the POMs in place with a position-preserving editor, so comments, element order and formatting stay as they were. It deletes the replaced direct dependencies, adds the exclusions on the direct dependencies that reintroduce embedded coordinates (merging with existing `<exclusions>`), adds the bundle dependency first in every changed module (version managed in the root POM of a multi-module build), and installs or updates the `ban-bundled-coordinates` execution of maven-enforcer-plugin in the root POM. Dependencies declared in a parent POM inside the checkout are edited there. The diff is archived as `out/consumer-apply.diff`; the branch is `rebundle/<bundle artifactId>-<version>`.
+2. **Build consumer with the Enforcer gate**: `mvn verify` with `CONSUMER_BUILD_ARGS` (default `-DskipTests`). The Enforcer execution runs at `validate`, so a path that still brings an original coordinate fails here with the offending coordinates in the log.
+3. **Verify rebuilt application**: the Spring Boot archive the build produced is located (the one containing the bundle), the artifact the bundle was built from is fetched again (or `VERIFY_AGAINST`), and `verify_app_equivalence.py` proves the effective classpath is unchanged. When the bundle was taken from Nexus and `VERIFY_AGAINST` is empty, this step is skipped with a message.
+4. **Push branch** (`PUSH_BRANCH=true` in the environment block): the POM changes are committed and pushed with `GIT_CREDENTIALS_ID` (https) or the agent's ssh keys. Open the merge request from that branch; nothing is merged automatically.
+
+Any failure stops before the push, so a branch only appears when the Enforcer gate and the equivalence check passed. Dependencies that the proposal could not locate in the POMs (declared through a profile, or coming from an imported BOM) are listed as warnings in `out/consumer-apply.json` and must be handled by hand.
 
 ## `mvn-rebundle-verify` parameters
 
@@ -154,7 +166,7 @@ The bundle freezes its contents at the versions of one build. Families managed b
 ```
 
 ```bash
-./run-local.sh consumer --tree dependency-tree.txt
+./run-local.sh consumer --tree dependency-tree.txt --project /path/to/consumer
 ```
 
 ```bash
@@ -186,4 +198,4 @@ python tests/run_selftest.py
 - A resource that several jars carry under the same path and that a library reads from every jar (`getResources`), such as `Log4j2Plugins.dat` or `reference.conf`, collapses to the first copy after merging. SPI files and the Spring metadata files are merged, everything else is reported by the selection stage and by the verify job so you can decide.
 - The Prepare stage prints the mvn-rebundle revision; compare it with the repository when a run does not behave as documented.
 - Nexus release repositories reject redeploying an existing version; regenerate under a new version.
-- The consumer POM is never modified automatically. That is intentional.
+- The consumer POM is modified only on a branch created by `APPLY=true`, never on the branch that was checked out, and nothing is merged by the pipeline.
