@@ -454,8 +454,8 @@ def main() -> None:
         run("verify_app_equivalence.py", "--old", app, "--new", new_dup, "--out", out / "eq-dup.json")
         ok("effective classpath unchanged when the winning copy is kept", read_json(out / "eq-dup.json")["ok"])
         new_dup_bad = fx.build_new_app(app, dup_bad, ["dup-x-1.0.jar", "dup-y-1.0.jar"], work / "new-dup-bad.jar")
-        run("verify_app_equivalence.py", "--old", app, "--new", new_dup_bad, "--out", out / "eq-dup-bad.json", expect=1)
-        ok("effective classpath change detected when the shadowed copy wins",
+        run("verify_app_equivalence.py", "--old", app, "--new", new_dup_bad, "--out", out / "eq-dup-bad.json")
+        ok("effective classpath change reported when the shadowed copy wins",
            "com/dup/Same.class" in next(c["detail"] for c in read_json(out / "eq-dup-bad.json")["checks"] if c["check"] == "classpath-entries-identical"))
         syn_jar = fx.simulate_shade(syn_proj, [libs["vendor-sdk"]], syn_bundle, syn_man["contents_attr"], source_attr, False,
                                     syn_proj / "target" / "syn-bundle-1.0.0.jar", boot_version="3.3.5")
@@ -467,8 +467,8 @@ def main() -> None:
         eq_syn = read_json(out / "eq-syn.json")
         ok("equivalence matches the unidentified jar by sha256", eq_syn["ok"] and eq_syn["replaced"] == [gav_str(syn_gav)])
         new_syn_left = fx.build_new_app(app, syn_jar, ["vendor-sdk-2.0.0.jar"], work / "new-syn-left.jar", keep_replaced=True)
-        run("verify_app_equivalence.py", "--old", app, "--new", new_syn_left, "--out", out / "eq-syn-left.json", expect=1)
-        ok("leftover unidentified jar detected by sha256", any(c["check"] == "original-coordinates-removed" and c["status"] == "fail" for c in read_json(out / "eq-syn-left.json")["checks"]))
+        run("verify_app_equivalence.py", "--old", app, "--new", new_syn_left, "--out", out / "eq-syn-left.json")
+        ok("leftover unidentified jar detected by sha256", any(c["check"] == "original-coordinates-removed" and c["status"] == "diff" for c in read_json(out / "eq-syn-left.json")["checks"]))
         run("gen_consumer_patch.py", "--manifest", out / "bundle-manifest-syn.json", "--tree", tree, "--out", out / "cp-syn.md", "--out-json", out / "cp-syn.json")
         cp_syn = read_json(out / "cp-syn.json")
         ok("consumer tree resolves the real coordinates of the synthetic jar",
@@ -486,27 +486,37 @@ def main() -> None:
         run("verify_app_equivalence.py", "--old", app, "--new", new_ok, "--out", out / "equivalence.json")
         eq = read_json(out / "equivalence.json")
         ok("rebuilt app is equivalent", eq["ok"] and sorted(eq["replaced"])[0] == "com.example.codec:codec-a:1.0")
-        ok("build-info / pom changes ignored", all(c["status"] == "pass" for c in eq["checks"]))
+        ok("build-info / pom changes ignored, nothing to review",
+           all(c["status"] in ("pass", "info") for c in eq["checks"]) and eq["findings"] == []
+           and not (out / "equivalence-findings.txt").read_text(encoding="utf-8").strip())
         new_bad = fx.build_new_app(app, good, selected_jars, work / "new-leftover.jar", keep_replaced=True)
-        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--out", out / "eq-leftover.json", expect=1)
-        ok("original coordinates left on classpath detected", any(c["check"] == "original-coordinates-removed" and c["status"] == "fail" for c in read_json(out / "eq-leftover.json")["checks"]))
+        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--out", out / "eq-leftover.json")
+        ok("original coordinates left on classpath reported as a dependency difference",
+           any(c["check"] == "original-coordinates-removed" and c["status"] == "diff" and c["scope"] == "dependencies" for c in read_json(out / "eq-leftover.json")["checks"])
+           and "[dependencies] original-coordinates-removed" in (out / "eq-leftover-findings.txt").read_text(encoding="utf-8"))
+        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--fail-on", "dependencies", "--out", out / "eq-leftover-gate.json", expect=1)
+        ok("--fail-on dependencies gates it", not read_json(out / "eq-leftover-gate.json")["ok"])
         new_bad = fx.build_new_app(app, good, selected_jars, work / "new-class.jar", change_class=True)
         run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--out", out / "eq-class.json")
         eq_class = read_json(out / "eq-class.json")
-        ok("changed application class is a warning, listed for the pipeline",
-           eq_class["ok"] and eq_class["warnings"] == ["application-classes-unchanged"]
-           and "Greeter.class" in (out / "eq-class-warnings.txt").read_text(encoding="utf-8"))
-        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--strict", "--out", out / "eq-class-strict.json", expect=1)
-        ok("--strict turns the warning into a failure",
+        findings_txt = (out / "eq-class-findings.txt").read_text(encoding="utf-8")
+        ok("changed application class is an application finding, listed for the pipeline",
+           eq_class["ok"] and eq_class["findings"] == [{"check": "application-classes-unchanged", "scope": "application"}]
+           and findings_txt.startswith("[info] source revision unknown") and "[application] application-classes-unchanged" in findings_txt
+           and "Greeter.class" in findings_txt)
+        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--fail-on", "dependencies", "--out", out / "eq-class-deps.json")
+        ok("--fail-on dependencies leaves application findings alone", read_json(out / "eq-class-deps.json")["ok"])
+        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--fail-on", "any", "--out", out / "eq-class-strict.json", expect=1)
+        ok("--fail-on any turns the finding into a failure",
            any(c["check"] == "application-classes-unchanged" and c["status"] == "fail" for c in read_json(out / "eq-class-strict.json")["checks"]))
         new_bad = fx.build_new_app(app, good, selected_jars, work / "new-droplib.jar", drop_lib="snakeyaml-2.2.jar")
-        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--out", out / "eq-droplib.json", expect=1)
+        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--out", out / "eq-droplib.json")
         checks = {c["check"]: c for c in read_json(out / "eq-droplib.json")["checks"]}
-        ok("lost unrelated dependency detected", checks["dependency-set-unchanged"]["status"] == "fail" and "snakeyaml" in checks["dependency-set-unchanged"]["detail"])
+        ok("lost unrelated dependency reported", checks["dependency-set-unchanged"]["status"] == "diff" and "snakeyaml" in checks["dependency-set-unchanged"]["detail"])
         bad_bundle = fx.simulate_shade(proj, jar_paths, bundle, man["contents_attr"], source_attr, True, target / "bad-for-app.jar", drop=["org/apache/commons/io/IOUtils.class"], boot_version="3.3.5")
         new_bad = fx.build_new_app(app, bad_bundle, selected_jars, work / "new-badbundle.jar")
-        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--out", out / "eq-badbundle.json", expect=1)
-        ok("missing class on new classpath detected", "IOUtils" in next(c["detail"] for c in read_json(out / "eq-badbundle.json")["checks"] if c["check"] == "classpath-entries-identical"))
+        run("verify_app_equivalence.py", "--old", app, "--new", new_bad, "--out", out / "eq-badbundle.json")
+        ok("missing class on new classpath reported", "IOUtils" in next(c["detail"] for c in read_json(out / "eq-badbundle.json")["checks"] if c["check"] == "classpath-entries-identical"))
         exploded = work / "new-exploded"
         with zipfile.ZipFile(new_ok) as zf:
             zf.extractall(exploded)
@@ -519,23 +529,43 @@ def main() -> None:
         run("verify_app_equivalence.py", "--old", stamped_old, "--new", stamped_new, "--out", out / "eq-stamped.json")
         eq_st = read_json(out / "eq-stamped.json")
         st = {c["check"]: c for c in eq_st["checks"]}
-        ok("project modules rebuilt under the CI-stamped version are a warning, the third-party checks pass",
-           eq_st["ok"] and st["project-version-differs"]["status"] == "warn" and "1.0.0-20240101 -> 1.0.0" in st["project-version-differs"]["detail"]
-           and "app-common" in st["project-version-differs"]["detail"]
+        ok("project modules rebuilt under the CI-stamped version are application findings, the dependency checks pass",
+           eq_st["ok"] and st["project-version-differs"]["status"] == "diff" and st["project-version-differs"]["scope"] == "application"
+           and "1.0.0-20240101 -> 1.0.0" in st["project-version-differs"]["detail"] and "app-common" in st["project-version-differs"]["detail"]
            and st["dependency-set-unchanged"]["status"] == "pass" and st["classpath-entries-identical"]["status"] == "pass"
-           and st["kept-jars-byte-identical"]["status"] == "pass")
+           and st["kept-jars-byte-identical"]["status"] == "pass" and all(f["scope"] == "application" for f in eq_st["findings"]))
         ok("entries that embed the build version are marked, the archive signature is ignored",
-           st["project-module-entries-changed"]["status"] == "warn" and "(1 embed the build version)" in st["project-module-entries-changed"]["detail"]
-           and st["application-classes-unchanged"]["status"] == "warn" and "all embed the build version" in st["application-classes-unchanged"]["detail"]
+           st["project-module-entries-changed"]["status"] == "diff" and "(1 embed the build version)" in st["project-module-entries-changed"]["detail"]
+           and st["application-classes-unchanged"]["status"] == "diff" and "all embed the build version" in st["application-classes-unchanged"]["detail"]
            and st["application-resources-unchanged"]["status"] == "pass" and eq_st["project_version"] == {"old": "1.0.0-20240101", "new": "1.0.0"})
+        ok("the source commits of both builds are read and compared",
+           st["same-source-revision"]["status"] == "diff" and "1a2b3c4d5e6f" in st["same-source-revision"]["detail"] and "9f8e7d6" in st["same-source-revision"]["detail"]
+           and eq_st["source_revision"]["same"] is False and eq_st["source_revision"]["old"]["branch"] == "main"
+           and (out / "eq-stamped-findings.txt").read_text(encoding="utf-8").startswith("[application] same-source-revision")
+           and eq["source_revision"]["same"] is None and any(c["check"] == "same-source-revision" and c["status"] == "info" for c in eq["checks"]))
         leaked = fx.build_new_app(app, good, selected_jars, work / "new-leaked.jar", extra_libs=[fx.leaked_jar(work / "stamped")],
                                   classpath_first=["tomcat-annotations-api-10.1.59.jar"])
-        run("verify_app_equivalence.py", "--old", app, "--new", leaked, "--out", out / "eq-leaked.json", expect=1)
+        run("verify_app_equivalence.py", "--old", app, "--new", leaked, "--out", out / "eq-leaked.json")
         lk = {c["check"]: c for c in read_json(out / "eq-leaked.json")["checks"]}
-        ok("a jar the old build never had fails, with the changed entries grouped by provider",
-           lk["dependency-set-unchanged"]["status"] == "fail" and "added: file:tomcat-annotations-api-10.1.59.jar" in lk["dependency-set-unchanged"]["detail"]
-           and lk["classpath-entries-identical"]["status"] == "fail" and "-> tomcat-annotations-api-10.1.59.jar: 1 changed" in lk["classpath-entries-identical"]["detail"]
-           and lk["classpath-entries-identical"]["items"][0]["path"] == "org/apache/commons/logging/LogFactory.class")
+        ok("a jar the old build never had is a dependency finding, with the changed entries grouped by provider",
+           lk["dependency-set-unchanged"]["status"] == "diff" and "added: file:tomcat-annotations-api-10.1.59.jar" in lk["dependency-set-unchanged"]["detail"]
+           and lk["classpath-entries-identical"]["status"] == "diff" and "-> tomcat-annotations-api-10.1.59.jar: 1 changed" in lk["classpath-entries-identical"]["detail"]
+           and lk["classpath-entries-identical"]["items"][0]["path"] == "org/apache/commons/logging/LogFactory.class"
+           and [f["scope"] for f in read_json(out / "eq-leaked.json")["findings"]] == ["dependencies", "dependencies", "dependencies"])
+        # the consumer moved on: the old build carried an embedded coordinate at another version
+        libs_old = dict(libs)
+        libs_old["commons-io"] = fx.dep_jar(work / "older", "commons-io", "commons-io", "2.15.0",
+                                            ["org/apache/commons/io/IOUtils.class", "org/apache/commons/io/FileUtils.class", "org/apache/commons/io/input/BOMInputStream.class"],
+                                            extra={"org/apache/commons/io/messages.properties": b"hello=world\n"})
+        older = fx.build_app(work / "older" / "app.jar", libs_old)
+        moved = fx.build_new_app(older, good, [n if n != "commons-io-2.16.1.jar" else "commons-io-2.15.0.jar" for n in selected_jars], work / "new-moved.jar")
+        run("verify_app_equivalence.py", "--old", older, "--new", moved, "--out", out / "eq-moved.json")
+        mv = {c["check"]: c for c in read_json(out / "eq-moved.json")["checks"]}
+        ok("an embedded coordinate at another version in the old build is reported once, with its changed entries",
+           mv["embedded-coordinates-match-old-build"]["status"] == "diff"
+           and "commons-io:commons-io 2.15.0 in the old build, 2.16.1 in the bundle" in mv["embedded-coordinates-match-old-build"]["detail"]
+           and mv["dependency-set-unchanged"]["status"] == "pass"
+           and mv["classpath-entries-identical"]["status"] == "diff" and "commons-io-2.15.0.jar -> thirdparty-bundle-1.0.0.jar: 3 changed" in mv["classpath-entries-identical"]["detail"])
 
         # ---- source detection and the fake Nexus -----------------------------------------
         print("[source detection]")

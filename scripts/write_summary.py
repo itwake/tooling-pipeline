@@ -17,11 +17,20 @@ def load(path: Path):
 def checks_table(checks):
     lines = ["| Check | Result | Detail |", "|---|---|---|"]
     for c in checks:
-        lines.append("| %s | %s | %s |" % (c["check"], c["status"].upper(), (c.get("detail") or "").replace("|", "\\|")[:300]))
+        status = c["status"].upper() + ((" (%s)" % c["scope"]) if c.get("scope") and c["status"] in ("diff", "fail") else "")
+        lines.append("| %s | %s | %s |" % (c["check"], status, (c.get("detail") or "").replace("|", "\\|")[:300]))
     return "\n".join(lines)
 
 
 def outcome(report) -> str:
+    if "findings" in report:  # the comparison with the original artifact reports; the reviewer decides
+        if not report.get("ok"):
+            return "FAILED (--fail-on %s)" % report.get("fail_on")
+        findings = report["findings"]
+        if not findings:
+            return "equivalent, only the embedded jars were replaced"
+        deps = sum(1 for f in findings if f.get("scope") == "dependencies")
+        return "%d difference(s) to review (%d in the dependencies, %d in the application)" % (len(findings), deps, len(findings) - deps)
     if not report.get("ok"):
         return "FAILED"
     warned = [c["check"] for c in report.get("checks", []) if c.get("status") == "warn"]
@@ -123,6 +132,11 @@ def main() -> None:
         pv = equivalence.get("project_version") or {}
         if pv.get("old") or pv.get("new"):
             md.append("- Application version: %s -> %s" % (pv.get("old") or "unknown", pv.get("new") or "unknown"))
+        rev = equivalence.get("source_revision") or {}
+        if rev:
+            o, n = rev.get("old") or {}, rev.get("new") or {}
+            md.append("- Source commit: old %s, new %s (%s)" % ((o.get("commit") or "unknown")[:12], (n.get("commit") or "unknown")[:12],
+                                                               {True: "same", False: "different", None: "unknown"}[rev.get("same")]))
         md += ["", checks_table(equivalence["checks"]), ""]
 
     (out / "SUMMARY.md").write_text("\n".join(md) + "\n", encoding="utf-8")

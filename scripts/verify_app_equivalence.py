@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Verify pipeline: the rebuilt application is equivalent to the original.
+"""Verify pipeline: compare the application built before the POM change with the one built after it.
 
-Compares an application built before the POM change (old) with one built after it (new).
+The check reports, it does not decide. The two builds may come from different commits (the consumer
+moved on since the artifact the bundle was built from was made), so every difference is listed with
+where it sits, and the person approving the change judges:
 
-Failures, meaning the swap itself is wrong:
-  * not exactly one bundle jar in the new build, or it embeds coordinates the old build did not have
-  * an embedded coordinate is still on the classpath (exclusions incomplete)
-  * a third-party jar was removed, added or changed its version
-  * a class or resource that third-party jars provide is missing, new, or has different bytes in
-    class-loading order (merged SPI / Spring resources are compared as sets of entries)
+  dependencies   third-party jars removed, added or at another version; an embedded coordinate still
+                 on the classpath; classes or resources of the third-party jars missing, new or with
+                 different bytes in class-loading order (merged SPI / Spring resources compared as
+                 sets of entries). With both builds from the same commit, any of these means the swap
+                 itself is wrong.
+  application    the project's own modules rebuilt under another version (CI version stamping) and
+                 their entries, the application's own classes and resources; entries that embed the
+                 build version are marked. Expected when the commits differ.
 
-Warnings, meaning the two builds differ for reasons outside the swap, left to the caller:
-  * the project's own modules were rebuilt under another version (CI version stamping) or their
-    entries changed; entries that embed the build version are marked as such
-  * the application's own classes or resources changed (another commit, another JDK, a stamp)
-  * resources that lost copies, new same-path-different-bytes pairs
-
---strict turns every warning into a failure. The warnings are also written one per line to a text
-file next to the JSON report, for the pipeline to show.
+The source commit of each build is read from git.properties / build-info.properties when present, so
+the report says whether the builds come from the same commit. The exit code is 0 whenever the
+comparison ran; --fail-on dependencies|any turns findings into failures for callers that want a gate.
+Findings are also written one per line to a text file next to the JSON report, for the pipeline.
 """
 from __future__ import annotations
 
@@ -48,8 +48,10 @@ from bundlelib import (  # noqa: E402
     write_json,
 )
 
+DEPS, APP = "dependencies", "application"
 SHOW_GROUPS = 12   # provider pairs printed per check
 SHOW_PATHS = 6     # paths printed per provider pair
+LINE_LIMIT = 300   # characters per line of the findings file
 
 
 def parse_contents_attr(value: str):
@@ -78,9 +80,11 @@ def parse_contents_file(text):
 
 
 def app_identity(app: AppArtifact) -> dict:
-    """What identifies the application itself: its Maven coordinates (META-INF/maven/<g>/<a>/pom.properties
-    at the root, else build-info.properties) and the package of its Start-Class."""
-    ident = {"groupId": None, "artifactId": None, "version": None, "start_package": None}
+    """What identifies a build: the application's Maven coordinates (META-INF/maven/<g>/<a>/pom.properties
+    at the root, else build-info.properties), the package of its Start-Class, and the source commit
+    (git.properties of the git-commit-id plugin) and build time (build-info.properties) when present."""
+    ident = {"groupId": None, "artifactId": None, "version": None, "start_package": None,
+             "commit": None, "commit_time": None, "branch": None, "build_time": None}
     build_info = None
     for n, loader in app.app_entries():
         if n.startswith("META-INF/maven/") and n.endswith("/pom.properties") and not ident["groupId"]:
@@ -89,28 +93,55 @@ def app_identity(app: AppArtifact) -> dict:
                 ident.update({"groupId": props["groupId"], "artifactId": props["artifactId"], "version": props["version"]})
         elif n.endswith("META-INF/build-info.properties") and build_info is None:
             build_info = parse_properties(loader().decode("utf-8", "replace"))
+        elif n.endswith("git.properties") and n.count("/") <= 2 and not ident["commit"]:
+            props = parse_properties(loader().decode("utf-8", "replace"))
+            ident["commit"] = props.get("git.commit.id.full") or props.get("git.commit.id") or props.get("git.commit.id.abbrev")
+            ident["commit_time"] = props.get("git.commit.time")
+            ident["branch"] = props.get("git.branch")
         elif n == "META-INF/MANIFEST.MF":
             start = parse_manifest(loader()).get("Start-Class")
             if start and "." in start:
                 ident["start_package"] = start.rsplit(".", 1)[0]
-    if not ident["groupId"] and build_info and build_info.get("build.group"):
-        ident.update({"groupId": build_info.get("build.group"), "artifactId": build_info.get("build.artifact"),
-                      "version": build_info.get("build.version")})
+    if build_info:
+        ident["build_time"] = build_info.get("build.time")
+        if not ident["groupId"] and build_info.get("build.group"):
+            ident.update({"groupId": build_info.get("build.group"), "artifactId": build_info.get("build.artifact"),
+                          "version": build_info.get("build.version")})
     return ident
+
+
+def same_commit(old_id: dict, new_id: dict):
+    """True / False when both commits are known (abbreviated ids compare by prefix), None otherwise."""
+    a, b = old_id.get("commit"), new_id.get("commit")
+    if not a or not b:
+        return None
+    return a == b or a.startswith(b) or b.startswith(a)
+
+
+def describe_build(ident: dict) -> str:
+    parts = []
+    if ident.get("commit"):
+        parts.append("commit %s" % ident["commit"][:12])
+        if ident.get("branch"):
+            parts.append("branch %s" % ident["branch"])
+        if ident.get("commit_time"):
+            parts.append("committed %s" % ident["commit_time"])
+    if ident.get("build_time"):
+        parts.append("built %s" % ident["build_time"])
+    return ", ".join(parts) if parts else "no git.properties or build-info.properties"
 
 
 def is_project_module(gav, ident: dict) -> bool:
     """A dependency jar that is one of the project's own modules: same groupId as the application,
-    the application's version, or a groupId matching the package of the Start-Class."""
+    the application's version, or (when the coordinates are unknown) a groupId that is a prefix of
+    the Start-Class package."""
     if not gav:
         return False
     g = gav.get("groupId") or ""
-    if ident.get("groupId") and g == ident["groupId"]:
-        return True
-    if ident.get("version") and gav.get("version") == ident["version"]:
-        return True
+    if ident.get("groupId"):
+        return g == ident["groupId"] or (bool(ident.get("version")) and gav.get("version") == ident["version"])
     pkg = ident.get("start_package")
-    return bool(pkg and g and (pkg == g or pkg.startswith(g + ".") or g.startswith(pkg + ".")))
+    return bool(pkg and g and (pkg == g or pkg.startswith(g + ".")))
 
 
 def load_jars(app: AppArtifact, ident: dict):
@@ -157,6 +188,10 @@ def collect_entries(jars, skip_prefixes):
 
 def embeds(data: bytes, version) -> bool:
     return bool(version) and version.encode("utf-8") in data
+
+
+def shorten(text: str, limit: int = LINE_LIMIT) -> str:
+    return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
 def group_items(items):
@@ -208,9 +243,10 @@ def main() -> None:
     ap.add_argument("--new-source", help="metadata JSON from extract_source.py (instead of --new)")
     ap.add_argument("--bundle-artifact-id", default="", help="restrict bundle detection to this artifactId")
     ap.add_argument("--policy", default=str(Path(__file__).resolve().parent.parent / "config" / "policy.json"))
-    ap.add_argument("--strict", action="store_true", help="treat warnings as failures")
+    ap.add_argument("--fail-on", choices=["none", "dependencies", "any"], default="none",
+                    help="exit 1 when findings of this scope exist (default none: report only)")
     ap.add_argument("--out", default="out/equivalence.json")
-    ap.add_argument("--warnings-out", default="", help="warnings one per line (default: <out>-warnings.txt)")
+    ap.add_argument("--findings-out", default="", help="findings one per line (default: <out>-findings.txt)")
     args = ap.parse_args()
 
     old_path = args.old or (read_json(args.old_source)["local_path"] if args.old_source else None)
@@ -221,11 +257,14 @@ def main() -> None:
 
     checks = []
 
-    def check(name, ok, detail="", level="fail", items=None):
-        rec = {"check": name, "status": "pass" if ok else level, "detail": detail}
+    def check(name, ok, detail="", scope=DEPS, items=None):
+        rec = {"check": name, "status": "pass" if ok else "diff", "scope": scope, "detail": detail}
         if items:
             rec["items"] = items
         checks.append(rec)
+
+    def info(name, detail, scope=APP):
+        checks.append({"check": name, "status": "info", "scope": scope, "detail": detail})
 
     old_app, new_app = AppArtifact(old_path), AppArtifact(new_path)
     log("old: %s (%s)" % (old_path, old_app.layout))
@@ -235,6 +274,8 @@ def main() -> None:
     if old_id.get("groupId") or new_id.get("groupId"):
         log("application: %s:%s %s -> %s" % (old_id.get("groupId") or new_id.get("groupId"), old_id.get("artifactId") or new_id.get("artifactId"),
                                             old_version or "?", new_version or "?"))
+    log("old build: %s" % describe_build(old_id))
+    log("new build: %s" % describe_build(new_id))
     old_jars, new_jars = load_jars(old_app, old_id), load_jars(new_app, new_id)
 
     # ---- locate the bundle ---------------------------------------------------------------
@@ -251,6 +292,17 @@ def main() -> None:
     log("bundle: %s embeds %s" % (bundle["name"], ", ".join(gav_str(g) for g in embedded)))
     check("bundle-present", True, "%s (%s)" % (bundle["name"], gav_str(bundle["gav"]) if bundle["gav"] else "coordinates unknown"))
 
+    # ---- same source commit? ---------------------------------------------------------------
+    same = same_commit(old_id, new_id)
+    if same is True:
+        check("same-source-revision", True, "both builds come from commit %s: a difference in the dependencies below means the swap itself is wrong" % old_id["commit"][:12], scope=APP)
+    elif same is False:
+        check("same-source-revision", False, "old build: %s; new build: %s: the differences below may come from the code change rather than from the swap" % (
+            describe_build(old_id), describe_build(new_id)), scope=APP)
+    else:
+        info("same-source-revision", "unknown (old build: %s; new build: %s): with both builds from the same commit a difference in the dependencies means the swap is wrong, otherwise it may come from the code change" % (
+            describe_build(old_id), describe_build(new_id)))
+
     # ---- dependency set ------------------------------------------------------------------
     def key(j):
         return gav_str(j["gav"]) if j["gav"] else "file:" + j["name"]
@@ -259,28 +311,38 @@ def main() -> None:
     new_by_key = {key(j): j for j in new_jars}
     old_by_sha = {j["sha256"]: j for j in old_jars}
     embedded_sha = bundle.get("contents_sha") or {}   # coordinate -> sha256 from BUNDLE-CONTENTS.txt
-    replaced, replaced_keys, problems = [], set(), []
+    replaced, replaced_keys, missing_in_old, other_version = [], set(), [], []
     for g in embedded:
         k = gav_str(g)
         match = old_by_sha.get(embedded_sha.get(k, "")) or old_by_key.get(k)
+        if match is None:
+            # the old build may carry the coordinate at another version (the consumer moved on)
+            same_ga = [j for j in old_jars if j["gav"] and ga_str(j["gav"]) == ga_str(g) and key(j) not in replaced_keys]
+            if same_ga:
+                match = same_ga[0]
+                other_version.append("%s %s in the old build, %s in the bundle" % (ga_str(g), match["gav"]["version"], g["version"]))
+            else:
+                missing_in_old.append(k)
         if match is not None:
             replaced.append(k)
             replaced_keys.add(key(match))
-        else:
-            same_ga = [kk for kk, j in old_by_key.items() if j["gav"] and ga_str(j["gav"]) == ga_str(g)]
-            problems.append("%s not in old build%s" % (k, " (old has %s)" % ", ".join(same_ga) if same_ga else ""))
-    check("embedded-coordinates-match-old-build", not problems, "; ".join(problems) if problems else ", ".join(replaced))
+    parts = []
+    if missing_in_old:
+        parts.append("not in the old build: " + ", ".join(missing_in_old))
+    if other_version:
+        parts.append("at another version in the old build: " + "; ".join(other_version))
+    check("embedded-coordinates-match-old-build", not parts, "; ".join(parts) if parts else ", ".join(replaced))
 
     embedded_shas = set(embedded_sha.values())
     leftovers = [key(j) for j in new_jars if j is not bundle
                  and ((j["gav"] and ga_str(j["gav"]) in embedded_ga) or j["sha256"] in embedded_shas)]
     check("original-coordinates-removed", not leftovers,
-          "still on the classpath: %s (exclusions incomplete)" % ", ".join(leftovers) if leftovers else "none of the embedded coordinates remain")
+          "still on the classpath next to the bundle: %s (exclusions incomplete)" % ", ".join(leftovers) if leftovers else "none of the embedded coordinates remain")
 
     removed = sorted(set(old_by_key) - set(new_by_key) - replaced_keys)
     added = sorted(set(new_by_key) - set(old_by_key) - {key(bundle)})
     # a jar removed and one added with the same groupId:artifactId is a version change; for the
-    # project's own modules that is the CI version stamp of the original build, a warning
+    # project's own modules that is the CI version stamp of the original build
     rebuilt, version_changed = [], []
     for rk in list(removed):
         oj = old_by_key[rk]
@@ -315,12 +377,12 @@ def main() -> None:
             parts.append("project modules rebuilt under another version: " + ", ".join(
                 "%s %s -> %s" % (ga_str(oj["gav"]), oj["gav"]["version"], nj["gav"]["version"]) for oj, nj in rebuilt))
         check("project-version-differs", False,
-              "; ".join(parts) + " (the original build was version-stamped by its CI? entries that embed the version differ below)", level="warn")
+              "; ".join(parts) + " (the original build was version-stamped by its CI? entries that embed the version differ below)", scope=APP)
 
     differing = [k for k in set(old_by_key) & set(new_by_key) if old_by_key[k]["sha256"] != new_by_key[k]["sha256"]]
     check("kept-jars-byte-identical", not differing,
-          "rebuilt from the repository with different bytes (entries compared below): %s" % ", ".join(sorted(differing)[:10]) if differing
-          else "all kept jars identical", level="warn")
+          "same coordinates, different bytes (rebuilt or taken from another repository; entries compared below): %s" % ", ".join(sorted(differing)[:10]) if differing
+          else "all kept jars identical")
 
     # ---- classpath contents --------------------------------------------------------------
     # Maven descriptors inside the jars are not compared: they differ for every rebuilt module
@@ -372,11 +434,11 @@ def main() -> None:
         check("project-module-entries-changed", False,
               "%d entries of the project's own modules differ%s: %s" % (
                   len(project_items), (" (%d embed the build version)" % stamped_count) if stamped_count else "", grouped_detail(project_items)),
-              level="warn", items=project_items)
+              scope=APP, items=project_items)
     collapsed = sorted(p for p in old_plain if len(old_plain[p]) > 1 and len(new_plain.get(p, {})) < len(old_plain[p]) and not p.endswith(".class"))
     check("duplicate-resources-collapsed", not collapsed,
           "resources that existed in several copies now have fewer; libraries reading every copy (getResources) see less: %s" % ", ".join(collapsed[:10])
-          if collapsed else "no multi-copy resource lost a copy", level="warn")
+          if collapsed else "no multi-copy resource lost a copy")
 
     line_problems = []
     for p in sorted(set(old_lines) | set(new_lines)):
@@ -395,7 +457,7 @@ def main() -> None:
     new_dups = [p for p in dup_new if p not in dup_old]
     check("no-new-duplicate-classes", not new_dups,
           "same path, different bytes, introduced by the change: %s" % ", ".join(new_dups[:10]) if new_dups
-          else ("%d pre-existing duplicates unchanged" % len(dup_old) if dup_old else "no duplicates"), level="warn")
+          else ("%d pre-existing duplicates unchanged" % len(dup_old) if dup_old else "no duplicates"))
 
     # ---- application's own entries --------------------------------------------------------
     def app_map(app: AppArtifact):
@@ -430,56 +492,68 @@ def main() -> None:
         stamped_count = sum(1 for i in diff if i["version_stamped"])
         hint = "all embed the build version" if stamped_count == len(diff) else (
             "%d embed the build version; the rest come from another commit, another JDK or a build-time stamp" % stamped_count if stamped_count
-            else "another commit, another JDK or a build-time stamp? compare with javap -v")
+            else "another commit, another JDK or a build-time stamp; compare with javap -v")
         return "%d differing %s (%s): %s%s" % (len(diff), what, hint, ", ".join(item_name(i) for i in diff[:10]), ", ..." if len(diff) > 10 else "")
 
     class_diff = app_diff(old_classes, new_classes)
     check("application-classes-unchanged", not class_diff,
-          app_detail(class_diff, "class entries") if class_diff else "%d classes identical" % len(old_classes), level="warn", items=class_diff)
+          app_detail(class_diff, "class entries") if class_diff else "%d classes identical" % len(old_classes), scope=APP, items=class_diff)
     other_diff = app_diff(old_others, new_others)
     check("application-resources-unchanged", not other_diff,
-          app_detail(other_diff, "entries") if other_diff else "%d entries identical" % len(old_others), level="warn", items=other_diff)
+          app_detail(other_diff, "entries") if other_diff else "%d entries identical" % len(old_others), scope=APP, items=other_diff)
     if old_app.layout != new_app.layout:
-        check("same-layout", False, "old %s vs new %s: only classes compared outside the dependency jars" % (old_app.layout, new_app.layout), level="warn")
+        check("same-layout", False, "old %s vs new %s: only classes compared outside the dependency jars" % (old_app.layout, new_app.layout), scope=APP)
 
     for z in zips.values():
         z.close()
     old_app.close()
     new_app.close()
 
-    if args.strict:
-        for c in checks:
-            if c["status"] == "warn":
-                c["status"] = "fail"
-                c["strict"] = True
+    # ---- report ----------------------------------------------------------------------------
+    gated = {"none": (), "dependencies": (DEPS,), "any": (DEPS, APP)}[args.fail_on]
+    for c in checks:
+        if c["status"] == "diff" and c["scope"] in gated:
+            c["status"] = "fail"
+    findings = [c for c in checks if c["status"] in ("diff", "fail")]
     failed = [c for c in checks if c["status"] == "fail"]
-    warned = [c for c in checks if c["status"] == "warn"]
+    deps_count = sum(1 for c in findings if c["scope"] == DEPS)
     result = {
         "old": str(old_path), "new": str(new_path),
         "bundle": {"file": bundle["name"], "gav": bundle["gav"], "embedded": embedded},
         "replaced": replaced,
         "project_version": {"old": old_version, "new": new_version},
+        "source_revision": {"old": {k: old_id.get(k) for k in ("commit", "commit_time", "branch", "build_time")},
+                            "new": {k: new_id.get(k) for k in ("commit", "commit_time", "branch", "build_time")}, "same": same},
         "checks": checks,
-        "warnings": [c["check"] for c in warned],
+        "findings": [{"check": c["check"], "scope": c["scope"]} for c in findings],
         "failed": [c["check"] for c in failed],
-        "strict": args.strict,
+        "fail_on": args.fail_on,
         "ok": not failed,
     }
     write_json(args.out, result)
-    warnings_path = Path(args.warnings_out) if args.warnings_out else Path(args.out).with_name(Path(args.out).stem + "-warnings.txt")
-    warnings_path.parent.mkdir(parents=True, exist_ok=True)
-    warnings_path.write_text("".join("%s: %s\n" % (c["check"], c["detail"]) for c in warned), encoding="utf-8")
+    findings_path = Path(args.findings_out) if args.findings_out else Path(args.out).with_name(Path(args.out).stem + "-findings.txt")
+    findings_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    revision = next(c for c in checks if c["check"] == "same-source-revision")
+    if findings and revision["status"] != "diff":
+        lines.append("[info] source revision %s" % shorten(revision["detail"]))
+    for c in findings:
+        lines.append("[%s] %s: %s" % (c["scope"], c["check"], shorten(c["detail"])))
+    findings_path.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
+
     for c in checks:
-        log("  [%s] %s%s" % (c["status"].upper() + (" (strict)" if c.get("strict") else ""), c["check"], (": " + c["detail"]) if c["detail"] else ""))
+        tag = c["status"].upper() + ((" " + c["scope"]) if c["status"] in ("diff", "fail") else "")
+        log("  [%s] %s%s" % (tag, c["check"], (": " + c["detail"]) if c["detail"] else ""))
         if c.get("items") and c["check"] not in ("application-classes-unchanged", "application-resources-unchanged"):
             for line in item_lines(c["items"]):
                 log("        " + line)
     if failed:
-        fail("%d check(s) failed" % len(failed), 1)
-    if warned:
-        log("Equivalence verification passed with %d warning(s): %s" % (len(warned), ", ".join(c["check"] for c in warned)))
+        fail("%d finding(s) in the gated scope (--fail-on %s): %s" % (len(failed), args.fail_on, ", ".join(c["check"] for c in failed)), 1)
+    if findings:
+        log("Comparison done: %d difference(s) to review, %d in the dependencies and %d in the application (details in %s)" % (
+            len(findings), deps_count, len(findings) - deps_count, args.out))
     else:
-        log("Equivalence verification passed")
+        log("Comparison done: the rebuilt application is equivalent, only the embedded jars were replaced by the bundle")
 
 
 if __name__ == "__main__":

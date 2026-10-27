@@ -10,9 +10,10 @@
 // APPLY=true turns the proposal into a branch of the consumer project: the POMs are edited in place
 // (formatting and comments preserved), the project is built with the Enforcer gate, the rebuilt Spring
 // Boot archive is compared with the artifact the bundle was built from, and the branch is pushed for
-// review. A failed comparison (the swap itself is wrong) stops before the push. Differences outside the
-// swap (project modules under another CI-stamped version, application classes from another commit or
-// JDK) are warnings: ON_WARNINGS decides whether to ask, push anyway or stop. Nothing is merged.
+// review. The comparison lists every difference (third-party jars and their contents, the project's own
+// modules and classes) and whether both builds come from the same commit, but decides nothing:
+// ON_DIFFERENCES says whether to ask (input step listing the findings), push anyway or stop. Nothing is
+// merged automatically.
 //
 // Agent requirements (Linux): Python 3.8+; Maven 3.6+ and a JDK when CONSUMER_GIT_URL is used;
 // docker or crane (and the aws CLI for ECR) when the original artifact is an image.
@@ -65,12 +66,13 @@ def fetchSource(String label, String ref) {
     }
 }
 
-// Warnings of the equivalence check, one per line; empty when it did not run or reported none.
-def equivalenceWarnings() {
-    if (!fileExists('out/equivalence-warnings.txt')) {
+// Findings of the comparison with the original artifact, one per line, prefixed [dependencies],
+// [application] or [info]; empty when the comparison did not run or found nothing.
+def equivalenceFindings() {
+    if (!fileExists('out/equivalence-findings.txt')) {
         return []
     }
-    return readFile('out/equivalence-warnings.txt').tokenize('\n').findAll { it.trim() }
+    return readFile('out/equivalence-findings.txt').tokenize('\n').findAll { it.trim() }
 }
 
 // Git over https with a username/password credential; ssh remotes rely on the agent's keys.
@@ -132,8 +134,8 @@ pipeline {
         GIT_USER_EMAIL        = 'mvn-rebundle@example.com'
         CONSUMER_BUILD_ARGS   = '-DskipTests'    // APPLY: arguments of the consumer build (`mvn ... verify`)
         PUSH_BRANCH           = 'true'           // APPLY: push the branch to the consumer repository
-        ON_WARNINGS           = 'ask'            // APPLY, equivalence check passed with warnings: ask (input step), push (push, build UNSTABLE), stop (no push)
-        ON_WARNINGS_TIMEOUT   = '60'             // minutes to wait for the answer when ON_WARNINGS=ask; no answer = not pushed
+        ON_DIFFERENCES        = 'ask'            // APPLY, the rebuilt application differs from the original artifact: ask (input step), push (push, build UNSTABLE), stop (no push)
+        ON_DIFFERENCES_TIMEOUT = '60'            // minutes to wait for the answer when ON_DIFFERENCES=ask; no answer = not pushed
         DEFAULT_APP_PATH      = '/app/app.jar'   // original artifact as an image: application path inside it
         IMAGE_PLATFORM        = ''
         IMAGE_TOOL            = 'auto'
@@ -266,20 +268,22 @@ pipeline {
                         return
                     }
                     fetchSource('old', oldRef)
-                    // failures (the swap is wrong) stop the job here; warnings (differences outside the swap) are
-                    // listed in out/equivalence-warnings.txt and decided on before the push
+                    // the comparison reports and never fails the job: its findings are listed in
+                    // out/equivalence-findings.txt and decided on before the push (ON_DIFFERENCES)
                     sh '''
                         NEW=$("$PY" -c "import json; print(json.load(open('out/rebuilt-app.json'))['new_jar'])")
                         "$PY" scripts/verify_app_equivalence.py --old-source out/old-source.json --new "$NEW" \
                             --policy config/policy.json --out out/equivalence.json
+                        "$PY" scripts/write_summary.py --out-dir out || true
                     '''
-                    def warnings = equivalenceWarnings()
-                    if (warnings) {
-                        echo "Equivalence check passed with ${warnings.size()} warning(s):\n - " + warnings.join('\n - ')
-                        env.EQUIVALENCE_NOTE = "passed with ${warnings.size()} warning(s)"
+                    archiveArtifacts artifacts: 'out/**', allowEmptyArchive: true   // readable while the input step waits
+                    def findings = equivalenceFindings().findAll { !it.startsWith('[info]') }
+                    if (findings) {
+                        echo "The rebuilt application differs from the original artifact in ${findings.size()} way(s):\n - " + equivalenceFindings().join('\n - ')
+                        env.EQUIVALENCE_NOTE = "${findings.size()} difference(s) found, see ${env.BUILD_URL}artifact/out/SUMMARY.md"
                         currentBuild.result = 'UNSTABLE'
                     } else {
-                        env.EQUIVALENCE_NOTE = 'passed'
+                        env.EQUIVALENCE_NOTE = "equivalent, only the embedded jars were replaced (${env.BUILD_URL})"
                     }
                 }
             }
@@ -296,19 +300,20 @@ pipeline {
             steps {
                 script {
                     def branch = readFile('out/consumer-apply.branch').trim()
-                    def warnings = equivalenceWarnings()
+                    def lines = equivalenceFindings()
+                    def findings = lines.findAll { !it.startsWith('[info]') }
                     def push = true
-                    if (warnings && env.ON_WARNINGS == 'stop') {
-                        echo "ON_WARNINGS=stop: the equivalence check reported warnings, ${branch} is not pushed (the change is archived as out/consumer-apply.diff)"
+                    if (findings && env.ON_DIFFERENCES == 'stop') {
+                        echo "ON_DIFFERENCES=stop: the rebuilt application differs from the original artifact, ${branch} is not pushed (the change is archived as out/consumer-apply.diff)"
                         push = false
-                    } else if (warnings && env.ON_WARNINGS != 'push') {
+                    } else if (findings && env.ON_DIFFERENCES != 'push') {
                         try {
-                            timeout(time: env.ON_WARNINGS_TIMEOUT.toInteger(), unit: 'MINUTES') {
-                                input message: "The equivalence check passed with ${warnings.size()} warning(s):\n - ${warnings.join('\n - ')}\n\nPush ${branch} anyway?",
+                            timeout(time: env.ON_DIFFERENCES_TIMEOUT.toInteger(), unit: 'MINUTES') {
+                                input message: "The rebuilt application differs from the original artifact in ${findings.size()} way(s):\n - ${lines.join('\n - ')}\n\nFull report: ${env.BUILD_URL}artifact/out/SUMMARY.md\n\nPush ${branch} anyway?",
                                       ok: 'Push the branch'
                             }
                         } catch (err) {
-                            echo "${branch} not pushed: declined, or no answer within ${env.ON_WARNINGS_TIMEOUT} minutes (${err})"
+                            echo "${branch} not pushed: declined, or no answer within ${env.ON_DIFFERENCES_TIMEOUT} minutes (${err})"
                             push = false
                         }
                     }
@@ -324,7 +329,7 @@ Replace bundled dependencies with $(sed 's#^rebundle/##' "$WORKSPACE/out/consume
 
 Generated by mvn-rebundle: direct dependencies removed, exclusions added on the
 paths that reintroduce embedded coordinates, Enforcer gate installed.
-Equivalence check against the original artifact: $EQUIVALENCE_NOTE ($BUILD_URL).
+Comparison with the original artifact: $EQUIVALENCE_NOTE
 EOF
                                 '''
                             }

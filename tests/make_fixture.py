@@ -374,8 +374,8 @@ def leaked_jar(libdir: Path) -> Path:
 
 def build_stamped_apps(target: Path, libs: dict, bundle_jar: Path, replaced_names: list):
     """The original build under a CI-stamped version, signed, with a project module jar; the rebuild
-    under the plain POM version. The module's coordinates, its Version class and the application's
-    BuildStamp class differ, nothing else."""
+    under the plain POM version from another commit. The module's coordinates, its Version class, the
+    application's BuildStamp class and git.properties differ, nothing else."""
     old_v, new_v = "1.0.0-20240101", "1.0.0"
     old_mod = project_module_jar(target / "old-modules", "app-common", old_v)
     new_mod = project_module_jar(target / "new-modules", "app-common", new_v)
@@ -384,12 +384,16 @@ def build_stamped_apps(target: Path, libs: dict, bundle_jar: Path, replaced_name
     old_app = build_app(target / "old-app.jar", stamped, extra_app_entries={
         "META-INF/maven/com.example/app/pom.properties": ("groupId=com.example\nartifactId=app\nversion=%s\n" % old_v).encode(),
         "BOOT-INF/classes/com/example/BuildStamp.class": version_class("com.example.BuildStamp", old_v),
+        "BOOT-INF/classes/git.properties": b"git.commit.id.abbrev=1a2b3c4\ngit.commit.id.full=1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b\n"
+                                           b"git.commit.time=2024-01-01T08:35:42+0000\ngit.branch=main\n",
         "META-INF/BOOT.SF": b"Signature-Version: 1.0\n",
         "META-INF/BOOT.RSA": b"\x30\x82",
     })
     new_app = build_new_app(old_app, bundle_jar, replaced_names, target / "new-app.jar", swap_libs={old_mod.name: new_mod}, rewrite={
         "META-INF/maven/com.example/app/pom.properties": ("groupId=com.example\nartifactId=app\nversion=%s\n" % new_v).encode(),
         "BOOT-INF/classes/com/example/BuildStamp.class": version_class("com.example.BuildStamp", new_v),
+        "BOOT-INF/classes/git.properties": b"git.commit.id.abbrev=9f8e7d6\ngit.commit.id.full=9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e\n"
+                                           b"git.commit.time=2024-02-15T10:00:00+0000\ngit.branch=main\n",
         "META-INF/BOOT.SF": None,
         "META-INF/BOOT.RSA": None,
     })

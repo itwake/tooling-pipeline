@@ -1,8 +1,8 @@
 // mvn-rebundle / verify: compare the Spring Boot artifacts built before and after the POM change.
 // Proves that every class and resource on the dependency classpath is byte-identical: only the replaced
-// jars disappear and the bundle appears. Differences outside the swap (the project's own modules under
-// another CI-stamped version, application classes from another commit or JDK) are warnings and make
-// the build UNSTABLE; a difference in the swap itself fails it.
+// jars disappear and the bundle appears. Every difference (third-party jars and their contents, the
+// project's own modules and classes) is listed with where it sits, together with whether both builds come
+// from the same commit; the build ends UNSTABLE when there is anything to review. Nothing is decided here.
 //
 // Each input is a reference like SOURCE_REF of the main job: an image reference (ECR, the Nexus Docker
 // registry or any registry the agent is logged in to; append #/path when the application is not at
@@ -99,9 +99,10 @@ pipeline {
                         --bundle-artifact-id "$BUNDLE_ARTIFACT_ID" --policy config/policy.json --out out/equivalence.json
                 '''
                 script {
-                    def warnings = fileExists('out/equivalence-warnings.txt') ? readFile('out/equivalence-warnings.txt').tokenize('\n').findAll { it.trim() } : []
-                    if (warnings) {
-                        echo "Equivalence check passed with ${warnings.size()} warning(s):\n - " + warnings.join('\n - ')
+                    def lines = fileExists('out/equivalence-findings.txt') ? readFile('out/equivalence-findings.txt').tokenize('\n').findAll { it.trim() } : []
+                    def findings = lines.findAll { !it.startsWith('[info]') }
+                    if (findings) {
+                        echo "The new build differs from the old one in ${findings.size()} way(s):\n - " + lines.join('\n - ')
                         currentBuild.result = 'UNSTABLE'
                     }
                 }
