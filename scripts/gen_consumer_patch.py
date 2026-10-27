@@ -358,7 +358,8 @@ def main() -> None:
     md.append("## 4. Spring Boot version")
     md.append("")
     if boot_embedded:
-        md.append("Spring Boot %s itself is inside the bundle. Set the `<version>` of `spring-boot-maven-plugin` to `%s` so the launcher matches the embedded runtime, and remove the Boot starters from the POM; the Enforcer rule bans their coordinates anyway." % (boot_version or "(version unknown)", boot_version or "the embedded version"))
+        v = boot_version or "the embedded version"
+        md.append("Spring Boot %s itself is inside the bundle. The `<version>` of `spring-boot-maven-plugin` must be `%s` so the launcher it writes matches the embedded runtime. `apply_consumer_patch.py` sets it wherever the changed modules declare or manage the plugin inside the checkout; a declaration that takes its version from `spring-boot-starter-parent` %s is left alone, one that takes it from another parent outside the checkout gets the version written explicitly. Remove the Boot starters from the POM; the Enforcer rule bans their coordinates anyway." % (boot_version or "(version unknown)", v, v))
     elif boot_version:
         md.append("The bundle was built from a Spring Boot %s application. The Enforcer rule above keeps the consumer on the %s.x line; moving to another line means rebuilding the bundle first, because the embedded libraries are frozen at the versions that line manages." % (boot_version, ".".join(boot_version.split(".")[:2])))
     else:

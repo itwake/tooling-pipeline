@@ -170,6 +170,28 @@ def replace_element(src: str, el: Element, block: str, root: Element) -> str:
     return src[:a] + text + src[b:]
 
 
+def set_text(src: str, el: Element, text: str) -> str:
+    """Replace the text of a leaf element, leaving its tags, its position and the rest of its line untouched."""
+    return src[:el.inner_start] + text + src[el.inner_end:]
+
+
+def insert_after(src: str, sibling: Element, block: str, root: Element) -> str:
+    """Insert a block of XML (two spaces per level) right after a sibling element.
+
+    When the sibling ends its line (a trailing comment stays on that line) the block goes on its own
+    line(s) below it, with the sibling's indentation. When other content follows on the same line the
+    element is written inline, in the same compact style."""
+    nl = src.find("\n", sibling.end)
+    rest = (src[sibling.end:nl] if nl >= 0 else src[sibling.end:]).strip()
+    if nl >= 0 and (rest == "" or (rest.startswith("<!--") and rest.endswith("-->") and rest.count("<!--") == 1)):
+        if src[line_start(src, sibling.start):sibling.start].strip() == "" or sibling.parent is None:
+            ind = line_indent(src, sibling.start)
+        else:
+            ind = child_indent(src, sibling.parent, root)
+        return src[:nl + 1] + _indent_block(block, ind, indent_unit(src, root)) + src[nl + 1:]
+    return src[:sibling.end] + "".join(l.strip() for l in block.strip().splitlines()) + src[sibling.end:]
+
+
 def ensure_child(src: str, parent_path: List[str], root_tag_block: Dict[str, str]) -> Tuple[str, Element]:
     """Make sure the element path (below the root) exists, creating empty containers as needed.
 

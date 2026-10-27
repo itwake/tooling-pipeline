@@ -406,6 +406,46 @@ def main() -> None:
            "+      <version>1.0.0</version>" in single_diff and "+      <exclusions>" in single_diff and "+  <build>" in single_diff and "maven-enforcer-plugin" in single_diff
            and (single / "pom.xml").read_text(encoding="utf-8") == fx.CONSUMER_SINGLE_POM
            and any("app-batch" in w for w in read_json(out / "apply-single.json")["warnings"]))
+        ok("boot plugin not declared in the checkout: warning only",
+           any("spring-boot-maven-plugin is not declared" in w for w in read_json(out / "apply-single.json")["warnings"]))
+
+        # ---- spring-boot-maven-plugin aligned to the embedded Boot version -------------------
+        print("[boot plugin alignment]")
+        ok("boot plugin without a version under spring-boot-starter-parent of the embedded version is left alone",
+           "<artifactId>spring-boot-maven-plugin</artifactId>\n            </plugin>" in app_pom
+           and any("spring-boot-starter-parent 3.3.5" in n for n in applied["spring_boot_plugin"]["notes"])
+           and not any("spring-boot-maven-plugin" in a for f in applied["changed_files"] for a in f["actions"]))
+        boot = fx.build_boot_consumer_project(work / "consumer-boot")
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch.json", "--project", boot, "--out", out / "apply-boot.json", "--diff", out / "apply-boot.diff")
+        applied_boot = read_json(out / "apply-boot.json")
+        boot_actions = [a for f in applied_boot["changed_files"] for a in f["actions"]]
+        boot_root = (boot / "pom.xml").read_text(encoding="utf-8")
+        boot_app = (boot / "app" / "pom.xml").read_text(encoding="utf-8")
+        boot_batch = (boot / "app-batch" / "pom.xml").read_text(encoding="utf-8")
+        ok("boot plugin: pluginManagement property replaced by the embedded version, the module declaration stays without one",
+           "<version>3.3.5</version>" in boot_root.split("<pluginManagement>")[1].split("</pluginManagement>")[0]
+           and "<spring-boot.version>3.2.5</spring-boot.version>" in boot_root
+           and "<artifactId>spring-boot-maven-plugin</artifactId>\n            </plugin>" in boot_app
+           and any("${spring-boot.version} (3.2.5) -> 3.3.5 in pluginManagement" in a for a in boot_actions)
+           and any("pluginManagement entry inside the checkout" in n for n in applied_boot["spring_boot_plugin"]["notes"]))
+        ok("boot plugin: literal version and the declaration inside a profile aligned",
+           boot_batch.count("<version>3.3.5</version>") == 2 and "3.2.5" not in boot_batch
+           and any("3.2.5 -> 3.3.5 in build/plugins" in a for a in boot_actions)
+           and any("in profile docker build/plugins" in a for a in boot_actions)
+           and all(ET.fromstring(p.encode("utf-8")) is not None for p in (boot_root, boot_app, boot_batch)))
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch.json", "--project", boot, "--out", out / "apply-boot2.json", "--diff", out / "apply-boot2.diff")
+        ok("boot plugin alignment applied twice changes nothing", (out / "apply-boot2.diff").read_text(encoding="utf-8") == "")
+        boot_single = fx.build_boot_consumer_project(work / "consumer-boot-single", single=True)
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch.json", "--project", boot_single, "--out", out / "apply-boot-single.json", "--diff", out / "apply-boot-single.diff")
+        ok("boot plugin: version inserted after the artifactId when the parent manages another Boot version",
+           "<artifactId>spring-boot-maven-plugin</artifactId> <!-- version from the parent -->\n        <version>3.3.5</version>\n      </plugin>" in (boot_single / "pom.xml").read_text(encoding="utf-8")
+           and any("managed by spring-boot-starter-parent 3.2.5" in a for f in read_json(out / "apply-boot-single.json")["changed_files"] for a in f["actions"]))
+        run("gen_consumer_patch.py", "--manifest", out / "bundle-manifest-io.json", "--tree", tree, "--out", out / "consumer-patch-io-tree.md", "--out-json", out / "consumer-patch-io-tree.json")
+        boot_io = fx.build_boot_consumer_project(work / "consumer-boot-io")
+        run("apply_consumer_patch.py", "--patch", out / "consumer-patch-io-tree.json", "--project", boot_io, "--out", out / "apply-boot-io.json", "--diff", out / "apply-boot-io.diff")
+        ok("boot not embedded: plugin versions untouched",
+           "<version>3.2.5</version>" in (boot_io / "app-batch" / "pom.xml").read_text(encoding="utf-8")
+           and read_json(out / "apply-boot-io.json")["spring_boot_plugin"] is None)
         run("apply_consumer_patch.py", "--patch", out / "consumer-patch-io.json", "--project", cons, "--out", out / "apply-notree.json", "--diff", out / "apply-notree.diff", expect=2)
         ok("a proposal without a tree cannot be applied", not (out / "apply-notree.json").exists())
         (work / "consumer" / "app" / "target").mkdir(parents=True, exist_ok=True)

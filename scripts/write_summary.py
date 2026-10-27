@@ -124,6 +124,10 @@ def main() -> None:
             md.append("- `%s`: %s" % (f["path"], "; ".join(f.get("actions", []))))
         for w in applied.get("warnings", []):
             md.append("- WARNING: %s" % w)
+        plugin = applied.get("spring_boot_plugin") or {}
+        if plugin:
+            md.append("- `spring-boot-maven-plugin` aligned to %s, Spring Boot is inside the bundle%s" % (
+                plugin.get("version"), (": " + "; ".join(plugin["notes"])) if plugin.get("notes") else ""))
         md.append("")
     if equivalence:
         md += ["## Application equivalence: %s" % outcome(equivalence), "",

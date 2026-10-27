@@ -10,7 +10,10 @@ and edits the POMs in place, preserving their formatting and comments:
     a multi-module build, explicit otherwise), with exclusions for the transitive dependencies of
     the bundle POM that the module must not take from the bundle,
   * adds or updates the maven-enforcer-plugin execution that bans the embedded coordinates and,
-    when Spring Boot is not inside the bundle, pins the consumer to the Boot minor line.
+    when Spring Boot is not inside the bundle, pins the consumer to the Boot minor line,
+  * when Spring Boot itself is inside the bundle, sets the version of spring-boot-maven-plugin to the
+    embedded Boot version wherever the changed modules declare or manage the plugin inside the
+    checkout, so the launcher the plugin writes matches the runtime.
 
 Dependencies declared in a parent POM inside the checkout are edited there. Nothing is committed;
 the caller reviews the diff (--diff) and decides.
@@ -19,9 +22,10 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pomedit  # noqa: E402
@@ -54,6 +58,8 @@ ENFORCER_EXECUTION = """<execution>
 </execution>"""
 
 SKIP_DIRS = {".git", "target", "node_modules", ".idea", "build"}
+BOOT_PLUGIN_GROUP, BOOT_PLUGIN = "org.springframework.boot", "spring-boot-maven-plugin"
+BOOT_PARENT = "org.springframework.boot:spring-boot-starter-parent"
 
 
 def xml_escape(text: str) -> str:
@@ -210,6 +216,141 @@ def manage_bundle_version(root_pom: Pom, bundle: dict) -> None:
     root_pom.actions.append("managed bundle version %s in dependencyManagement" % bundle["version"])
 
 
+def ancestors(pom: Pom, poms: Dict[str, Pom]) -> List[Pom]:
+    """The POM and its parents inside the checkout, nearest first."""
+    chain: List[Pom] = []
+    current: Optional[Pom] = pom
+    while current is not None and all(current is not p for p in chain):
+        chain.append(current)
+        current = parent_of(current, poms)
+    return chain
+
+
+def boot_plugin_declarations(pom: Pom) -> List[Tuple[str, pomedit.Element]]:
+    """(where, element) for every declaration of spring-boot-maven-plugin in the POM: build/plugins,
+    build/pluginManagement, and the same two places inside each profile."""
+    def plugins_in(container, where):
+        found = []
+        for p in (container.children_named("plugin") if container is not None else []):
+            if p.child_text(pom.src, "artifactId") == BOOT_PLUGIN and p.child_text(pom.src, "groupId") in (None, BOOT_PLUGIN_GROUP):
+                found.append((where, p))
+        return found
+
+    def in_build(build, prefix):
+        if build is None:
+            return []
+        management = build.child("pluginManagement")
+        found = plugins_in(management.child("plugins"), prefix + "pluginManagement") if management is not None else []
+        return found + plugins_in(build.child("plugins"), prefix + "build/plugins")
+
+    found = in_build(pom.root.child("build"), "")
+    profiles = pom.root.child("profiles")
+    for profile in (profiles.children_named("profile") if profiles is not None else []):
+        found += in_build(profile.child("build"), "profile %s " % (profile.child_text(pom.src, "id") or "?"))
+    return found
+
+
+def resolve_property(pom: Pom, poms: Dict[str, Pom], expr: str, depth: int = 0) -> Optional[str]:
+    """Value of a ${...} expression from the POM and its parents inside the checkout; None when unknown."""
+    m = re.fullmatch(r"\$\{([^}]+)\}", expr.strip())
+    if m is None:
+        return expr.strip() or None
+    if depth > 5:
+        return None
+    name = m.group(1)
+    parent = pom.root.child("parent")
+    parent_version = parent.child_text(pom.src, "version") if parent is not None else None
+    if name in ("project.version", "pom.version", "version"):
+        value = pom.root.child_text(pom.src, "version") or parent_version
+    elif name in ("project.parent.version", "parent.version"):
+        value = parent_version
+    else:
+        value = None
+        for p in ancestors(pom, poms):
+            props = p.root.child("properties")
+            value = props.child_text(p.src, name) if props is not None else None
+            if value is not None:
+                break
+    if value is None:
+        return None
+    return resolve_property(pom, poms, value, depth + 1) if "${" in value else value
+
+
+def boot_parent_version(chain: List[Pom]) -> Optional[str]:
+    """Version of spring-boot-starter-parent when the outermost POM of the chain inherits from it."""
+    top = chain[-1]
+    if top.parent_ga != BOOT_PARENT:
+        return None
+    parent = top.root.child("parent")
+    return parent.child_text(top.src, "version") if parent is not None else None
+
+
+def align_boot_plugin(modules: List[Pom], poms: Dict[str, Pom], project: Path, version: str, warnings: List[str]) -> List[str]:
+    """Spring Boot itself is inside the bundle, so the launcher written by spring-boot-maven-plugin has
+    to match the embedded runtime: every declaration of the plugin that the changed modules see (their
+    own POM and their parents inside the checkout) is set to `version`. A declaration without a version
+    is left alone when a pluginManagement entry inside the checkout provides it (that entry is aligned
+    instead) or when it comes from spring-boot-starter-parent of that same version; otherwise the
+    version is written explicitly. Returns notes on the declarations that needed no change."""
+    reason = "Spring Boot %s is inside the bundle" % version
+    notes: List[str] = []
+    todo: List[Pom] = []
+    for module in modules:
+        for pom in ancestors(module, poms):
+            if all(pom is not p for p in todo):
+                todo.append(pom)
+    declared = False
+    for pom in todo:
+        rel = pom.path.relative_to(project).as_posix()
+        chain = ancestors(pom, poms)
+        managed = any(where == "pluginManagement" for p in chain for where, _ in boot_plugin_declarations(p))
+        parent_version = boot_parent_version(chain)
+        edited = set()
+        while True:
+            change = None
+            for where, plugin in boot_plugin_declarations(pom):
+                declared = True
+                ver = plugin.child("version")
+                if ver is not None:
+                    text = ver.text(pom.src)
+                    resolved = resolve_property(pom, poms, text) if "${" in text else text
+                    if text == version or resolved == version:
+                        continue
+                    change = ("set", where, plugin, ver, text, resolved)
+                    break
+                if where.endswith("build/plugins") and (managed or parent_version == version):
+                    continue
+                change = ("insert", where, plugin, None, None, None)
+                break
+            if change is None:
+                break
+            kind, where, plugin, ver, text, resolved = change
+            edited.add(where)
+            if kind == "set":
+                pom.src = pomedit.set_text(pom.src, ver, version)
+                was = text if resolved in (None, text) else "%s (%s)" % (text, resolved)
+                pom.actions.append("set %s version %s -> %s in %s (%s)" % (BOOT_PLUGIN, was, version, where, reason))
+            else:
+                pom.src = pomedit.insert_after(pom.src, plugin.child("artifactId"), "<version>%s</version>" % version, pom.root)
+                origin = ("spring-boot-starter-parent %s" % parent_version) if parent_version else "a parent outside the checkout"
+                pom.actions.append("set %s version %s in %s, it was managed by %s (%s)" % (BOOT_PLUGIN, version, where, origin, reason))
+            pom.reparse()
+        for where, plugin in boot_plugin_declarations(pom):
+            if where in edited:
+                continue
+            ver = plugin.child("version")
+            if ver is None:
+                source = "a pluginManagement entry inside the checkout" if managed else "spring-boot-starter-parent %s" % parent_version
+                notes.append("%s: %s declares %s without a version, %s provides %s" % (rel, where, BOOT_PLUGIN, source, version))
+            elif ver.text(pom.src) != version:
+                notes.append("%s: %s has %s %s, which resolves to %s" % (rel, where, BOOT_PLUGIN, ver.text(pom.src), version))
+            else:
+                notes.append("%s: %s already has %s %s" % (rel, where, BOOT_PLUGIN, version))
+    if not declared:
+        warnings.append("%s is not declared in the changed modules or their parents inside the checkout; where the application is repackaged, set the plugin version to %s so the launcher matches the embedded Spring Boot runtime" % (BOOT_PLUGIN, version))
+    return notes
+
+
 def install_enforcer(root_pom: Pom, banned: List[str], boot_excludes: List[str], coordinate: str, boot_version: Optional[str]) -> None:
     excludes = ["<exclude>%s</exclude>" % ga for ga in banned]
     if boot_excludes:
@@ -278,7 +419,7 @@ def main() -> None:
 
     bundle = patch["bundle"]
     warnings: List[str] = []
-    touched_modules = 0
+    touched: List[Pom] = []
     for module in patch.get("modules", []):
         if not module.get("remove_direct") and not module.get("exclusions"):
             continue
@@ -286,14 +427,18 @@ def main() -> None:
         if pom is None:
             warnings.append("module %s has changes in the proposal but no pom.xml was found for it" % module["module"])
             continue
-        touched_modules += 1
+        touched.append(pom)
         for ga in module.get("remove_direct", {}):
             remove_dependency(pom, poms, ga, warnings)
         for direct_ga, info in module.get("exclusions", {}).items():
             add_exclusions(pom, poms, direct_ga, info.get("targets", []), warnings)
         add_bundle_dependency(pom, bundle, with_version=not multi_module, exclusions=list(module.get("bundle_exclusions") or {}))
-    if multi_module and touched_modules:
+    if multi_module and touched:
         manage_bundle_version(root_pom, bundle)
+    plugin_report = None
+    if touched and patch.get("boot_embedded") and patch.get("spring_boot_version"):
+        plugin_report = {"version": patch["spring_boot_version"],
+                         "notes": align_boot_plugin(touched, poms, project, patch["spring_boot_version"], warnings)}
     banned = patch.get("banned") or sorted({"%s:%s" % (g["groupId"], g["artifactId"]) for g in patch["embedded"] if g.get("groupId") != "rebundle.unidentified"})
     install_enforcer(root_pom, banned, patch.get("boot_line_excludes") or [], patch["coordinate"], patch.get("spring_boot_version"))
 
@@ -321,6 +466,7 @@ def main() -> None:
         "branch": branch,
         "changed_files": [{"path": p.path.relative_to(project).as_posix(), "actions": p.actions} for p in changed],
         "warnings": warnings,
+        "spring_boot_plugin": plugin_report,
         "dry_run": args.dry_run,
     }
     write_json(args.out, result)
@@ -331,6 +477,8 @@ def main() -> None:
             log("    - %s" % a)
     for w in warnings:
         log("  [WARN] %s" % w)
+    for n in (plugin_report or {}).get("notes", []):
+        log("  [plugin] %s" % n)
     log("Diff written to %s; suggested branch %s" % (args.diff, branch))
 
 

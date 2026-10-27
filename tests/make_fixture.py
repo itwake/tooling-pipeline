@@ -484,6 +484,15 @@ CONSUMER_APP_POM = """<?xml version="1.0" encoding="UTF-8"?>
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
 </project>
 """
 
@@ -527,6 +536,147 @@ CONSUMER_SINGLE_POM = """<?xml version="1.0" encoding="UTF-8"?>
   </dependencies>
 </project>
 """
+
+# A consumer built on spring-boot-starter-parent 3.2.5 while the bundle embeds Boot 3.3.5. The root
+# manages spring-boot-maven-plugin through a property, app (CONSUMER_APP_POM) declares it without a
+# version, app-batch with a literal version and once more inside a profile.
+CONSUMER_BOOT_ROOT_POM = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.5</version>
+        <relativePath/>
+    </parent>
+    <groupId>com.example</groupId>
+    <artifactId>consumer-parent</artifactId>
+    <version>1.0.0</version>
+    <packaging>pom</packaging>
+
+    <properties>
+        <spring-boot.version>3.2.5</spring-boot.version>
+    </properties>
+
+    <modules>
+        <module>app</module>
+        <module>app-batch</module>
+    </modules>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <version>${spring-boot.version}</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+</project>
+"""
+CONSUMER_BOOT_BATCH_POM = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>consumer-parent</artifactId>
+        <version>1.0.0</version>
+    </parent>
+    <artifactId>app-batch</artifactId>
+    <dependencies>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>app</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency><groupId>org.yaml</groupId><artifactId>snakeyaml</artifactId></dependency>
+    </dependencies>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
+        </plugins>
+    </build>
+    <profiles>
+        <profile>
+            <id>docker</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.springframework.boot</groupId>
+                        <artifactId>spring-boot-maven-plugin</artifactId>
+                        <version>${spring-boot.version}</version>
+                        <configuration><skip>true</skip></configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>
+"""
+# Single module on spring-boot-starter-parent 3.2.5: the plugin takes its version from the parent.
+CONSUMER_BOOT_SINGLE_POM = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.2.5</version>
+    <relativePath/>
+  </parent>
+  <groupId>com.example</groupId>
+  <artifactId>app</artifactId>
+  <version>1.0.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>commons-io</groupId>
+      <artifactId>commons-io</artifactId>
+      <version>2.16.1</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-text</artifactId>
+      <version>1.12.0</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId> <!-- version from the parent -->
+      </plugin>
+    </plugins>
+  </build>
+</project>
+"""
+
+
+def build_boot_consumer_project(target: Path, single: bool = False) -> Path:
+    """The consumer on spring-boot-starter-parent 3.2.5 described above CONSUMER_BOOT_ROOT_POM."""
+    import shutil
+
+    if target.exists():
+        shutil.rmtree(target)
+    if single:
+        target.mkdir(parents=True)
+        (target / "pom.xml").write_text(CONSUMER_BOOT_SINGLE_POM, encoding="utf-8")
+        return target
+    (target / "app").mkdir(parents=True)
+    (target / "app-batch").mkdir(parents=True)
+    (target / "pom.xml").write_text(CONSUMER_BOOT_ROOT_POM, encoding="utf-8")
+    (target / "app" / "pom.xml").write_text(CONSUMER_APP_POM, encoding="utf-8")
+    (target / "app-batch" / "pom.xml").write_text(CONSUMER_BOOT_BATCH_POM, encoding="utf-8")
+    return target
 
 
 def build_consumer_project(target: Path, single: bool = False) -> Path:
