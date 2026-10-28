@@ -1,0 +1,111 @@
+// mvn-rebundle / extract: take the application archive out of an image, Nexus coordinates or a URL and keep
+// it as a build artifact.
+//
+// SOURCE_REF takes the same forms as in the main job and is detected the same way: an image reference (ECR,
+// the Nexus Docker registry or any registry the agent is logged in to; append #/path when the application is
+// not at DEFAULT_APP_PATH), Maven coordinates resolved in NEXUS_MAVEN_REPO_URL (SNAPSHOT versions through
+// maven-metadata.xml), an http(s) URL, or a path on the agent. A jar or war is archived byte for byte with its
+// SHA-256; an exploded Spring Boot layout (a buildpacks image's /workspace) is packed back into an executable
+// jar; a Jib layout (/app with libs and classes) is zipped and marked as not executable. The artifact is
+// fingerprinted, so downstream jobs can take it with Copy Artifact, and out/source.json records where it came
+// from (image digest, resolved Maven version).
+//
+// Agent requirements (Linux): Python 3.8+; docker (with a reachable daemon) or crane for images; the aws CLI
+// for images in ECR. Job setup: "Pipeline script from SCM", Script Path = jenkins/Jenkinsfile.extract.
+
+// Credentials needed to read the source; `auth` is what `extract_source.py --detect` printed.
+def withSourceCredentials(String auth, Closure body) {
+    if (auth == 'ecr' && env.AWS_CREDENTIALS_ID?.trim()) {
+        withCredentials([aws(credentialsId: env.AWS_CREDENTIALS_ID,
+                             accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+            body()
+        }
+    } else if (auth == 'nexus' && env.SOURCE_CREDENTIALS_ID?.trim()) {
+        withCredentials([usernamePassword(credentialsId: env.SOURCE_CREDENTIALS_ID,
+                                          usernameVariable: 'SOURCE_USERNAME', passwordVariable: 'SOURCE_PASSWORD')]) {
+            body()
+        }
+    } else {
+        body()
+    }
+}
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    parameters {
+        string(name: 'SOURCE_REF', defaultValue: '',
+               description: 'Where the application comes from: an image reference (append #/path when the application is not at DEFAULT_APP_PATH), Maven coordinates groupId:artifactId:version[:packaging[:classifier]], an http(s) URL, or a path on the agent')
+        string(name: 'ARTIFACT_NAME', defaultValue: '',
+               description: 'File name of the archived artifact. Empty: <repository>-<tag>.jar for an image, the artifact file name for Maven coordinates, the file name for a URL or path')
+    }
+
+    environment {
+        // ---- site specific: edit once -------------------------------------------------------
+        NEXUS_MAVEN_REPO_URL  = 'https://nexus.example.com/repository/maven-public/'   // Maven coordinates are resolved here
+        NEXUS_DOCKER_REGISTRY = 'nexus-docker.example.com'   // host[:port] of the Nexus Docker registry; images from it log in with SOURCE_CREDENTIALS_ID
+        SOURCE_CREDENTIALS_ID = 'nexus-deploy'  // Nexus credential for reading images, URLs and coordinates hosted on Nexus
+        AWS_CREDENTIALS_ID    = ''              // images in ECR: AWS credential ID (CloudBees AWS Credentials plugin); empty = the agent's instance role
+        DEFAULT_APP_PATH      = '/app/app.jar'  // application path inside images (fat jar file, or /workspace for buildpacks, /app for Jib)
+        IMAGE_PLATFORM        = ''              // e.g. linux/amd64 for multi-arch images; empty = default
+        IMAGE_TOOL            = 'auto'          // auto | docker | crane
+        // -----------------------------------------------------------------------------------
+        NEXUS_HOSTS = "${NEXUS_DOCKER_REGISTRY},${NEXUS_MAVEN_REPO_URL}"
+        PY = 'python3'
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                sh 'rm -rf work out && mkdir -p work out && "$PY" --version'
+            }
+        }
+
+        stage('Fetch source') {
+            steps {
+                script {
+                    if (!params.SOURCE_REF?.trim()) {
+                        error 'SOURCE_REF is required'
+                    }
+                    // kind, auth and host are detected from the reference; bind only the credentials that are needed
+                    def detected = sh(returnStdout: true,
+                                      script: '"$PY" scripts/extract_source.py --detect --ref "$SOURCE_REF" --nexus-hosts "$NEXUS_HOSTS"').trim()
+                    echo "Source detected: ${detected}"
+                    withSourceCredentials(detected.tokenize()[1]) {
+                        sh '''
+                            "$PY" scripts/extract_source.py --ref "$SOURCE_REF" --path "$DEFAULT_APP_PATH" --nexus-hosts "$NEXUS_HOSTS" \
+                                --image-tool "$IMAGE_TOOL" --platform "$IMAGE_PLATFORM" --maven-repo-url "$NEXUS_MAVEN_REPO_URL" \
+                                --out work/app --meta out/source.json
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Export artifact') {
+            steps {
+                sh '"$PY" scripts/export_app.py --source out/source.json --out-dir out/artifact --name "$ARTIFACT_NAME" --meta out/app-artifact.json'
+                script {
+                    // "<sha256>  <name>", written next to the artifact
+                    def line = sh(returnStdout: true, script: 'cat out/artifact/*.sha256').trim()
+                    def parts = line.split(/\s+/)
+                    if (parts.length == 2) {
+                        currentBuild.description = "${parts[1]} (sha256 ${parts[0].take(12)})"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '"$PY" scripts/write_summary.py --out-dir out || true'
+            archiveArtifacts artifacts: 'out/**', allowEmptyArchive: true, fingerprint: true
+        }
+    }
+}

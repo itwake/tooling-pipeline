@@ -21,6 +21,10 @@
 #        [--no-sources] [--mirror-url URL] [--release-url URL --snapshot-url URL --publish] [--skip-maven]
 #        (adds jars to a published bundle, or replaces embedded components by newer versions, and republishes it)
 #
+#   ./run-local.sh extract --ref REF [--name NAME] [--path /app/app.jar] [--maven-repo-url URL] [--nexus-hosts host1,host2] \
+#        [--aws-region R] [--type TYPE] [--image-tool auto|docker|crane] [--platform linux/amd64]
+#        (takes the application archive out of the source and writes it to out/artifact/ with its SHA-256)
+#
 # REF is detected like SOURCE_REF in Jenkins: an image reference (append #/path for the application inside
 # it), Maven coordinates g:a:v[:packaging[:classifier]], an http(s) URL, or a local file / directory.
 # Credentials come from the environment: SOURCE_USERNAME / SOURCE_PASSWORD for the Nexus hosts, the usual
@@ -34,7 +38,7 @@ command -v "$PY" >/dev/null 2>&1 || PY=python
 mode=${1:-bundle}
 [ $# -gt 0 ] && shift
 
-usage() { sed -n '2,27p' "$0"; exit 2; }
+usage() { sed -n '2,31p' "$0"; exit 2; }
 
 extract() {  # <ref> <path> <out dir> <meta file>
     "$PY" scripts/extract_source.py --ref "$1" --path "$2" --type "$type" --nexus-hosts "$nexus_hosts" \
@@ -220,6 +224,29 @@ elif [ "$mode" = "rework" ]; then
     fi
     "$PY" scripts/write_summary.py --out-dir out
     echo "done: see out/SUMMARY.md"
+
+elif [ "$mode" = "extract" ]; then
+    ref="" name="" path=/app/app.jar type=auto image_tool=auto platform="" aws_region="" maven_repo_url="" nexus_hosts=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ref) ref=$2; shift 2;;
+            --name) name=$2; shift 2;;
+            --path) path=$2; shift 2;;
+            --type) type=$2; shift 2;;
+            --image-tool) image_tool=$2; shift 2;;
+            --platform) platform=$2; shift 2;;
+            --aws-region) aws_region=$2; shift 2;;
+            --maven-repo-url) maven_repo_url=$2; shift 2;;
+            --nexus-hosts) nexus_hosts=$2; shift 2;;
+            *) echo "unknown option: $1"; usage;;
+        esac
+    done
+    [ -n "$ref" ] || usage
+    rm -rf work out && mkdir -p work out
+    extract "$ref" "$path" work/app out/source.json
+    "$PY" scripts/export_app.py --source out/source.json --out-dir out/artifact --name "$name" --meta out/app-artifact.json
+    "$PY" scripts/write_summary.py --out-dir out
+    echo "done: the artifact and its .sha256 are in out/artifact/"
 else
     usage
 fi

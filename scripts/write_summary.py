@@ -60,6 +60,7 @@ def main() -> None:
     plugin_check = load(out / "plugin-trees-check.json")
     publish = load(out / "publish.json")
     rework = load(out / "rework-plan.json")
+    artifact = load(out / "app-artifact.json")
 
     md = ["# Run summary", ""]
     if rework:
@@ -97,6 +98,14 @@ def main() -> None:
             md.append("- Image digest: `%s`" % source["digest"])
         if source.get("sha256"):
             md.append("- Artifact SHA-256: `%s`" % source["sha256"])
+        md.append("")
+    if artifact:
+        kind = {"copy": "the archive as it was fetched, byte for byte", "repack": "packed back from the exploded layout into an executable archive",
+                "zip": "a zip of the directory, not an executable archive"}.get(artifact.get("kind"), artifact.get("kind"))
+        md += ["## Application artifact", "", "- File: `%s` (%d bytes)" % (artifact["name"], artifact.get("size") or 0),
+               "- SHA-256: `%s`" % artifact["sha256"], "- Content: %s" % kind]
+        if artifact.get("note"):
+            md.append("- Note: %s" % artifact["note"])
         md.append("")
     if inventory:
         app = inventory["app"]

@@ -31,6 +31,7 @@ sys.path.insert(0, str(HERE))
 
 import make_fixture as fx  # noqa: E402
 from bundlelib import (  # noqa: E402
+    AppArtifact,
     BUNDLE_BASE_ATTR,
     BUNDLE_CONTENTS_ATTR,
     BUNDLE_REWORKED_FROM_ATTR,
@@ -1090,11 +1091,74 @@ def main() -> None:
             "--out", work / "mvn-bad", "--meta", out / "mvn-bad.json", env=with_creds, expect=2)
         ok("malformed maven coordinates fail", not (out / "mvn-bad.json").exists())
 
+        # ---- extract job: the application archive as one build artifact -------------------------
+        print("[export app]")
+        run("export_app.py", "--source", out / "source.json", "--out-dir", out / "artifact", "--meta", out / "app-artifact.json")
+        exp = read_json(out / "app-artifact.json")
+        ok("a jar source is copied byte for byte with its checksum",
+           exp["name"] == "app.jar" and exp["kind"] == "copy" and exp["executable"] and exp["layout"] == "file" and exp["sha256"] == src["sha256"]
+           and (out / "artifact" / "app.jar").read_bytes() == app.read_bytes()
+           and (out / "artifact" / "app.jar.sha256").read_text(encoding="utf-8").split() == [src["sha256"], "app.jar"]
+           and exp["source"]["ref"] == src["ref"])
+        run("export_app.py", "--source", out / "source.json", "--out-dir", out / "artifact-named", "--name", "orders-1.2.3.jar", "--meta", out / "app-artifact-named.json")
+        ok("--name renames the artifact", (out / "artifact-named" / "orders-1.2.3.jar").is_file() and read_json(out / "app-artifact-named.json")["name"] == "orders-1.2.3.jar")
+        run("export_app.py", "--source", out / "source.json", "--out-dir", out / "artifact-badname", "--name", "../x.jar", "--meta", out / "app-artifact-badname.json", expect=2)
+        ok("a name with a path is refused", not (out / "app-artifact-badname.json").exists())
+        image_meta = dict(src, type="image", ref="nexus-docker.example.com:5000/team/orders:1.2.3", app_path="/app/app.jar", digest="sha256:" + "ab" * 32)
+        write_json(out / "image-source.json", image_meta)
+        run("export_app.py", "--source", out / "image-source.json", "--out-dir", out / "artifact-image", "--meta", out / "app-artifact-image.json")
+        ok("an image artifact is named after the repository and tag", read_json(out / "app-artifact-image.json")["name"] == "orders-1.2.3.jar")
+        write_json(out / "image-digest-source.json", dict(image_meta, ref="nexus-docker.example.com:5000/team/orders@sha256:" + "ab" * 32))
+        run("export_app.py", "--source", out / "image-digest-source.json", "--out-dir", out / "artifact-digest", "--meta", out / "app-artifact-digest.json")
+        ok("without a tag the digest prefix names it", read_json(out / "app-artifact-digest.json")["name"] == "orders-abababababab.jar")
+        # an exploded Boot layout (a buildpacks image's /workspace) is packed back into an executable jar
+        exploded = work / "exploded" / "workspace"
+        with zipfile.ZipFile(app) as zf:
+            zf.extractall(exploded)
+        write_json(out / "exploded-source.json", dict(image_meta, ref="nexus-docker.example.com:5000/team/orders:2.0.0", app_path="/workspace", local_path=str(exploded), sha256=None))
+        run("export_app.py", "--source", out / "exploded-source.json", "--out-dir", out / "artifact-exploded", "--meta", out / "app-artifact-exploded.json")
+        rexp = read_json(out / "app-artifact-exploded.json")
+        repacked = out / "artifact-exploded" / "orders-2.0.0.jar"
+        with zipfile.ZipFile(repacked) as zf, zipfile.ZipFile(app) as orig:
+            infos = zf.infolist()
+            same = {n: zf.read(n) for n in zf.namelist()} == {n: orig.read(n) for n in orig.namelist() if not n.endswith("/")}
+            stored = all(i.compress_type == zipfile.ZIP_STORED for i in infos if i.filename.startswith("BOOT-INF/lib/"))
+            deflated = any(i.compress_type == zipfile.ZIP_DEFLATED for i in infos if i.filename.startswith("BOOT-INF/classes/"))
+        ok("exploded Boot layout repacked: same entries, manifest first, nested jars stored, classes deflated",
+           rexp["kind"] == "repack" and rexp["executable"] and rexp["layout"] == "boot-exploded" and infos[0].filename == "META-INF/MANIFEST.MF"
+           and same and stored and deflated and rexp["nested_jars_stored"] == len(libs) and "stored without compression" in rexp["note"])
+        repacked_app = AppArtifact(repacked)
+        ok("the repacked jar reads as a Boot jar with every dependency", repacked_app.layout == "boot-jar" and len(repacked_app.dependency_jars()) == len(libs)
+           and repacked_app.manifest().get("Spring-Boot-Version") == "3.3.5")
+        repacked_app.close()
+        # a Jib layout has no archive to repack: it is zipped and marked as not executable
+        jib = work / "jib" / "app"
+        (jib / "libs").mkdir(parents=True)
+        (jib / "classes" / "com").mkdir(parents=True)
+        shutil.copy(libs["commons-io"], jib / "libs" / libs["commons-io"].name)
+        (jib / "classes" / "com" / "App.class").write_bytes(fx.fake_class("App"))
+        (jib / "jib-classpath-file").write_text("/app/resources:/app/classes:/app/libs/*", encoding="utf-8")
+        write_json(out / "jib-source.json", dict(image_meta, ref="registry.example.com/team/orders:3.0.0", app_path="/app", local_path=str(jib), sha256=None))
+        run("export_app.py", "--source", out / "jib-source.json", "--out-dir", out / "artifact-jib", "--meta", out / "app-artifact-jib.json")
+        jexp = read_json(out / "app-artifact-jib.json")
+        with zipfile.ZipFile(out / "artifact-jib" / "orders-3.0.0.zip") as zf:
+            jib_names = set(zf.namelist())
+        ok("a Jib layout is zipped and marked as not executable",
+           jexp["kind"] == "zip" and not jexp["executable"] and jexp["layout"] == "lib-dir"
+           and jib_names == {"libs/commons-io-2.16.1.jar", "classes/com/App.class", "jib-classpath-file"} and "not an executable jar" in jexp["note"])
+        notjar = work / "notjar.bin"
+        notjar.write_bytes(b"\x7fELF not a jar")
+        write_json(out / "notjar-source.json", dict(src, local_path=str(notjar), sha256=None))
+        run("export_app.py", "--source", out / "notjar-source.json", "--out-dir", out / "artifact-notjar", "--meta", out / "app-artifact-notjar.json", expect=2)
+        ok("a file that is not an archive is refused", not (out / "app-artifact-notjar.json").exists())
+
         # ---- summary + settings -----------------------------------------------------------
         print("[summary]")
         run("write_summary.py", "--out-dir", out)
         summary = (out / "SUMMARY.md").read_text(encoding="utf-8")
         ok("summary written", (out / "SUMMARY.md").is_file() and "Bundle verification: passed" in summary)
+        ok("summary describes the exported artifact", "## Application artifact" in summary and "- File: `app.jar`" in summary
+           and "- Content: the archive as it was fetched, byte for byte" in summary)
         ok("summary describes the rework", "## Rework of `com.company.platform:thirdparty-bundle:1.0.0`" in summary
            and "- New coordinates: `com.company.platform:thirdparty-bundle:1.0.0.1` (version derived)" in summary
            and "`hotfix.jar` (upload): add as `rebundle.unidentified:hotfix:" in summary and "replaces 1 entry of the bundle: `org/apache/commons/io/FileUtils.class`" in summary)

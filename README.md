@@ -19,17 +19,18 @@ Design principles:
 | `mvn-rebundle-consumer` | `jenkins/Jenkinsfile.consumer` | POM change proposal for a consuming project, per module and per path when its dependency tree is available |
 | `mvn-rebundle-verify` | `jenkins/Jenkinsfile.verify` | Equivalence check of the application built before and after the POM change |
 | `mvn-rebundle-rework` | `jenkins/Jenkinsfile.rework` | Change a published bundle (merge an uploaded jar or Nexus coordinates into it, replace an embedded component by a newer version) and publish it under a new version |
+| `mvn-rebundle-extract` | `jenkins/Jenkinsfile.extract` | Take the application jar out of an image, Nexus coordinates or a URL and keep it as a fingerprinted build artifact |
 
-The four jobs are independent. The consumer job takes the bundle from an archived `mvn-rebundle` build (Copy Artifact plugin) or downloads it from Nexus by coordinates, so it also works for a bundle published long ago; the rework job always starts from Nexus.
+The five jobs are independent. The consumer job takes the bundle from an archived `mvn-rebundle` build (Copy Artifact plugin) or downloads it from Nexus by coordinates, so it also works for a bundle published long ago; the rework job always starts from Nexus.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `Jenkinsfile`, `jenkins/` | The four jobs |
+| `Jenkinsfile`, `jenkins/` | The five jobs |
 | `scripts/*.py` | The stages, standard-library Python only, shared by Jenkins and the local runner |
 | `config/policy.json` | Families that must stay together, notes, and the ignore list of the equivalence check |
-| `run-local.sh` | Runs the same stages on a workstation (`bundle`, `consumer`, `verify`, `rework` modes) |
+| `run-local.sh` | Runs the same stages on a workstation (`bundle`, `consumer`, `verify`, `rework`, `extract` modes) |
 | `tests/` | Synthetic fixtures, a fake Nexus, and the self-test (no Maven needed) |
 
 ## Agent requirements
@@ -39,12 +40,13 @@ The four jobs are independent. The consumer job takes the bundle from an archive
 - `mvn-rebundle-consumer`: Python 3.8+; JDK and Maven when a consumer project is analysed.
 - `mvn-rebundle-verify`: Python 3.8+; `docker` or `crane` for image inputs.
 - `mvn-rebundle-rework`: JDK 17+, Maven 3.6+, Python 3.8+; no image tools.
+- `mvn-rebundle-extract`: Python 3.8+; `docker` or `crane` for image inputs, the `aws` CLI for images in ECR.
 - Jenkins plugins: Pipeline, Git, Credentials Binding, Copy Artifact (consumer job, unless coordinates are used), File Parameter (rework job: the uploaded jar is a `stashedFile` parameter, and the Jenkinsfile does not load without the plugin), CloudBees AWS Credentials (only when `AWS_CREDENTIALS_ID` is set).
 
 ## Creating the Jenkins jobs
 
 1. Push this repository to your git server.
-2. Create the four Pipeline jobs, Definition "Pipeline script from SCM", with the Script Paths from the table above.
+2. Create the five Pipeline jobs, Definition "Pipeline script from SCM", with the Script Paths from the table above.
 3. Edit the site settings in the `environment` block at the top of each Jenkinsfile once. Everything that describes your site lives there, not in the run parameters:
 
    | Variable | Meaning |
@@ -164,6 +166,17 @@ What happens:
 
 Afterwards run `mvn-rebundle-consumer` with the new coordinates: the jar's manifest lists what it embeds now, so the proposal adds the exclusions for the added coordinates and moves the consumer to the new version. Removing a component is not a rework: rebuild the bundle with `mvn-rebundle` and a smaller `SELECT`.
 
+## `mvn-rebundle-extract` parameters
+
+Takes the application archive out of a source and keeps it as a build artifact, for a look at what runs in production or as the input of another job.
+
+| Parameter | Meaning |
+|---|---|
+| `SOURCE_REF` | Where the application comes from, detected like `SOURCE_REF` of the main job: an image reference (`#/path` when the application is not at `DEFAULT_APP_PATH`), Maven coordinates, an http(s) URL or a path on the agent |
+| `ARTIFACT_NAME` | File name of the artifact. Empty derives it: `<repository>-<tag>.jar` for an image (`<repository>-<digest prefix>.jar` without a tag), the artifact's file name for Maven coordinates (SNAPSHOT versions resolved), the file name for a URL or path |
+
+`extract_source.py` fetches the source as in the main job, then `export_app.py` writes `out/artifact/<name>` and `<name>.sha256`: a jar or war byte for byte; an exploded Spring Boot layout (a buildpacks image's `/workspace`) packed back into an executable archive, `META-INF/MANIFEST.MF` first and the nested jars stored without compression as the Boot launcher requires; a Jib layout (`/app` with `libs` and `classes`) zipped as it is and marked as not executable. `out/source.json` records the image digest or the resolved Maven version, `out/app-artifact.json` the name, size, SHA-256 and kind; the build description shows the name and the SHA-256 prefix. Everything under `out/` is archived with fingerprints, so another job can take `out/artifact/*.jar` with Copy Artifact. Nothing is published to Nexus.
+
 ## What the consumer has to do
 
 Run `mvn-rebundle-consumer` (ideally with the consumer's git URL) and apply `out/consumer-patch.md` to the POM: delete the replaced direct dependencies, add the bundle dependency, add the proposed exclusions and put the Enforcer rule into the parent POM. Then run `mvn clean verify`; a passing Enforcer check means no path brings the original coordinates back.
@@ -204,7 +217,11 @@ For a change that does not justify a rebuild from the application, such as a hot
 ./run-local.sh rework --bundle com.company.platform:thirdparty-bundle:1.0.0 --maven-repo-url https://nexus.example.com/repository/maven-public/ --add-jar fix.jar --add org.apache.commons:commons-lang3:3.14.0
 ```
 
-`--ref` takes the same forms as `SOURCE_REF` and is detected the same way. Pass `--maven-repo-url URL` (Maven coordinates and jar identification) and `--nexus-hosts host1,host2` so that references on Nexus use the exported `SOURCE_USERNAME` / `SOURCE_PASSWORD`; images in ECR use the AWS credentials of the environment or the instance role. Without `--select` the bundle mode stops after the inventory. On a machine without Maven add `--skip-maven` to stop after project generation. Publishing needs `export NEXUS_USERNAME NEXUS_PASSWORD` plus `--release-url`, `--snapshot-url` and `--publish`. The consumer mode reads `out/bundle-manifest.json` from a previous bundle run, or takes `--bundle-jar` or `--bundle g:a:v --embedded "..."`. The verify mode exits 0 whenever the comparison ran and prints the differences; `--fail-on dependencies|any` makes findings of that scope exit 1. The rework mode needs `--maven-repo-url` with `SOURCE_USERNAME` / `SOURCE_PASSWORD` exported, takes any number of `--add-jar` files and `--add` coordinates, derives the version unless `--new-version` is given, and publishes like the bundle mode.
+```bash
+./run-local.sh extract --ref nexus-docker.example.com/team/app:1.2.3 --nexus-hosts nexus-docker.example.com
+```
+
+`--ref` takes the same forms as `SOURCE_REF` and is detected the same way. Pass `--maven-repo-url URL` (Maven coordinates and jar identification) and `--nexus-hosts host1,host2` so that references on Nexus use the exported `SOURCE_USERNAME` / `SOURCE_PASSWORD`; images in ECR use the AWS credentials of the environment or the instance role. Without `--select` the bundle mode stops after the inventory. On a machine without Maven add `--skip-maven` to stop after project generation. Publishing needs `export NEXUS_USERNAME NEXUS_PASSWORD` plus `--release-url`, `--snapshot-url` and `--publish`. The consumer mode reads `out/bundle-manifest.json` from a previous bundle run, or takes `--bundle-jar` or `--bundle g:a:v --embedded "..."`. The verify mode exits 0 whenever the comparison ran and prints the differences; `--fail-on dependencies|any` makes findings of that scope exit 1. The rework mode needs `--maven-repo-url` with `SOURCE_USERNAME` / `SOURCE_PASSWORD` exported, takes any number of `--add-jar` files and `--add` coordinates, derives the version unless `--new-version` is given, and publishes like the bundle mode. The extract mode writes the application archive to `out/artifact/` with its `.sha256`; `--name` sets the file name.
 
 Self-test (no Maven needed; a fake Nexus runs locally and the Shade output is simulated from synthetic fixtures):
 
