@@ -26,7 +26,9 @@ from bundlelib import (  # noqa: E402
     AppArtifact,
     BUNDLE_CONTENTS_ATTR,
     THIRD_PARTY_DIR,
+    LOG4J_PLUGIN_CACHE,
     classify_entry,
+    parse_log4j_plugin_cache,
     fail,
     ga_str,
     log,
@@ -102,6 +104,8 @@ def main() -> None:
     services_exp = defaultdict(set)
     append_exp = defaultdict(set)
     props_exp = defaultdict(lambda: defaultdict(set))
+    log4j_exp = defaultdict(set)  # Log4j plugin category -> keys, over every component carrying a plugin cache
+    log4j_sources = 0
     legal_exp = {}  # bundle path -> sha
     for comp in man["components"]:
         dj = by_path.get(comp["path_in_app"])
@@ -125,6 +129,13 @@ def main() -> None:
                 elif cat == "props-merge":
                     for k, vals in properties_values(parse_properties(data.decode("utf-8", "replace"))).items():
                         props_exp[n][k].update(vals)
+                elif cat == "log4j-plugins":
+                    log4j_sources += 1
+                    try:
+                        for category, entries in parse_log4j_plugin_cache(data).items():
+                            log4j_exp[category].update(entries)
+                    except Exception as e:  # noqa: BLE001
+                        fail("%s in %s cannot be parsed: %s" % (n, dj.name, e))
                 elif n not in expected:  # first copy wins, as in the application's class-loading order
                     expected[n] = sha256_bytes(data)
     app.close()
@@ -168,6 +179,23 @@ def main() -> None:
     check("spring-properties-merged", not props_problems,
           "; ".join(props_problems[:10]) if props_problems else "%d file(s) verified" % len(props_exp))
 
+    if log4j_sources:
+        log4j_problems = []
+        if LOG4J_PLUGIN_CACHE not in bset:
+            log4j_problems.append("%s missing" % LOG4J_PLUGIN_CACHE)
+        else:
+            try:
+                have = parse_log4j_plugin_cache(bz.read(LOG4J_PLUGIN_CACHE))
+            except Exception as e:  # noqa: BLE001
+                have, log4j_problems = {}, ["%s cannot be parsed: %s" % (LOG4J_PLUGIN_CACHE, e)]
+            for category, keys in sorted(log4j_exp.items()):
+                lost = sorted(keys - set(have.get(category, {})))
+                if lost:
+                    log4j_problems.append("category %s lost %s" % (category, ", ".join(lost[:5])))
+        check("log4j-plugin-cache-merged", not log4j_problems,
+              "; ".join(log4j_problems[:10]) if log4j_problems else "%d plugin(s) in %d categor%s from %d jar(s)" % (
+                  sum(len(k) for k in log4j_exp.values()), len(log4j_exp), "y" if len(log4j_exp) == 1 else "ies", log4j_sources))
+
     legal_missing = [p for p, s in legal_exp.items() if p not in bset or sha256_bytes(bz.read(p)) != s]
     check("legal-files-relocated", not legal_missing,
           "missing/changed: %s" % ", ".join(legal_missing[:10]) if legal_missing else "%d file(s) under %s" % (len(legal_exp), THIRD_PARTY_DIR))
@@ -184,6 +212,7 @@ def main() -> None:
         or n in services_exp
         or n in append_exp
         or n in props_exp
+        or (n == LOG4J_PLUGIN_CACHE and log4j_sources > 0)
     )
     extras = [n for n in bnames if n not in expected and not allowed_extra(n) and classify_entry(n) not in ("signature", "index", "module-info")]
     check("no-unexpected-entries", not extras, ", ".join(extras[:15]))

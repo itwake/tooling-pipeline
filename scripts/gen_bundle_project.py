@@ -27,6 +27,7 @@ from bundlelib import (  # noqa: E402
     BUNDLE_CONTENTS_ATTR,
     BUNDLE_SOURCE_ATTR,
     THIRD_PARTY_DIR,
+    LEGAL_PATTERNS,
     classify_entry,
     fail,
     ga_str,
@@ -109,21 +110,14 @@ POM_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
                     <exclude>module-info.class</exclude>
                     <exclude>META-INF/versions/*/module-info.class</exclude>
                     <!-- legal files are copied to META-INF/third-party/<artifact>-<version>/ instead -->
-                    <exclude>META-INF/LICENSE</exclude>
-                    <exclude>META-INF/LICENSE.*</exclude>
-                    <exclude>META-INF/LICENSE-*</exclude>
-                    <exclude>META-INF/NOTICE</exclude>
-                    <exclude>META-INF/NOTICE.*</exclude>
-                    <exclude>META-INF/NOTICE-*</exclude>
-                    <exclude>META-INF/DEPENDENCIES</exclude>
-                    <exclude>META-INF/DEPENDENCIES.*</exclude>
+@@LEGAL_EXCLUDES@@
                   </excludes>
                 </filter>
               </filters>
 
               <transformers>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
-@@APPEND_TRANSFORMERS@@@@PROPS_TRANSFORMERS@@
+@@APPEND_TRANSFORMERS@@@@PROPS_TRANSFORMERS@@@@LOG4J_TRANSFORMER@@
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                   <manifestEntries>
 @@MULTI_RELEASE@@
@@ -152,13 +146,23 @@ PROPS_TRANSFORMER = """                <transformer implementation="org.springfr
                 </transformer>
 """
 SHADE_PLUGIN_DEPS = """        <dependencies>
-          <!-- provides PropertiesMergingResourceTransformer; version follows the application's Spring Boot -->
+%s        </dependencies>
+"""
+BOOT_PLUGIN_DEP = """          <!-- provides PropertiesMergingResourceTransformer; version follows the application's Spring Boot -->
           <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-maven-plugin</artifactId>
             <version>%s</version>
           </dependency>
-        </dependencies>
+"""
+LOG4J_TRANSFORM_DEP = """          <!-- provides Log4j2PluginCacheFileTransformer, which merges the Log4j plugin caches of the components -->
+          <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-transform-maven-shade-plugin-extensions</artifactId>
+            <version>%s</version>
+          </dependency>
+"""
+LOG4J_TRANSFORMER = """                <transformer implementation="org.apache.logging.log4j.maven.plugins.shade.transformer.Log4j2PluginCacheFileTransformer"/>
 """
 DIST_MGMT = """
   <distributionManagement>
@@ -201,6 +205,8 @@ def main() -> None:
     ap.add_argument("--timestamp", default="2024-01-01T00:00:00Z", help="project.build.outputTimestamp")
     ap.add_argument("--shade-version", default="3.6.0")
     ap.add_argument("--spring-boot-version", default="", help="override the detected Spring Boot version")
+    ap.add_argument("--log4j-transform-version", default="0.2.0",
+                    help="version of org.apache.logging.log4j:log4j-transform-maven-shade-plugin-extensions, used when several components carry a Log4j plugin cache")
     ap.add_argument("--manifest-out", default="out/bundle-manifest.json")
     ap.add_argument("--inventory", default="", help="inventory.json of the application (default: next to the selection file); "
                     "its coordinates bound what the published POM may promote")
@@ -231,6 +237,11 @@ def main() -> None:
     boot_version = args.spring_boot_version or sel.get("spring_boot_version")
     if transformers.get("props_merge") and not boot_version:
         fail("properties merging needs a Spring Boot version (--spring-boot-version)")
+    shade_plugin_deps = ""
+    if transformers.get("props_merge"):
+        shade_plugin_deps += BOOT_PLUGIN_DEP % escape(boot_version)
+    if transformers.get("log4j_plugins"):
+        shade_plugin_deps += LOG4J_TRANSFORM_DEP % escape(args.log4j_transform_version)
 
     source = read_json(args.source) if args.source and Path(args.source).exists() else None
     if source:
@@ -270,7 +281,9 @@ def main() -> None:
         "@@TIMESTAMP@@": escape(args.timestamp),
         "@@DEPENDENCIES@@": "\n".join(dep_xml(d["gav"]) for d in selected),
         "@@SHADE_VERSION@@": escape(args.shade_version),
-        "@@SHADE_PLUGIN_DEPENDENCIES@@": (SHADE_PLUGIN_DEPS % escape(boot_version)) if transformers.get("props_merge") else "",
+        "@@SHADE_PLUGIN_DEPENDENCIES@@": (SHADE_PLUGIN_DEPS % shade_plugin_deps) if shade_plugin_deps else "",
+        "@@LEGAL_EXCLUDES@@": "\n".join("                    <exclude>%s</exclude>" % escape(p) for p in LEGAL_PATTERNS),
+        "@@LOG4J_TRANSFORMER@@": LOG4J_TRANSFORMER if transformers.get("log4j_plugins") else "",
         "@@SOURCES_JAR@@": args.sources_jar,
         "@@INCLUDES@@": "\n".join("                  <include>%s</include>" % escape(ga) for ga in includes),
         "@@APPEND_TRANSFORMERS@@": "".join(APPEND_TRANSFORMER % escape(r) for r in transformers.get("append", [])),
@@ -357,6 +370,7 @@ def main() -> None:
         "transformers": transformers,
         "spring_boot_version": boot_version,
         "shade_version": args.shade_version,
+        "log4j_transform_version": args.log4j_transform_version if transformers.get("log4j_plugins") else None,
         "sources_jar": args.sources_jar == "true",
         "timestamp": args.timestamp,
         "project_dir": str(out),
@@ -374,7 +388,8 @@ def main() -> None:
     log("  transformers: services%s%s%s" % (
         ", append(%d)" % len(transformers.get("append", [])) if transformers.get("append") else "",
         ", props-merge(%d) via spring-boot-maven-plugin %s" % (len(transformers["props_merge"]), boot_version) if transformers.get("props_merge") else "",
-        ", Multi-Release" if transformers.get("multi_release") else ""))
+        ", Multi-Release" if transformers.get("multi_release") else "")
+        + (", log4j-plugins via log4j-transform-maven-shade-plugin-extensions %s" % args.log4j_transform_version if transformers.get("log4j_plugins") else ""))
     if unidentified:
         log("  unidentified: %d jar(s) embedded under synthetic coordinates (%s)" % (
             len(unidentified), ", ".join(u["name"] for u in unidentified)))

@@ -31,7 +31,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bundlelib import (  # noqa: E402
     AppArtifact,
+    COLLAPSE_HARMLESS,
+    LOG4J_PLUGIN_CACHE,
     classify_entry,
+    match_any,
     fail,
     ga_str,
     gav_str,
@@ -227,7 +230,7 @@ def main() -> None:
 
     # ---- cross-jar checks (needs the bytes) ----------------------------------------------
     conflicts, identical = [], []
-    append_present, props_counts, services_counts = set(), defaultdict(int), defaultdict(int)
+    append_present, props_counts, services_counts, log4j_counts = set(), defaultdict(int), defaultdict(int), 0
     multi_release = any(d.get("flags", {}).get("multi_release") for d in selected_list)
     if selected_list:
         app = AppArtifact(inv["app"]["local_path"])
@@ -250,6 +253,8 @@ def main() -> None:
                         append_present.add(n)
                     elif cat == "props-merge":
                         props_counts[n] += 1
+                    elif cat == "log4j-plugins":
+                        log4j_counts += 1
         app.close()
         position = {d["name"]: d.get("classpath_index", 10 ** 9) for d in deps}
         for path, shas in sorted(entries.items()):
@@ -263,9 +268,14 @@ def main() -> None:
             add_finding("warn", "overlap-resolved", "%d entries exist in several selected jars with different bytes; the bundle keeps the copy that comes first on the application's classpath, as the JVM does: %s" % (
                 len(conflicts), "; ".join("%s shadows %s" % (w, s) for w, s in pairs[:6])))
             resources = [c["path"] for c in conflicts if not c["path"].endswith(".class")]
-            if resources:
-                add_finding("warn", "resource-copies-collapse", "%d of them are resources; a library that reads every copy (getResources) will only see the first after merging: %s" % (
-                    len(resources), ", ".join(resources[:6])))
+            harmless = [r for r in resources if match_any(r, COLLAPSE_HARMLESS)]
+            review = [r for r in resources if r not in harmless]
+            if harmless:
+                add_finding("info", "resource-copies-harmless", "%d of them are IDE or documentation metadata nothing reads at run time; the first copy is kept: %s" % (
+                    len(harmless), ", ".join(harmless[:6])))
+            if review:
+                add_finding("warn", "resource-copies-collapse", "%d of them are resources that only keep their first copy; a library that reads every copy (getResources) loses the others. SPI files, the Spring metadata and the Log4j plugin cache are merged, decide for these: %s" % (
+                    len(review), ", ".join(review[:6])))
         if identical:
             add_finding("info", "overlap-identical", "%d entries are duplicated with identical bytes (first copy is kept)" % len(identical))
 
@@ -274,7 +284,9 @@ def main() -> None:
         if boot_version:
             add_finding("info", "props-merge", "%s occur in several selected jars; merged with Spring Boot %s PropertiesMergingResourceTransformer" % (", ".join(props_merge), boot_version))
         else:
-            add_finding("error", "props-merge-no-boot", "%s occur in several selected jars but no Spring Boot version was detected to merge them" % ", ".join(props_merge))
+            add_finding("error", "props-merge-no-boot", "%s occur in several selected jars but no Spring Boot version is known to merge them (the application manifest has no Spring-Boot-Version, no spring-boot jar is named or identified); rerun inspect_app.py with --spring-boot-version" % ", ".join(props_merge))
+    if log4j_counts > 1:
+        add_finding("info", "log4j-plugins-merge", "%s provided by %d jars; merged by Log4j's Log4j2PluginCacheFileTransformer" % (LOG4J_PLUGIN_CACHE, log4j_counts))
     for r, c in sorted(services_counts.items()):
         if c > 1:
             add_finding("info", "services-merge", "%s provided by %d jars; merged by ServicesResourceTransformer" % (r, c))
@@ -292,6 +304,7 @@ def main() -> None:
             "services": True,
             "append": sorted(append_present),
             "props_merge": props_merge,
+            "log4j_plugins": log4j_counts > 1,
             "multi_release": multi_release,
         },
         "spring_boot_version": boot_version,

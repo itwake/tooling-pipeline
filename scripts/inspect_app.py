@@ -6,9 +6,14 @@ Maven coordinates, SHA-1 / SHA-256, the dependencies declared in its embedded po
 the facts that matter for merging: signatures, module-info, multi-release, SPI files, Spring
 metadata, native libraries, nested jars.
 
-Coordinates come from the jar's pom.properties. Jars without one (Tomcat, BouncyCastle, ...)
-are identified through the Spring Boot BOM, the manifest vendor id and the Nexus search API,
-and every candidate is confirmed against the repository's .sha1 (--repo-url).
+Coordinates come from the jar's pom.properties. Jars without one (Spring and Spring Boot themselves,
+which Gradle builds, Tomcat, BouncyCastle, ...) are identified through the Spring Boot BOM, the
+dependencies other jars declare, the manifest vendor id and the Nexus search API, and every candidate
+is confirmed against the repository's .sha1 (--repo-url).
+
+The Spring Boot version is read from the application's own manifest (Spring-Boot-Version), else from
+the spring-boot jar's name, before any jar is identified: it selects the BOM and the properties-merging
+transformer of the bundle build. --spring-boot-version overrides it.
 """
 from __future__ import annotations
 
@@ -30,6 +35,7 @@ from bundlelib import (  # noqa: E402
     scan_jar,
     sha1_bytes,
     spring_boot_version,
+    spring_boot_version_from_app,
     utc_now_iso,
     write_json,
 )
@@ -64,6 +70,7 @@ def main() -> None:
     ap.add_argument("--repo-url", default="", help="Maven repository used to identify jars without pom.properties (Nexus group URL)")
     ap.add_argument("--central", action="store_true", help="also query search.maven.org by checksum")
     ap.add_argument("--no-lookup", action="store_true", help="never touch the network")
+    ap.add_argument("--spring-boot-version", default="", help="override the Spring Boot version read from the application")
     ap.add_argument("--out", default="out/inventory.json")
     args = ap.parse_args()
 
@@ -77,6 +84,12 @@ def main() -> None:
 
     order_names, order_source = app.classpath_order()
     log("Inspecting %s (layout: %s, class-loading order from %s)" % (path, app.layout, order_source))
+    if args.spring_boot_version:
+        boot, boot_source = args.spring_boot_version, "--spring-boot-version"
+    else:
+        boot, boot_source = spring_boot_version_from_app(app, [dj.name for dj in app.dependency_jars()])
+    if boot:
+        log("Spring Boot %s (%s)" % (boot, boot_source))
     deps = []
     for index, dj in enumerate(app.dependency_jars()):
         rec = {
@@ -110,7 +123,9 @@ def main() -> None:
             rec["error"] = "not a valid zip: %s" % e
         deps.append(rec)
 
-    boot = spring_boot_version(deps)
+    identified_boot = spring_boot_version(deps)
+    if identified_boot and not boot:
+        boot, boot_source = identified_boot, "identified spring-boot jar"
     unknown = [d for d in deps if not d["gav"] and not d["error"]]
     if unknown:
         # what the other jars declare in their own pom.xml identifies jars without a descriptor offline
@@ -136,6 +151,14 @@ def main() -> None:
             else:
                 d["candidates"] = (d["candidates"] or []) + [c for c in cands if c not in d["candidates"]]
                 d["synthetic"], d["synthetic_hint"] = synthetic_coordinates(d["name"], d["sha1"])
+    identified_boot = spring_boot_version(deps)
+    if identified_boot and not boot:
+        boot, boot_source = identified_boot, "identified spring-boot jar"
+    elif identified_boot and boot and identified_boot != boot and boot_source != "--spring-boot-version":
+        log("WARN: the application manifest says Spring Boot %s but the embedded spring-boot jar is %s; the jar wins" % (boot, identified_boot))
+        boot, boot_source = identified_boot, "identified spring-boot jar"
+    if not boot:
+        log("WARN: no Spring Boot version found: the manifest has no Spring-Boot-Version, no spring-boot jar is named or identified; pass --spring-boot-version if the bundle must merge spring.factories")
 
     inventory = {
         "app": {
@@ -143,6 +166,7 @@ def main() -> None:
             "layout": app.layout,
             "sha256": app.file_sha256(),
             "spring_boot_version": boot,
+            "spring_boot_version_source": boot_source,
             "dependency_count": len(deps),
             "classpath_source": order_source,
             "repo_url": args.repo_url or None,

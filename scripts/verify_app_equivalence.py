@@ -32,6 +32,7 @@ from bundlelib import (  # noqa: E402
     BUNDLE_CONTENTS_ATTR,
     THIRD_PARTY_DIR,
     classify_entry,
+    parse_log4j_plugin_cache,
     fail,
     ga_str,
     gav_str,
@@ -181,6 +182,13 @@ def collect_entries(jars, skip_prefixes):
                 elif cat == "props-merge":
                     for k, vals in properties_values(parse_properties(data.decode("utf-8", "replace"))).items():
                         merged_props[n][k].update(vals)
+                elif cat == "log4j-plugins":
+                    # the Log4j plugin cache is merged by Log4j's transformer: compare the set of plugins, not the bytes
+                    try:
+                        for category, entries in parse_log4j_plugin_cache(data).items():
+                            merged_lines[n].update("%s/%s" % (category, key) for key in entries)
+                    except Exception:  # noqa: BLE001
+                        plain[n][sha256_bytes(data)].append(j["name"])
                 else:
                     plain[n][sha256_bytes(data)].append(j["name"])
     return plain, merged_lines, merged_props

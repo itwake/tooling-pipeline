@@ -159,6 +159,39 @@ def main() -> None:
            and by_name["vendor-sdk-2.0.0.jar"]["gav_source"] == "nexus-search+sha1")
         ok("everything identified with the repository", all(d["gav"] for d in inv["dependencies"]))
 
+        # ---- Spring Boot version: the application manifest first, then the spring-boot jar name --------
+        print("[spring boot version]")
+        glibs = fx.build_gradle_style_libs(work / "fixture-gradle" / "libs")
+        gapp = fx.build_app(work / "fixture-gradle" / "app.jar", glibs)
+        for key, g, v in (("spring-boot", "org.springframework.boot", "3.3.5"), ("spring-boot-autoconfigure", "org.springframework.boot", "3.3.5"),
+                          ("spring-core", "org.springframework", "6.1.14")):
+            fx.put_sha1(work / "fakenexus", g, key, v, glibs[key])
+        run("inspect_app.py", "--app", gapp, "--no-lookup", "--out", out / "inv-gradle-offline.json")
+        gi = read_json(out / "inv-gradle-offline.json")
+        ok("Boot version read from the application manifest although no Spring jar has a descriptor",
+           gi["app"]["spring_boot_version"] == "3.3.5" and gi["app"]["spring_boot_version_source"] == "application manifest Spring-Boot-Version"
+           and all(not d["gav"] for d in gi["dependencies"]))
+        text = run("inspect_app.py", "--app", gapp, "--repo-url", repo_url, "--out", out / "inv-gradle.json", env=with_creds)
+        gby = {d["name"]: d for d in read_json(out / "inv-gradle.json")["dependencies"]}
+        ok("with the version known up front the Boot BOM identifies the Gradle-built Spring jars",
+           "Loaded 2 BOM(s)" in text and gby["spring-boot-3.3.5.jar"]["gav_source"] == "spring-boot-bom+sha1"
+           and gby["spring-boot-3.3.5.jar"]["gav"] == {"groupId": "org.springframework.boot", "artifactId": "spring-boot", "version": "3.3.5"}
+           and gby["spring-core-6.1.14.jar"]["gav_source"] == "spring-boot-bom+sha1" and gby["spring-boot-autoconfigure-3.3.5.jar"]["gav_source"] == "spring-boot-bom+sha1")
+        run("resolve_selection.py", "--inventory", out / "inv-gradle-offline.json", "--select", "*", "--out", out / "sel-gradle.json")
+        gsel = read_json(out / "sel-gradle.json")
+        ok("spring.factories of several jars merge with the manifest-detected version, offline and unidentified",
+           gsel["ok"] and gsel["spring_boot_version"] == "3.3.5" and gsel["transformers"]["props_merge"] == ["META-INF/spring.factories"]
+           and any(f["code"] == "props-merge" for f in gsel["findings"]) and not any(f["code"] == "props-merge-no-boot" for f in gsel["findings"]))
+        gapp2 = fx.build_app(work / "fixture-gradle" / "app-plain.jar", glibs, boot_version_in_manifest=False)
+        run("inspect_app.py", "--app", gapp2, "--no-lookup", "--out", out / "inv-gradle-plain.json")
+        gi2 = read_json(out / "inv-gradle-plain.json")["app"]
+        ok("without the manifest attribute the spring-boot jar name gives the version",
+           gi2["spring_boot_version"] == "3.3.5" and gi2["spring_boot_version_source"] == "spring-boot jar name")
+        run("inspect_app.py", "--app", gapp2, "--no-lookup", "--spring-boot-version", "3.2.0", "--out", out / "inv-gradle-override.json")
+        ok("--spring-boot-version overrides the detection",
+           read_json(out / "inv-gradle-override.json")["app"]["spring_boot_version"] == "3.2.0"
+           and read_json(out / "inv-gradle-override.json")["app"]["spring_boot_version_source"] == "--spring-boot-version")
+
         # ---- stage 3: selection and expansion ------------------------------------------------
         print("[resolve selection]")
 
@@ -188,9 +221,17 @@ def main() -> None:
         sel = selection("*", "all")
         ok("star selects every jar; duplicates resolve in class-loading order",
            sel["ok"] and len(sel["selected"]) == len(libs)
-           and sel["overlaps"]["conflicts"] == [{"path": "com/dup/Same.class", "winner": "dup-x-1.0.jar", "shadowed": ["dup-y-1.0.jar"]}]
+           and {"path": "com/dup/Same.class", "winner": "dup-x-1.0.jar", "shadowed": ["dup-y-1.0.jar"]} in sel["overlaps"]["conflicts"]
            and any(f["code"] == "overlap-resolved" and "dup-x-1.0.jar shadows dup-y-1.0.jar" in f["message"] for f in sel["findings"])
            and [d["name"] for d in sel["selected"]] == [d["name"] for d in inv["dependencies"]])
+        ok("duplicated resources are graded: IDE metadata is harmless, the rest is listed for review, merged files are not listed",
+           any(f["code"] == "resource-copies-harmless" and "META-INF/spring-configuration-metadata.json" in f["message"] for f in sel["findings"])
+           and any(f["code"] == "resource-copies-collapse" and "reference.conf" in f["message"] and "Log4j2Plugins" not in f["message"]
+                   and "spring-autoconfigure-metadata" not in f["message"] and "license.txt" not in f["message"] for f in sel["findings"])
+           and any(f["code"] == "log4j-plugins-merge" for f in sel["findings"]) and sel["transformers"]["log4j_plugins"] is True)
+        sel = selection("log4j-core", "log4j")
+        ok("Log4j family completed, its plugin caches flagged for merging",
+           names(sel) == ["log4j-core-2.23.1.jar", "log4j-layout-template-json-2.23.1.jar"] and sel["transformers"]["log4j_plugins"] is True)
         sel = selection("* -dup-y", "all-excl")
         ok("exclusion removes one side of a duplicate", sel["ok"] and len(sel["selected"]) == len(libs) - 1 and not sel["overlaps"]["conflicts"])
         run("resolve_selection.py", "--inventory", out / "inventory.json", "--select", "commons-io", "--policy-mode", "strict", "--out", out / "sel-compat.json")
@@ -211,8 +252,8 @@ def main() -> None:
            and sorted(d["name"] for d in sel["selected"] if d["gav_source"] == "synthetic") == ["bcprov-jdk15on-1.60.jar", "vendor-sdk-2.0.0.jar"])
         sel = selection("codec-a\ncodec-b\ncommons-codec", "merge")
         ok("merge transformers detected", sel["transformers"]["props_merge"] == ["META-INF/spring.factories"]
-           and sel["transformers"]["append"] == ["META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports"]
-           and sel["transformers"]["multi_release"] is True)
+           and sel["transformers"]["append"] == ["META-INF/spring-autoconfigure-metadata.properties", "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports"]
+           and sel["transformers"]["multi_release"] is True and sel["transformers"]["log4j_plugins"] is False)
 
         # ---- stage 4: project generation ---------------------------------------------------
         print("[generate bundle project]")
@@ -232,8 +273,10 @@ def main() -> None:
         ok("pom configures Boot properties transformer", "PropertiesMergingResourceTransformer" in pom and "<version>3.3.5</version>" in pom)
         ok("pom sets Multi-Release and the Boot manifest attribute", "<Multi-Release>true</Multi-Release>" in pom and "<X-Dependency-Bundle-Spring-Boot>3.3.5</X-Dependency-Bundle-Spring-Boot>" in pom)
         ok("pom has distributionManagement", "<snapshotRepository>" in pom and "maven-releases" in pom)
-        ok("legal files relocated", (proj / "src/main/resources/META-INF/third-party/commons-io-2.16.1/LICENSE.txt").is_file()
-           and (proj / "src/main/resources/META-INF/third-party/BUNDLE-CONTENTS.txt").is_file())
+        ok("legal files relocated, lowercase ones included", (proj / "src/main/resources/META-INF/third-party/commons-io-2.16.1/LICENSE.txt").is_file()
+           and (proj / "src/main/resources/META-INF/third-party/codec-b-1.0/license.txt").is_file()
+           and (proj / "src/main/resources/META-INF/third-party/BUNDLE-CONTENTS.txt").is_file()
+           and "<exclude>META-INF/license.*</exclude>" in pom and "Log4j2PluginCacheFileTransformer" not in pom)
         ok("manifest lists 10 components in class-loading order", len(man["components"]) == 10 and man["contents_attr"].startswith("com.example.codec:codec-a:1.0,")
            and not man["unidentified"] and len(man["install"]) == 10 and all(Path(i["file"]).is_file() for i in man["install"]))
         text = run("install_components.py", "--manifest", out / "bundle-manifest.json", "--repo-url", repo_url, "--local-repo", work / "m2", "--dry-run", env=with_creds)
@@ -282,6 +325,38 @@ def main() -> None:
         fx.write_reduced_pom(target / "bad-reduced-pom.xml", bundle, [("commons-io", "commons-io", "2.16.1")])
         run("verify_bundle.py", "--manifest", out / "bundle-manifest.json", "--reduced-pom", target / "bad-reduced-pom.xml", "--out", out / "bv-pom.json", expect=1)
         ok("embedded coordinate still in reduced pom detected", any(c["check"] == "reduced-pom-drops-embedded" and c["status"] == "fail" for c in read_json(out / "bv-pom.json")["checks"]))
+
+        # ---- Log4j plugin caches of several jars are merged by Log4j's transformer ---------------
+        print("[log4j plugin cache]")
+        l4_sel = out / "sel-log4j.json"
+        run("resolve_selection.py", "--inventory", out / "inventory.json", "--select", "log4j-core", "--out", l4_sel)
+        l4_proj = work / "bundle-log4j"
+        run("gen_bundle_project.py", "--selection", l4_sel, "--source", out / "source.json", "--group-id", bundle["groupId"],
+            "--artifact-id", "log4j-bundle", "--version", "1.0.0", "--out", l4_proj, "--manifest-out", out / "bundle-manifest-log4j.json")
+        l4_pom = (l4_proj / "pom.xml").read_text(encoding="utf-8")
+        l4_man = read_json(out / "bundle-manifest-log4j.json")
+        ok("pom merges the Log4j plugin caches with Log4j's transformer",
+           "Log4j2PluginCacheFileTransformer" in l4_pom
+           and "<artifactId>log4j-transform-maven-shade-plugin-extensions</artifactId>\n            <version>0.2.0</version>" in l4_pom
+           and "PropertiesMergingResourceTransformer" not in l4_pom and l4_man["log4j_transform_version"] == "0.2.0"
+           and ET.fromstring(l4_pom.encode("utf-8")) is not None)
+        l4_jars = [work / "fixture" / "libs" / Path(c["path_in_app"]).name for c in l4_man["components"]]
+        l4_bundle = {"groupId": bundle["groupId"], "artifactId": "log4j-bundle", "version": "1.0.0"}
+        l4_good = fx.simulate_shade(l4_proj, l4_jars, l4_bundle, l4_man["contents_attr"], source_attr, False, l4_proj / "target" / "log4j-bundle-1.0.0.jar", boot_version="3.3.5")
+        fx.write_reduced_pom(l4_proj / "target" / "dependency-reduced-pom.xml", l4_bundle, [])
+        run("verify_bundle.py", "--manifest", out / "bundle-manifest-log4j.json", "--out", out / "bv-log4j.json")
+        l4_checks = {c["check"]: c for c in read_json(out / "bv-log4j.json")["checks"]}
+        with zipfile.ZipFile(l4_good) as zf:
+            merged = fx.parse_log4j_plugin_cache(zf.read(fx.LOG4J_PLUGIN_CACHE))
+        ok("merged plugin cache keeps every plugin of every jar",
+           l4_checks["log4j-plugin-cache-merged"]["status"] == "pass" and "5 plugin(s) in 3 categories from 2 jar(s)" in l4_checks["log4j-plugin-cache-merged"]["detail"]
+           and l4_checks["no-unexpected-entries"]["status"] == "pass" and read_json(out / "bv-log4j.json")["ok"]
+           and set(merged["Core"]) == {"console", "patternlayout", "jsontemplatelayout"} and set(merged) == {"Core", "Lookup", "JsonTemplateResolverFactory"})
+        l4_bad = fx.simulate_shade(l4_proj, l4_jars, l4_bundle, l4_man["contents_attr"], source_attr, False, l4_proj / "target" / "bad-log4j.jar",
+                                   drop=[fx.LOG4J_PLUGIN_CACHE], boot_version="3.3.5")
+        run("verify_bundle.py", "--manifest", out / "bundle-manifest-log4j.json", "--bundle", l4_bad, "--out", out / "bv-log4j-bad.json", expect=1)
+        ok("a lost plugin cache fails the verification",
+           any(c["check"] == "log4j-plugin-cache-merged" and c["status"] == "fail" and "missing" in c["detail"] for c in read_json(out / "bv-log4j-bad.json")["checks"]))
 
         # ---- stage 8: publish (dry run) --------------------------------------------------
         print("[publish]")

@@ -17,10 +17,13 @@ from bundlelib import (  # noqa: E402
     BUNDLE_BOOT_ATTR,
     BUNDLE_CONTENTS_ATTR,
     BUNDLE_SOURCE_ATTR,
+    LOG4J_PLUGIN_CACHE,
     classify_entry,
+    parse_log4j_plugin_cache,
     parse_properties,
     properties_values,
     significant_lines,
+    write_log4j_plugin_cache,
 )
 
 
@@ -133,23 +136,44 @@ def build_libs(libdir: Path) -> dict:
                               ["com/example/codec/a/JsonCodec.class"],
                               extra={"META-INF/services/com.example.Codec": b"com.example.codec.a.JsonCodec\n",
                                      "META-INF/spring.factories": b"com.example.Factory=com.example.codec.a.AFactory\n",
+                                     "META-INF/spring-autoconfigure-metadata.properties": b"com.example.codec.a.AAutoConfiguration=\ncom.example.codec.a.AAutoConfiguration.ConditionalOnClass=com.example.codec.a.JsonCodec\n",
                                      "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports": b"com.example.codec.a.AAutoConfiguration\n"},
                               deps=[("commons-io", "commons-io", "compile"), ("junit", "junit", "test")])
+    # codec-b carries its legal files in lowercase, as some jars do
     libs["codec-b"] = dep_jar(libdir, "com.example.codec", "codec-b", "1.0",
                               ["com/example/codec/b/XmlCodec.class"],
                               extra={"META-INF/services/com.example.Codec": b"com.example.codec.b.XmlCodec\n",
                                      "META-INF/spring.factories": b"com.example.Factory=com.example.codec.b.BFactory,com.example.codec.b.B2Factory\n",
-                                     "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports": b"com.example.codec.b.BAutoConfiguration\n"})
-    # two jars with the same class path but different bytes
-    libs["dup-x"] = dep_jar(libdir, "com.example.dup", "dup-x", "1.0", ["com/dup/Same.class"])
-    libs["dup-y"] = dep_jar(libdir, "com.example.dup", "dup-y", "1.0", ["com/dup/Same.class"])
+                                     "META-INF/spring-autoconfigure-metadata.properties": b"com.example.codec.b.BAutoConfiguration=\ncom.example.codec.b.BAutoConfiguration.AutoConfigureAfter=com.example.codec.a.AAutoConfiguration\n",
+                                     "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports": b"com.example.codec.b.BAutoConfiguration\n",
+                                     "META-INF/license.txt": b"Apache License 2.0 for codec-b", "META-INF/notice.txt": b"codec-b\nCopyright example"},
+                              legal=False)
+    # two jars with the same class path but different bytes, plus a duplicated IDE metadata file (harmless) and
+    # a duplicated configuration file a library may read from every jar (to review)
+    libs["dup-x"] = dep_jar(libdir, "com.example.dup", "dup-x", "1.0", ["com/dup/Same.class"],
+                            extra={"META-INF/spring-configuration-metadata.json": b'{"properties": [{"name": "dup.x"}]}', "reference.conf": b"dup { x = 1 }\n"})
+    libs["dup-y"] = dep_jar(libdir, "com.example.dup", "dup-y", "1.0", ["com/dup/Same.class"],
+                            extra={"META-INF/spring-configuration-metadata.json": b'{"properties": [{"name": "dup.y"}]}', "reference.conf": b"dup { y = 2 }\n"})
     # unrelated library that stays in the app
     libs["snakeyaml"] = dep_jar(libdir, "org.yaml", "snakeyaml", "2.2", ["org/yaml/snakeyaml/Yaml.class"],
                                 extra={"META-INF/LICENSE.txt": b"Apache 2.0 snakeyaml"})
+    # two Log4j jars, each with its own plugin cache: Log4j reads every copy at start-up
+    libs["log4j-core"] = dep_jar(libdir, "org.apache.logging.log4j", "log4j-core", "2.23.1",
+                                 ["org/apache/logging/log4j/core/appender/ConsoleAppender.class"],
+                                 extra={LOG4J_PLUGIN_CACHE: write_log4j_plugin_cache({
+                                     "Core": {"console": ("org.apache.logging.log4j.core.appender.ConsoleAppender", "Console", True, False),
+                                              "patternlayout": ("org.apache.logging.log4j.core.layout.PatternLayout", "PatternLayout", True, False)},
+                                     "Lookup": {"env": ("org.apache.logging.log4j.core.lookup.EnvironmentLookup", "env", False, False)}})})
+    libs["log4j-layout-template-json"] = dep_jar(libdir, "org.apache.logging.log4j", "log4j-layout-template-json", "2.23.1",
+                                                 ["org/apache/logging/log4j/layout/template/json/JsonTemplateLayout.class"],
+                                                 extra={LOG4J_PLUGIN_CACHE: write_log4j_plugin_cache({
+                                                     "Core": {"jsontemplatelayout": ("org.apache.logging.log4j.layout.template.json.JsonTemplateLayout", "JsonTemplateLayout", True, False)},
+                                                     "JsonTemplateResolverFactory": {"message": ("org.apache.logging.log4j.layout.template.json.resolver.MessageResolverFactory", "message", False, False)}})},
+                                                 deps=[("org.apache.logging.log4j", "log4j-core", "compile")])
     return libs
 
 
-def build_app(app_path: Path, libs: dict, app_seed: str = "v1", extra_app_entries=None) -> Path:
+def build_app(app_path: Path, libs: dict, app_seed: str = "v1", extra_app_entries=None, boot_version_in_manifest: bool = True) -> Path:
     lib_names = sorted(p.name for p in libs.values())
     entries = {
         "org/springframework/boot/loader/launch/JarLauncher.class": fake_class("JarLauncher"),
@@ -164,6 +188,8 @@ def build_app(app_path: Path, libs: dict, app_seed: str = "v1", extra_app_entrie
     entries.update(extra_app_entries or {})
     manifest = {"Main-Class": "org.springframework.boot.loader.launch.JarLauncher", "Start-Class": "com.example.App",
                 "Spring-Boot-Version": "3.3.5", "Spring-Boot-Classes": "BOOT-INF/classes/", "Spring-Boot-Lib": "BOOT-INF/lib/"}
+    if not boot_version_in_manifest:
+        del manifest["Spring-Boot-Version"]
     stored = {"BOOT-INF/lib/%s" % p.name: str(p) for p in libs.values()}
     return make_jar(app_path, entries, manifest, stored)
 
@@ -177,10 +203,14 @@ BOOT_BOM = """<?xml version="1.0" encoding="UTF-8"?>
   <packaging>pom</packaging>
   <properties>
     <tomcat.version>10.1.59</tomcat.version>
+    <spring-framework.version>6.1.14</spring-framework.version>
     <extra-bom.version>1.0</extra-bom.version>
   </properties>
   <dependencyManagement>
     <dependencies>
+      <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot</artifactId><version>3.3.5</version></dependency>
+      <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-autoconfigure</artifactId><version>3.3.5</version></dependency>
+      <dependency><groupId>org.springframework</groupId><artifactId>spring-core</artifactId><version>${spring-framework.version}</version></dependency>
       <dependency><groupId>org.apache.tomcat.embed</groupId><artifactId>tomcat-embed-core</artifactId><version>${tomcat.version}</version></dependency>
       <dependency><groupId>com.example.boms</groupId><artifactId>extra-bom</artifactId><version>${extra-bom.version}</version><type>pom</type><scope>import</scope></dependency>
     </dependencies>
@@ -228,6 +258,31 @@ def build_fake_nexus(repo_root: Path, libs: dict, app_jar: Path, snapshot_metada
     return {sha1_of(libs["vendor-sdk"]): {"groupId": "com.vendor", "artifactId": "vendor-sdk", "version": "2.0.0", "extension": "jar"}}
 
 
+def put_sha1(repo_root: Path, g: str, a: str, v: str, jar: Path) -> None:
+    """The .sha1 the fake Nexus serves for a jar, so a candidate can be confirmed."""
+    p = repo_root / "repository" / "maven-public" / g.replace(".", "/") / a / v / ("%s-%s.jar.sha1" % (a, v))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(sha1_of(jar) + "  %s-%s.jar\n" % (a, v), encoding="utf-8")
+
+
+def build_gradle_style_libs(libdir: Path) -> dict:
+    """Spring's own jars as Gradle builds them: no pom.properties, no embedded pom.xml. Nothing in the
+    libraries identifies them or says which Spring Boot this is; the application has to."""
+    libs = {}
+    libs["spring-boot"] = dep_jar(libdir, "org.springframework.boot", "spring-boot", "3.3.5", ["org/springframework/boot/SpringApplication.class"],
+                                  extra={"META-INF/spring.factories": b"org.springframework.boot.env.EnvironmentPostProcessor=\\\norg.springframework.boot.env.RandomValuePropertySourceEnvironmentPostProcessor\n"},
+                                  no_pom=True, manifest_extra={"Implementation-Title": "Spring Boot"})
+    libs["spring-boot-autoconfigure"] = dep_jar(libdir, "org.springframework.boot", "spring-boot-autoconfigure", "3.3.5",
+                                                ["org/springframework/boot/autoconfigure/SpringBootApplication.class"],
+                                                extra={"META-INF/spring.factories": b"org.springframework.boot.env.EnvironmentPostProcessor=\\\norg.springframework.boot.autoconfigure.IntegrationPropertiesEnvironmentPostProcessor\n",
+                                                       "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports": b"org.springframework.boot.autoconfigure.context.PropertyPlaceholderAutoConfiguration\n"},
+                                                no_pom=True, manifest_extra={"Implementation-Title": "Spring Boot AutoConfigure"})
+    libs["spring-core"] = dep_jar(libdir, "org.springframework", "spring-core", "6.1.14", ["org/springframework/core/SpringVersion.class"],
+                                  extra={"META-INF/spring/aot.factories": b"org.springframework.beans.factory.aot.BeanFactoryInitializationAotProcessor=\\\n  org.springframework.core.CoreAotProcessor\n"},
+                                  no_pom=True, manifest_extra={"Implementation-Title": "Spring Core"})
+    return libs
+
+
 def simulate_shade(project_dir: Path, selected: list, bundle: dict, contents_attr: str, source_attr: str,
                    multi_release: bool, out_jar: Path, drop=None, corrupt=None, keep_signatures=False,
                    boot_version=None) -> Path:
@@ -251,6 +306,7 @@ def simulate_shade(project_dir: Path, selected: list, bundle: dict, contents_att
             out[p.relative_to(res_root).as_posix()] = p.read_bytes()
     lines = defaultdict(list)
     props = defaultdict(lambda: defaultdict(list))
+    log4j = {}
     for jar in selected:
         with zipfile.ZipFile(jar) as zf:
             for n in zf.namelist():
@@ -269,12 +325,17 @@ def simulate_shade(project_dir: Path, selected: list, bundle: dict, contents_att
                         for val in vals:
                             if val not in props[n][k]:
                                 props[n][k].append(val)
+                elif cat == "log4j-plugins":  # Log4j2PluginCacheFileTransformer: one cache holding every jar's plugins
+                    for category, entries in parse_log4j_plugin_cache(data).items():
+                        log4j.setdefault(category, {}).update(entries)
                 elif n not in out:
                     out[n] = data
     for n, ls in lines.items():
         out[n] = ("\n".join(ls) + "\n").encode()
     for n, kv in props.items():
         out[n] = ("".join("%s=%s\n" % (k, ",".join(vals)) for k, vals in kv.items())).encode()
+    if log4j:
+        out[LOG4J_PLUGIN_CACHE] = write_log4j_plugin_cache(log4j)
     for n in drop or []:
         out.pop(n, None)
     for n in corrupt or []:

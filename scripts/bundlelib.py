@@ -36,14 +36,35 @@ LEGAL_PATTERNS = [
     "META-INF/NOTICE-*",
     "META-INF/DEPENDENCIES",
     "META-INF/DEPENDENCIES.*",
+    # lowercase variants some jars carry (matching is case-sensitive on Linux)
+    "META-INF/license",
+    "META-INF/license.*",
+    "META-INF/license-*",
+    "META-INF/notice",
+    "META-INF/notice.*",
+    "META-INF/notice-*",
 ]
 SERVICES_PREFIX = "META-INF/services/"
-# Resources Shade merges by appending the files (AppendingTransformer).
+# Resources Shade merges by appending the files (AppendingTransformer). spring-autoconfigure-metadata.properties
+# has one key per auto-configuration class, so appending the files is a correct merge.
 APPEND_RESOURCES = [
     "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports",
+    "META-INF/spring-autoconfigure-metadata.properties",
     "META-INF/spring.handlers",
     "META-INF/spring.schemas",
     "META-INF/spring.tooling",
+]
+# Log4j 2 plugin cache: Log4j reads every copy at start-up, so copies from several jars are merged by Log4j's
+# own Shade transformer (log4j-transform-maven-shade-plugin-extensions) instead of collapsing to the first.
+LOG4J_PLUGIN_CACHE = "META-INF/org/apache/logging/log4j/core/config/plugins/Log4j2Plugins.dat"
+# Duplicated resources nothing reads at run time (IDE and documentation metadata): collapsing them is harmless.
+COLLAPSE_HARMLESS = [
+    "META-INF/spring-configuration-metadata.json",
+    "META-INF/additional-spring-configuration-metadata.json",
+    "META-INF/DISCLAIMER",
+    "META-INF/DISCLAIMER.*",
+    "META-INF/eclipse.inf",
+    "about.html",
 ]
 # Properties files whose values for the same key must be merged
 # (Spring Boot's PropertiesMergingResourceTransformer).
@@ -154,7 +175,7 @@ def classify_entry(name: str) -> str:
     """Category of a jar entry.
 
     dir | manifest | signature | index | module-info | legal | services | append |
-    props-merge | class | resource
+    props-merge | log4j-plugins | class | resource
     """
     if name.endswith("/"):
         return "dir"
@@ -174,6 +195,8 @@ def classify_entry(name: str) -> str:
         return "append"
     if name in PROPERTIES_MERGE_RESOURCES:
         return "props-merge"
+    if name == LOG4J_PLUGIN_CACHE:
+        return "log4j-plugins"
     if name.endswith(".class"):
         return "class"
     return "resource"
@@ -438,6 +461,7 @@ def scan_jar(zf: zipfile.ZipFile) -> dict:
         "services": [],
         "append_resources": [],
         "props_merge_resources": [],
+        "log4j_plugin_cache": False,
         "nested_jars": [],
         "class_count": 0,
         "entry_count": 0,
@@ -457,6 +481,8 @@ def scan_jar(zf: zipfile.ZipFile) -> dict:
             flags["append_resources"].append(n)
         elif cat == "props-merge":
             flags["props_merge_resources"].append(n)
+        elif cat == "log4j-plugins":
+            flags["log4j_plugin_cache"] = True
         elif cat == "class":
             flags["class_count"] += 1
         if n.lower().endswith(".jar"):
@@ -566,6 +592,16 @@ class AppArtifact:
     def is_archive(self) -> bool:
         return self._zip is not None
 
+    def manifest(self) -> Dict[str, str]:
+        """Main attributes of the application's own META-INF/MANIFEST.MF; empty when there is none."""
+        try:
+            if self._zip is not None:
+                return parse_manifest(self._zip.read("META-INF/MANIFEST.MF")) if "META-INF/MANIFEST.MF" in self._zip.namelist() else {}
+            p = self.path / "META-INF" / "MANIFEST.MF"
+            return parse_manifest(p.read_bytes()) if p.is_file() else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
     def file_sha256(self) -> Optional[str]:
         return sha256_file(self.path) if self.path.is_file() else None
 
@@ -666,11 +702,83 @@ class AppArtifact:
 
 
 def spring_boot_version(dependencies: List[dict]) -> Optional[str]:
+    """Version of the dependency identified as org.springframework.boot:spring-boot, if any."""
     for d in dependencies:
         g = d.get("gav") or {}
         if g.get("groupId") == "org.springframework.boot" and g.get("artifactId") == "spring-boot":
             return g.get("version")
     return None
+
+
+def spring_boot_version_from_app(app: "AppArtifact", jar_names) -> Tuple[Optional[str], Optional[str]]:
+    """(version, where it comes from) before any jar is identified: the application's own manifest carries
+    Spring-Boot-Version in every archive the Boot Maven and Gradle plugins write; a layout without that
+    manifest (Jib) still names the spring-boot jar. Spring's own jars are built with Gradle and carry no
+    pom.properties, so the version must not depend on identifying them."""
+    version = app.manifest().get("Spring-Boot-Version")
+    if version:
+        return version, "application manifest Spring-Boot-Version"
+    for name in jar_names:
+        fn = split_filename(name[:-4] if name.lower().endswith(".jar") else name)
+        if fn and fn[0] == "spring-boot":
+            return fn[1], "spring-boot jar name"
+    return None, None
+
+
+def parse_log4j_plugin_cache(data: bytes) -> "Dict[str, Dict[str, tuple]]":
+    """{category: {key: (className, name, printable, defer)}} of a Log4j2Plugins.dat, the DataOutputStream
+    format PluginCache.writeCache produces (int count, then per category: UTF name, int count, per plugin:
+    UTF key, UTF class, UTF name, boolean printable, boolean defer)."""
+    import struct
+
+    pos = 0
+
+    def read_int():
+        nonlocal pos
+        v = struct.unpack(">i", data[pos:pos + 4])[0]
+        pos += 4
+        return v
+
+    def read_utf():
+        nonlocal pos
+        n = struct.unpack(">H", data[pos:pos + 2])[0]
+        pos += 2
+        s = data[pos:pos + n].decode("utf-8", "replace")
+        pos += n
+        return s
+
+    def read_bool():
+        nonlocal pos
+        v = data[pos] != 0
+        pos += 1
+        return v
+
+    categories: Dict[str, Dict[str, tuple]] = {}
+    for _ in range(read_int()):
+        category = read_utf()
+        entries = categories.setdefault(category, {})
+        for _ in range(read_int()):
+            key, cls, pname = read_utf(), read_utf(), read_utf()
+            entries[key] = (cls, pname, read_bool(), read_bool())
+    return categories
+
+
+def write_log4j_plugin_cache(categories: "Dict[str, Dict[str, tuple]]") -> bytes:
+    """The inverse of parse_log4j_plugin_cache, categories and keys sorted as Log4j's TreeMaps are."""
+    import struct
+
+    def utf(s: str) -> bytes:
+        b = s.encode("utf-8")
+        return struct.pack(">H", len(b)) + b
+
+    out = [struct.pack(">i", len(categories))]
+    for category in sorted(categories):
+        entries = categories[category]
+        out.append(utf(category) + struct.pack(">i", len(entries)))
+        for key in sorted(entries):
+            cls, pname, printable, defer = entries[key]
+            out.append(utf(key) + utf(cls) + utf(pname) + bytes([1 if printable else 0, 1 if defer else 0]))
+    return b"".join(out)
 
 
 # --------------------------------------------------------------------------- selection tokens
