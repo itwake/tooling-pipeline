@@ -88,9 +88,11 @@ def main() -> None:
         pom_path, finalized = Path(args.reduced_pom or man["reduced_pom"]), False
     if not bundle_path.is_file():
         fail("bundle jar not found: %s" % bundle_path)
+    inputs = man.get("inputs")  # rework job: the jars Shade merged, on disk; otherwise the jars come from the application
     app_path = (man.get("source") or {}).get("local_path")
-    if not app_path:
+    if not inputs and not app_path:
         fail("manifest has no source.local_path")
+    rework = man.get("rework") or {}
 
     checks = []
 
@@ -98,8 +100,26 @@ def main() -> None:
         checks.append({"check": name, "status": "pass" if ok else level, "detail": detail})
 
     # ---- collect expectations from the original jars -------------------------------------
-    app = AppArtifact(app_path)
-    by_path = {j.path_in_app: j for j in app.dependency_jars()}
+    readers = []  # (label, ZipFile, directory under META-INF/third-party/ that receives its legal files)
+    app = None
+    if inputs:
+        for inp in inputs:
+            p = Path(inp["file"])
+            if not p.is_file():
+                fail("input %s not found: %s" % (inp["name"], p))
+            if sha256_file(p) != inp["sha256"]:
+                fail("%s changed since the rework project was generated" % inp["name"])
+            readers.append((inp["name"], zipfile.ZipFile(p), inp.get("third_party_dir")))
+    else:
+        app = AppArtifact(app_path)
+        by_path = {j.path_in_app: j for j in app.dependency_jars()}
+        for comp in man["components"]:
+            dj = by_path.get(comp["path_in_app"])
+            if dj is None:
+                fail("%s disappeared from the application" % comp["path_in_app"])
+            if dj.sha256 != comp["sha256"]:
+                fail("%s changed since the bundle was generated" % comp["path_in_app"])
+            readers.append((dj.name, dj.open(), component_dir(comp["gav"])))
     expected = {}  # entry -> sha
     services_exp = defaultdict(set)
     append_exp = defaultdict(set)
@@ -107,38 +127,35 @@ def main() -> None:
     log4j_exp = defaultdict(set)  # Log4j plugin category -> keys, over every component carrying a plugin cache
     log4j_sources = 0
     legal_exp = {}  # bundle path -> sha
-    for comp in man["components"]:
-        dj = by_path.get(comp["path_in_app"])
-        if dj is None:
-            fail("%s disappeared from the application" % comp["path_in_app"])
-        if dj.sha256 != comp["sha256"]:
-            fail("%s changed since the bundle was generated" % comp["path_in_app"])
-        cdir = THIRD_PARTY_DIR + component_dir(comp["gav"]) + "/"
-        with dj.open() as zf:
-            for n in zf.namelist():
-                cat = classify_entry(n)
-                if cat in ("dir", "manifest", "signature", "index", "module-info"):
-                    continue
-                data = zf.read(n)
-                if cat == "legal":
+    for label, zf, third_party in readers:
+        cdir = (THIRD_PARTY_DIR + third_party + "/") if third_party else None
+        for n in zf.namelist():
+            cat = classify_entry(n)
+            if cat in ("dir", "manifest", "signature", "index", "module-info"):
+                continue
+            data = zf.read(n)
+            if cat == "legal":
+                if cdir:  # a reworked bundle's own legal files were relocated by the original build already
                     legal_exp[cdir + n[len("META-INF/"):]] = sha256_bytes(data)
-                elif cat == "services":
-                    services_exp[n].update(significant_lines(data.decode("utf-8", "replace")))
-                elif cat == "append":
-                    append_exp[n].update(significant_lines(data.decode("utf-8", "replace")))
-                elif cat == "props-merge":
-                    for k, vals in properties_values(parse_properties(data.decode("utf-8", "replace"))).items():
-                        props_exp[n][k].update(vals)
-                elif cat == "log4j-plugins":
-                    log4j_sources += 1
-                    try:
-                        for category, entries in parse_log4j_plugin_cache(data).items():
-                            log4j_exp[category].update(entries)
-                    except Exception as e:  # noqa: BLE001
-                        fail("%s in %s cannot be parsed: %s" % (n, dj.name, e))
-                elif n not in expected:  # first copy wins, as in the application's class-loading order
-                    expected[n] = sha256_bytes(data)
-    app.close()
+            elif cat == "services":
+                services_exp[n].update(significant_lines(data.decode("utf-8", "replace")))
+            elif cat == "append":
+                append_exp[n].update(significant_lines(data.decode("utf-8", "replace")))
+            elif cat == "props-merge":
+                for k, vals in properties_values(parse_properties(data.decode("utf-8", "replace"))).items():
+                    props_exp[n][k].update(vals)
+            elif cat == "log4j-plugins":
+                log4j_sources += 1
+                try:
+                    for category, entries in parse_log4j_plugin_cache(data).items():
+                        log4j_exp[category].update(entries)
+                except Exception as e:  # noqa: BLE001
+                    fail("%s in %s cannot be parsed: %s" % (n, label, e))
+            elif n not in expected:  # first copy wins, as in the application's class-loading order
+                expected[n] = sha256_bytes(data)
+        zf.close()
+    if app is not None:
+        app.close()
 
     # ---- bundle contents -----------------------------------------------------------------
     bz = zipfile.ZipFile(bundle_path)
@@ -217,6 +234,40 @@ def main() -> None:
     extras = [n for n in bnames if n not in expected and not allowed_extra(n) and classify_entry(n) not in ("signature", "index", "module-info")]
     check("no-unexpected-entries", not extras, ", ".join(extras[:15]))
 
+    # rework job: the lines a replaced component had contributed to merged resources must be gone, unless an input
+    # (its new version, say) contributes them again; stale entries of that component are caught above as extras
+    stale_lines = (rework.get("stale") or {}).get("lines") or {}
+    if rework:
+        stale_problems = []
+        for path, lines in stale_lines.items():
+            if path not in bset:
+                continue
+            cat = classify_entry(path)
+            text = bz.read(path)
+            if cat in ("services", "append"):
+                have = set(significant_lines(text.decode("utf-8", "replace")))
+                allowed = services_exp.get(path, set()) | append_exp.get(path, set())
+                stale_problems += ["%s still lists %s" % (path, ln) for ln in lines if ln in have and ln not in allowed]
+            elif cat == "props-merge":
+                have = properties_values(parse_properties(text.decode("utf-8", "replace")))
+                for entry in lines:
+                    k, _, vals = entry.partition("=")
+                    for v in vals.split(","):
+                        if v in have.get(k, []) and v not in props_exp.get(path, {}).get(k, set()):
+                            stale_problems.append("%s key %s still has %s" % (path, k, v))
+            elif cat == "log4j-plugins":
+                try:
+                    have = parse_log4j_plugin_cache(text)
+                except Exception:  # noqa: BLE001
+                    have = {}
+                for entry in lines:
+                    category, _, key = entry.partition("/")
+                    if key in have.get(category, {}) and key not in log4j_exp.get(category, set()):
+                        stale_problems.append("%s still has plugin %s" % (path, entry))
+        check("replaced-components-removed", not stale_problems,
+              "; ".join(stale_problems[:10]) if stale_problems else "%d merged resource(s) checked for lines of the replaced component(s), %d stale entries checked above" % (
+                  len(stale_lines), len((rework.get("stale") or {}).get("entries") or [])))
+
     attrs = read_manifest(bz)
     contents_attr = attrs.get(BUNDLE_CONTENTS_ATTR, "")
     check("manifest-contents-attribute", contents_attr == man["contents_attr"],
@@ -235,12 +286,17 @@ def main() -> None:
               "still declared: %s" % ", ".join("%s:%s" % (d.get("groupId"), d.get("artifactId")) for d in still) if still
               else "%d remaining dependencies: %s" % (len(promoted), ", ".join("%s:%s:%s" % (d.get("groupId"), d.get("artifactId"), d.get("version")) for d in promoted)))
         app_ga = {ga_str(g) for g in man.get("application_coordinates") or []}
-        foreign = [d for d in promoted if "%s:%s" % (d.get("groupId"), d.get("artifactId")) not in app_ga] if app_ga else []
+        foreign = [d for d in promoted if "%s:%s" % (d.get("groupId"), d.get("artifactId")) not in app_ga] if (app_ga or rework) else []
         if not finalized:
             check("pom-promotes-only-application-dependencies", False,
                   "finalize_bundle_pom.py did not run: Shade's dependency-reduced POM would be published as is%s" % (
                       " (it promotes %s, which the application never had)" % ", ".join("%s:%s" % (d.get("groupId"), d.get("artifactId")) for d in foreign) if foreign else ""),
                   level="warn")
+        elif rework:  # the added jars' own dependencies are legitimate; the reviewer checks them against the consumer
+            check("pom-promotes-only-application-dependencies", not foreign,
+                  "promoted from the added jars' POMs, the original application never had them; make sure the consumer has or wants them: %s" % ", ".join(
+                      "%s:%s:%s" % (d.get("groupId"), d.get("artifactId"), d.get("version")) for d in foreign) if foreign
+                  else "%d promoted dependencies, all from the previous bundle POM" % len(promoted), level="warn")
         elif not app_ga:
             check("pom-promotes-only-application-dependencies", False, "application coordinates unknown (inventory missing when the project was generated); nothing was pruned", level="warn")
         else:
@@ -265,6 +321,7 @@ def main() -> None:
         "pom_finalized": finalized and pom_path.is_file(),
         "checks": checks,
         "promoted_dependencies": promoted,
+        "rework": {"from": rework.get("from"), "added": rework.get("added"), "replaced": rework.get("replaced")} if rework else None,
         "ok": not failed,
     }
     write_json(args.out, result)

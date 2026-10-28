@@ -42,7 +42,10 @@ def main() -> None:
     for item in items:
         gav = item["gav"]
         pom_file = None
-        if repo is not None and not item.get("synthetic"):
+        if item.get("pom_file") and Path(item["pom_file"]).is_file():  # the rework job fetched the POM already
+            pom_file = Path(item["pom_file"])
+            with_pom += 1
+        elif repo is not None and not item.get("synthetic"):
             text = repo.pom(gav["groupId"], gav["artifactId"], gav["version"])
             if text:
                 pom_file = Path(item["file"]).with_suffix(".pom")
@@ -64,6 +67,8 @@ def main() -> None:
         if gav.get("classifier"):
             cmd.append("-Dclassifier=%s" % gav["classifier"])
         cmd.append("-DpomFile=%s" % pom_file if pom_file else "-DgeneratePom=true")
+        if item.get("sources") and Path(item["sources"]).is_file():
+            cmd.append("-Dsources=%s" % item["sources"])
         log("Installing %s as %s:%s:%s%s" % (Path(item["file"]).name, gav["groupId"], gav["artifactId"], gav["version"],
                                              " (with its POM)" if pom_file else " (generated POM)"))
         log("  $ " + " ".join(cmd))

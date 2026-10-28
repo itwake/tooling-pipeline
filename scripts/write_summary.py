@@ -59,8 +59,36 @@ def main() -> None:
     equivalence = load(out / "equivalence.json")
     plugin_check = load(out / "plugin-trees-check.json")
     publish = load(out / "publish.json")
+    rework = load(out / "rework-plan.json")
 
     md = ["# Run summary", ""]
+    if rework:
+        v = rework["version"]
+        md += ["## Rework of `%s`" % rework["bundle"], "",
+               "- New coordinates: `%s` (version %s)" % (rework["new_coordinate"], "given" if v.get("source") == "parameter" else "derived"),
+               "- Descends from: `%s`" % rework.get("base")]
+        for a in rework.get("added", []):
+            if a.get("action") == "skip":
+                md.append("- `%s` (%s): skipped, %s" % (a["name"], a.get("origin"), a.get("reason")))
+                continue
+            line = "- `%s` (%s): %s as `%s` (%s)" % (a["name"], a.get("origin"), a.get("action"), a.get("coordinate"), a.get("gav_source"))
+            rep = a.get("replaces") or {}
+            if rep:
+                strip = rep.get("strip") or {}
+                line += "; replaces `%s`: %d entries removed by %s%s%s" % (
+                    rep.get("coordinate"), len(strip.get("removed") or []), strip.get("by"),
+                    (", %d kept as another component's copy" % len(strip["kept_other"])) if strip.get("kept_other") else "",
+                    (", lines trimmed in %s" % ", ".join("`%s`" % p for p in strip["merged_lines"])) if strip.get("merged_lines") else "")
+            ov = a.get("overlap") or {}
+            if ov.get("replaced"):
+                line += "; replaces %d entr%s of the bundle: %s" % (len(ov["replaced"]), "y" if len(ov["replaced"]) == 1 else "ies",
+                                                                   ", ".join("`%s`" % e for e in ov["replaced"][:10]))
+            md.append(line)
+            for w in a.get("warnings") or []:
+                md.append("  - WARNING: %s" % w)
+        for w in rework.get("warnings") or []:
+            md.append("- WARNING: %s" % w)
+        md.append("")
     if source:
         md += ["## Input", "", "- Type: %s" % source["type"], "- Reference: `%s`" % source["ref"]]
         if source.get("app_path"):
@@ -107,12 +135,19 @@ def main() -> None:
             md.append("Transitive dependencies kept in the published POM: " + ", ".join(coord(d) for d in verification["promoted_dependencies"]))
             md.append("")
     if bundle_pom:
-        md += ["## Published POM", "", "- Kept: %s" % (", ".join(coord(d) for d in bundle_pom.get("kept", [])) or "no promoted dependencies")]
+        new = bundle_pom.get("new") or []
+        kept = [d for d in bundle_pom.get("kept", []) if d not in new]
+        md += ["## Published POM", "", "- Kept: %s" % (", ".join(coord(d) for d in kept) or "no promoted dependencies")]
+        if new:
+            md.append("- New, promoted from the added jars' POMs (make sure the consumer has or wants them): " + ", ".join(coord(d) for d in new))
         if bundle_pom.get("pruned"):
             md.append("- Pruned (the application never had them): " + ", ".join(coord(d) for d in bundle_pom["pruned"]))
+        if bundle_pom.get("pruned_embedded"):
+            md.append("- Pruned (declared by an added jar but embedded in the bundle): " + ", ".join(coord(d) for d in bundle_pom["pruned_embedded"]))
         if bundle_pom.get("aligned"):
-            md.append("- Version aligned to the application: " + ", ".join("`%s:%s` %s -> %s" % (d.get("groupId"), d.get("artifactId"), d.get("version_in_reduced_pom"), d.get("version")) for d in bundle_pom["aligned"]))
-        if not bundle_pom.get("application_coordinates_known"):
+            md.append("- Version aligned to %s: " % ("the previous bundle POM" if bundle_pom.get("rework") else "the application")
+                      + ", ".join("`%s:%s` %s -> %s" % (d.get("groupId"), d.get("artifactId"), d.get("version_in_reduced_pom"), d.get("version")) for d in bundle_pom["aligned"]))
+        if not bundle_pom.get("application_coordinates_known") and not bundle_pom.get("rework"):
             md.append("- Application coordinates unknown: nothing pruned")
         md.append("")
     if patch:

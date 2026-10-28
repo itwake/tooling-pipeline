@@ -283,12 +283,22 @@ def build_gradle_style_libs(libdir: Path) -> dict:
     return libs
 
 
+def put_artifact(repo_root: Path, g: str, a: str, v: str, jar: Path, pom: bytes = None) -> None:
+    """A jar (and its POM) the fake Nexus serves, plus the .sha1 that confirms a candidate."""
+    d = repo_root / "repository" / "maven-public" / g.replace(".", "/") / a / v
+    d.mkdir(parents=True, exist_ok=True)
+    (d / ("%s-%s.jar" % (a, v))).write_bytes(Path(jar).read_bytes())
+    (d / ("%s-%s.pom" % (a, v))).write_bytes(pom if pom is not None else pom_xml(g, a, v))
+    put_sha1(repo_root, g, a, v, jar)
+
+
 def simulate_shade(project_dir: Path, selected: list, bundle: dict, contents_attr: str, source_attr: str,
                    multi_release: bool, out_jar: Path, drop=None, corrupt=None, keep_signatures=False,
-                   boot_version=None) -> Path:
+                   boot_version=None, extra_manifest=None) -> Path:
     """Produce what maven-shade-plugin would produce for the generated project.
 
-    selected: list of jar paths. drop/corrupt: entry names to omit / alter (negative tests).
+    selected: list of jar paths in dependency order (the first copy of an entry wins). drop/corrupt: entry
+    names to omit / alter (negative tests). extra_manifest: further manifest attributes (the rework job's).
     """
     out = {}
     man = {"Created-By": "simulate_shade", BUNDLE_CONTENTS_ATTR: contents_attr, BUNDLE_SOURCE_ATTR: source_attr}
@@ -296,6 +306,7 @@ def simulate_shade(project_dir: Path, selected: list, bundle: dict, contents_att
         man["Multi-Release"] = "true"
     if boot_version:
         man[BUNDLE_BOOT_ATTR] = boot_version
+    man.update(extra_manifest or {})
     out["META-INF/MANIFEST.MF"] = manifest_bytes(man)
     g, a, v = bundle["groupId"], bundle["artifactId"], bundle["version"]
     out["META-INF/maven/%s/%s/pom.properties" % (g, a)] = ("groupId=%s\nartifactId=%s\nversion=%s\n" % (g, a, v)).encode()

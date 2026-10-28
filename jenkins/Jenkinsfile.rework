@@ -1,0 +1,197 @@
+// mvn-rebundle / rework: change a bundle that is already in Nexus and publish the result under a new version.
+//
+// The bundle is fetched by coordinates (jar, POM, sources jar when published). Jars to add come from a file
+// uploaded with the build (ADD_JAR, File Parameter plugin) and from coordinates resolved in Nexus
+// (ADD_COORDINATES). maven-shade-plugin merges the added jars followed by the bundle, with the transformers
+// of the original build: an entry both have is taken from the added jar (a hot fix wins), a jar whose
+// groupId:artifactId is already embedded replaces that component (its entries are removed from the bundle
+// copy first), a jar identical to an embedded component is skipped. The new manifest lists the new contents,
+// so the consumer job can propose the matching POM change, and records which bundle this one came from.
+// The result is verified against the inputs and, with PUBLISH=true, uploaded by deploy-file under
+// NEW_VERSION, or <version>.1 (counting up for a bundle that is itself a rework; a SNAPSHOT keeps its
+// version). Nothing is rebuilt between verification and upload.
+//
+// Agent requirements (Linux): JDK 17+, Maven 3.6+, Python 3.8+. Jenkins plugins: Pipeline, Credentials
+// Binding, File Parameter (the stashedFile parameter type). Site-specific settings live in `environment`.
+// Job setup: "Pipeline script from SCM", Script Path = jenkins/Jenkinsfile.rework. The first run only
+// registers the parameters; use "Build with Parameters" afterwards.
+
+def withNexusCredentials(Closure body) {
+    if (env.NEXUS_CREDENTIALS_ID?.trim()) {
+        withCredentials([usernamePassword(credentialsId: env.NEXUS_CREDENTIALS_ID,
+                                          usernameVariable: 'NEXUS_USERNAME',
+                                          passwordVariable: 'NEXUS_PASSWORD')]) {
+            body()
+        }
+    } else {
+        body()
+    }
+}
+
+// Credential for reading the bundle, the coordinates to add and the replaced components from Nexus.
+def withSourceCredentials(Closure body) {
+    if (env.SOURCE_CREDENTIALS_ID?.trim()) {
+        withCredentials([usernamePassword(credentialsId: env.SOURCE_CREDENTIALS_ID,
+                                          usernameVariable: 'SOURCE_USERNAME', passwordVariable: 'SOURCE_PASSWORD')]) {
+            body()
+        }
+    } else {
+        body()
+    }
+}
+
+pipeline {
+    agent any            // or: agent { label 'maven' }
+
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+    parameters {
+        string(name: 'BUNDLE_COORDINATES', defaultValue: '',
+               description: 'groupId:artifactId:version of the published bundle to change')
+        stashedFile(name: 'ADD_JAR',
+                    description: 'A jar to merge into the bundle. Its coordinates come from its pom.properties, else from the Nexus checksum search, else it is embedded under synthetic coordinates. A jar whose groupId:artifactId is already embedded replaces that component; an entry the bundle already holds is taken from this jar (hot fix)')
+        text(name: 'ADD_COORDINATES', defaultValue: '',
+             description: 'Jars to add from Nexus, one groupId:artifactId:version[:classifier] per line; their POMs are fetched too')
+        string(name: 'NEW_VERSION', defaultValue: '',
+               description: 'Version of the new bundle. Empty: <version>.1, counting up for a bundle that is itself a rework; a SNAPSHOT keeps its version. A version Nexus already has is refused')
+        booleanParam(name: 'PUBLISH', defaultValue: false,
+                     description: 'Upload the verified jar, its POM and the sources jar to Nexus; false builds and verifies only')
+    }
+
+    environment {
+        // ---- site specific: edit once -------------------------------------------------------
+        NEXUS_RELEASE_URL     = 'https://nexus.example.com/repository/maven-releases/'
+        NEXUS_SNAPSHOT_URL    = 'https://nexus.example.com/repository/maven-snapshots/'
+        NEXUS_MAVEN_REPO_URL  = 'https://nexus.example.com/repository/maven-public/'   // the bundle, the coordinates to add and the replaced components are fetched here
+        NEXUS_CREDENTIALS_ID  = 'nexus-deploy'   // username/password credential for publishing; empty = anonymous (cannot publish)
+        SOURCE_CREDENTIALS_ID = 'nexus-deploy'   // Nexus credential for reading; may equal NEXUS_CREDENTIALS_ID
+        MAVEN_MIRROR_URL      = ''               // Maven mirror for the Shade build, e.g. the group repository above; empty = Maven Central
+        CREATE_SOURCES_JAR    = 'true'           // needs the sources jars of the bundle and the added jars in Nexus; missing ones only warn
+        // -----------------------------------------------------------------------------------
+        MAVEN_LOCAL_REPO = "${WORKSPACE}/work/m2"   // job-local repository: the inputs are installed here from the fetched bytes
+        PY        = 'python3'
+        MVN_FLAGS = "-B -ntp -s work/settings.xml -Dmaven.repo.local=${WORKSPACE}/work/m2"
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                sh '''
+                    rm -rf work out && mkdir -p work out work/upload
+                    echo "mvn-rebundle revision: $(git rev-parse --short HEAD 2>/dev/null || echo unknown) ($(git log -1 --format=%cd --date=short 2>/dev/null || echo 'no git checkout'))"
+                    "$PY" --version
+                    java -version
+                    mvn -v
+                '''
+                writeFile file: 'work/add.txt', text: params.ADD_COORDINATES ?: ''
+                sh '"$PY" scripts/gen_maven_settings.py --server-id nexus --mirror-url "$MAVEN_MIRROR_URL" --out work/settings.xml'
+            }
+        }
+
+        stage('Fetch bundle') {
+            steps {
+                script {
+                    if (!params.BUNDLE_COORDINATES?.trim()) {
+                        error 'BUNDLE_COORDINATES is required: groupId:artifactId:version of the published bundle'
+                    }
+                    withSourceCredentials {
+                        sh '''
+                            "$PY" scripts/fetch_bundle.py --bundle "$BUNDLE_COORDINATES" --add-file work/add.txt --repo-url "$NEXUS_MAVEN_REPO_URL" \
+                                --out work/bundle-in --added-out work/added --meta out/rework-bundle.json
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Uploaded jar') {
+            // the File Parameter plugin stashes the upload under the parameter name and puts the original
+            // file name into ADD_JAR_FILENAME; nothing is set when no file was chosen
+            when { expression { env.ADD_JAR_FILENAME?.trim() } }
+            steps {
+                dir('work/upload') {
+                    unstash 'ADD_JAR'
+                }
+                sh 'mv work/upload/ADD_JAR "work/upload/$ADD_JAR_FILENAME" && ls -l work/upload'
+            }
+        }
+
+        stage('Plan rework') {
+            steps {
+                script {
+                    // the repository identifies uploaded jars and provides the old versions of replaced components
+                    withSourceCredentials {
+                        sh '''
+                            set --
+                            if [ -n "${ADD_JAR_FILENAME:-}" ]; then set -- --add-jar "work/upload/$ADD_JAR_FILENAME"; fi
+                            "$PY" scripts/rework_bundle.py "$@" --bundle-meta out/rework-bundle.json --new-version "$NEW_VERSION" \
+                                --repo-url "$NEXUS_MAVEN_REPO_URL" --release-url "$NEXUS_RELEASE_URL" --snapshot-url "$NEXUS_SNAPSHOT_URL" \
+                                --server-id nexus --sources-jar "$CREATE_SOURCES_JAR" --out work/rework \
+                                --manifest-out out/bundle-manifest.json --plan-out out/rework-plan.json
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Build bundle') {
+            steps {
+                script {
+                    withSourceCredentials {
+                        withNexusCredentials {
+                            // every input is installed into the job-local repository from the fetched bytes: the bundle
+                            // with the POM it was published with, the added jars with theirs
+                            sh '''
+                                "$PY" scripts/install_components.py --manifest out/bundle-manifest.json --settings work/settings.xml \
+                                    --repo-url "$NEXUS_MAVEN_REPO_URL" --local-repo "$MAVEN_LOCAL_REPO"
+                            '''
+                            sh 'mvn $MVN_FLAGS -f work/rework/pom.xml clean verify'
+                            // the published POM: the previous bundle POM's dependencies at their versions, the added jars'
+                            // dependencies kept and reported, embedded coordinates pruned
+                            sh '"$PY" scripts/finalize_bundle_pom.py --manifest out/bundle-manifest.json --report out/bundle-pom.json'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Verify bundle') {
+            steps {
+                sh '"$PY" scripts/verify_bundle.py --manifest out/bundle-manifest.json --out out/bundle-verification.json'
+            }
+        }
+
+        stage('Publish to Nexus') {
+            when { expression { params.PUBLISH } }
+            steps {
+                script {
+                    if (!env.NEXUS_CREDENTIALS_ID?.trim()) {
+                        error 'PUBLISH=true requires NEXUS_CREDENTIALS_ID in the environment block'
+                    }
+                    withNexusCredentials {
+                        // deploy-file uploads the jar that was just verified; nothing is rebuilt
+                        sh '''
+                            "$PY" scripts/publish_bundle.py --manifest out/bundle-manifest.json \
+                                --verification out/bundle-verification.json --settings work/settings.xml \
+                                --release-url "$NEXUS_RELEASE_URL" --snapshot-url "$NEXUS_SNAPSHOT_URL" --server-id nexus \
+                                --local-repo "$MAVEN_LOCAL_REPO" --out out/publish.json
+                        '''
+                    }
+                    echo 'Published. Run mvn-rebundle-consumer with BUNDLE_COORDINATES set to the new coordinates (see out/publish.json) to propose the consumer POM change.'
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '"$PY" scripts/write_summary.py --out-dir out || true'
+            archiveArtifacts artifacts: 'out/**, work/rework/pom.xml, work/rework/target/*.jar, work/rework/target/*.pom, work/rework/target/dependency-reduced-pom.xml',
+                             allowEmptyArchive: true, fingerprint: true
+        }
+    }
+}

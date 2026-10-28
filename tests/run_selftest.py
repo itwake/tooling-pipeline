@@ -30,7 +30,19 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(HERE))
 
 import make_fixture as fx  # noqa: E402
-from bundlelib import gav_str, read_json, write_json  # noqa: E402
+from bundlelib import (  # noqa: E402
+    BUNDLE_BASE_ATTR,
+    BUNDLE_CONTENTS_ATTR,
+    BUNDLE_REWORKED_FROM_ATTR,
+    gav_str,
+    parse_properties,
+    properties_values,
+    read_json,
+    read_manifest,
+    significant_lines,
+    write_json,
+)
+from rework_bundle import derive_version  # noqa: E402
 
 PY = sys.executable
 passed = 0
@@ -386,6 +398,205 @@ def main() -> None:
         run("publish_bundle.py", "--manifest", out / "manifest-snapshot.json", "--verification", out / "bundle-verification.json",
             "--release-url", release, "--dry-run", "--out", out / "publish-nosnap.json", expect=2)
         ok("missing snapshot repository is refused", not (out / "publish-nosnap.json").exists())
+
+        # ---- rework: add jars to a published bundle and republish it under a new version ---------
+        print("[rework bundle]")
+        nexus_root = work / "fakenexus"
+        fx.put_artifact(nexus_root, bundle["groupId"], bundle["artifactId"], bundle["version"], good, (target / "thirdparty-bundle-1.0.0.pom").read_bytes())
+        for key, g, a, v in (("log4j-core", "org.apache.logging.log4j", "log4j-core", "2.23.1"),
+                             ("log4j-layout-template-json", "org.apache.logging.log4j", "log4j-layout-template-json", "2.23.1"),
+                             ("commons-io", "commons-io", "commons-io", "2.16.1"), ("codec-a", "com.example.codec", "codec-a", "1.0")):
+            fx.put_artifact(nexus_root, g, a, v, libs[key])
+        run("fetch_bundle.py", "--bundle", "com.company.platform:thirdparty-bundle:1.0.0", "--repo-url", repo_url,
+            "--add", "org.apache.logging.log4j:log4j-core:2.23.1", "--add", "org.apache.logging.log4j:log4j-layout-template-json:2.23.1",
+            "--out", work / "rework-in", "--added-out", work / "rework-added", "--meta", out / "rework-bundle.json", env=with_creds)
+        rmeta = read_json(out / "rework-bundle.json")
+        ok("published bundle fetched with its POM, its manifest and contents list read",
+           rmeta["sha256"] == ver["sha256"] and Path(rmeta["pom"]).is_file() and rmeta["sources"] is None
+           and len(rmeta["contents"]) == 10 and rmeta["manifest"]["spring_boot_version"] == "3.3.5" and rmeta["manifest"]["multi_release"]
+           and [d["artifactId"] for d in rmeta["pom_dependencies"]] == ["snakeyaml"]
+           and [a["coordinate"] for a in rmeta["added"]] == ["org.apache.logging.log4j:log4j-core:2.23.1", "org.apache.logging.log4j:log4j-layout-template-json:2.23.1"]
+           and all(Path(a["jar"]).is_file() and Path(a["pom"]).is_file() for a in rmeta["added"])
+           and rmeta["contents_file"]["commons-io:commons-io:2.16.1"]["sha256"] == next(c["sha256"] for c in man["components"] if c["coordinate"] == "commons-io:commons-io:2.16.1"))
+        run("fetch_bundle.py", "--bundle", "commons-io:commons-io:2.16.1", "--repo-url", repo_url, "--out", work / "rework-nb", "--meta", out / "rework-notbundle.json", env=with_creds, expect=2)
+        ok("a jar that is not a bundle is refused", not (out / "rework-notbundle.json").exists())
+        # the same bundle without coordinates to add, for the runs that only upload jars
+        run("fetch_bundle.py", "--bundle", "com.company.platform:thirdparty-bundle:1.0.0", "--repo-url", repo_url, "--out", work / "rework-in-plain", "--meta", out / "rework-bundle-plain.json", env=with_creds)
+
+        # a hot fix without coordinates, two Log4j jars by coordinates, a vendor jar identified through the repository
+        hotfix = fx.make_jar(work / "upload" / "hotfix.jar", {"org/apache/commons/io/FileUtils.class": b"patched FileUtils",
+                                                               "com/example/hotfix/Patch.class": fx.fake_class("Patch"),
+                                                               "META-INF/services/com.example.Codec": b"com.example.hotfix.HotCodec\n"},
+                             {"Implementation-Title": "hotfix"})
+        rproj = work / "rework"
+        run("rework_bundle.py", "--bundle-meta", out / "rework-bundle.json", "--add-jar", hotfix, "--add-jar", libs["vendor-sdk"], "--repo-url", repo_url,
+            "--release-url", release, "--snapshot-url", snapshot, "--out", rproj, "--manifest-out", out / "rework-manifest.json", "--plan-out", out / "rework-plan.json", env=with_creds)
+        rman = read_json(out / "rework-manifest.json")
+        rplan = read_json(out / "rework-plan.json")
+        by_name = {a["name"]: a for a in rplan["added"]}
+        ok("version derived from the published one",
+           rman["bundle"]["version"] == "1.0.0.1" and rplan["version"] == {"old": "1.0.0", "new": "1.0.0.1", "source": "derived"}
+           and rman["coordinate"] == "com.company.platform:thirdparty-bundle:1.0.0.1" and rman["rework"]["base"] == "com.company.platform:thirdparty-bundle:1.0.0")
+        ok("added jars identified: by coordinates, by the repository checksum, synthetic for the hot fix",
+           by_name["log4j-core-2.23.1.jar"]["action"] == "add" and by_name["log4j-core-2.23.1.jar"]["gav_source"] == "coordinates"
+           and by_name["vendor-sdk-2.0.0.jar"]["coordinate"] == "com.vendor:vendor-sdk:2.0.0" and by_name["vendor-sdk-2.0.0.jar"]["gav_source"] == "nexus-search+sha1"
+           and by_name["hotfix.jar"]["synthetic"] and by_name["hotfix.jar"]["coordinate"].startswith("rebundle.unidentified:hotfix:0-u")
+           and any("synthetic coordinates" in w for w in by_name["hotfix.jar"]["warnings"]))
+        ok("hot fix replaces the bundle's copy of a class and adds to a merged resource",
+           by_name["hotfix.jar"]["overlap"]["replaced"] == ["org/apache/commons/io/FileUtils.class"]
+           and by_name["hotfix.jar"]["overlap"]["merged"] == ["META-INF/services/com.example.Codec"] and any("hot fix" in w for w in by_name["hotfix.jar"]["warnings"]))
+        rpom = (rproj / "pom.xml").read_text(encoding="utf-8")
+        deps_part = rpom[rpom.find("<dependencies>"):rpom.find("</dependencies>")]
+        ok("project merges the added jars first and the bundle last, with the Log4j transformer and the origin in the manifest",
+           deps_part.find("log4j-core") < deps_part.find("<artifactId>hotfix</artifactId>") < deps_part.find("vendor-sdk")
+           < deps_part.find("<artifactId>thirdparty-bundle</artifactId>\n      <version>1.0.0</version>")
+           and "Log4j2PluginCacheFileTransformer" in rpom and "PropertiesMergingResourceTransformer" not in rpom and rpom.count("<include>") == 5
+           and "<%s>com.company.platform:thirdparty-bundle:1.0.0</%s>" % (BUNDLE_BASE_ATTR, BUNDLE_BASE_ATTR) in rpom
+           and "<%s>com.company.platform:thirdparty-bundle:1.0.0</%s>" % (BUNDLE_REWORKED_FROM_ATTR, BUNDLE_REWORKED_FROM_ATTR) in rpom
+           and "<X-Dependency-Bundle-Source>%s</X-Dependency-Bundle-Source>" % source_attr in rpom and ET.fromstring(rpom.encode("utf-8")) is not None)
+        ok("contents list the added coordinates then the carried ones; inputs and install items carry the fetched POMs",
+           rman["contents_attr"].startswith("org.apache.logging.log4j:log4j-core:2.23.1,org.apache.logging.log4j:log4j-layout-template-json:2.23.1,rebundle.unidentified:hotfix:")
+           and rman["contents_attr"].endswith(man["contents_attr"]) and len(rman["components"]) == 14
+           and [i["role"] for i in rman["inputs"]] == ["added"] * 4 + ["bundle"]
+           and rman["install"][-1]["pom_file"] == rmeta["pom"] and rman["install"][0]["pom_file"] == rmeta["added"][0]["pom"]
+           and rman["application_coordinates"] == [{"groupId": "org.yaml", "artifactId": "snakeyaml", "version": "2.2"}])
+        with zipfile.ZipFile(rman["inputs"][-1]["file"]) as zf:
+            names = zf.namelist()
+        ok("bundle input keeps everything but its own descriptors and contents list",
+           "META-INF/maven/com.company.platform/thirdparty-bundle/pom.xml" not in names and "META-INF/third-party/BUNDLE-CONTENTS.txt" not in names
+           and "org/apache/commons/io/FileUtils.class" in names and "META-INF/third-party/commons-io-2.16.1/LICENSE.txt" in names)
+        text = run("install_components.py", "--manifest", out / "rework-manifest.json", "--repo-url", repo_url, "--local-repo", work / "m2", "--dry-run", env=with_creds)
+        ok("inputs are installed with the fetched POMs, the hot fix with a generated one",
+           text.count("install-file") == 5 and "-DpomFile=%s" % rmeta["pom"] in text and any("hotfix.jar" in l and "-DgeneratePom=true" in l for l in text.splitlines()))
+        r_inputs = [Path(i["file"]) for i in rman["inputs"]]
+        new_bundle = dict(bundle, version="1.0.0.1")
+        r_extra = {BUNDLE_BASE_ATTR: "com.company.platform:thirdparty-bundle:1.0.0", BUNDLE_REWORKED_FROM_ATTR: "com.company.platform:thirdparty-bundle:1.0.0"}
+        r_good = fx.simulate_shade(rproj, r_inputs, new_bundle, rman["contents_attr"], source_attr, True, rproj / "target" / "thirdparty-bundle-1.0.0.1.jar",
+                                   boot_version="3.3.5", extra_manifest=r_extra)
+        # Shade promotes snakeyaml at the version an added jar's POM wants, codec-a (embedded) and a new dependency of an added jar
+        fx.write_reduced_pom(rproj / "target" / "dependency-reduced-pom.xml", new_bundle, [("org.yaml", "snakeyaml", "2.3"), ("com.example.codec", "codec-a", "1.0"), ("org.foo", "newdep", "1.0")])
+        run("finalize_bundle_pom.py", "--manifest", out / "rework-manifest.json", "--report", out / "rework-pom.json")
+        rfin = read_json(out / "rework-pom.json")
+        ok("rework POM keeps the previous POM's dependencies at their versions, keeps new ones and prunes embedded ones",
+           rfin["rework"] and [d["artifactId"] for d in rfin["new"]] == ["newdep"] and [d["artifactId"] for d in rfin["pruned_embedded"]] == ["codec-a"]
+           and rfin["aligned"][0]["version"] == "2.2" and not rfin["pruned"]
+           and "codec-a" not in (rproj / "target" / "thirdparty-bundle-1.0.0.1.pom").read_text(encoding="utf-8"))
+        run("verify_bundle.py", "--manifest", out / "rework-manifest.json", "--out", out / "rework-verification.json")
+        rver = read_json(out / "rework-verification.json")
+        rchecks = {c["check"]: c for c in rver["checks"]}
+        ok("reworked bundle passes the verification against its inputs; the new dependency is a warning",
+           rver["ok"] and rchecks["classes-and-resources-identical"]["status"] == "pass" and rchecks["no-unexpected-entries"]["status"] == "pass"
+           and rchecks["log4j-plugin-cache-merged"]["status"] == "pass" and rchecks["legal-files-relocated"]["status"] == "pass"
+           and rchecks["pom-promotes-only-application-dependencies"]["status"] == "warn" and "newdep" in rchecks["pom-promotes-only-application-dependencies"]["detail"]
+           and rver["rework"]["from"] == "com.company.platform:thirdparty-bundle:1.0.0")
+        with zipfile.ZipFile(r_good) as zf:
+            r_names = zf.namelist()
+            r_services = set(significant_lines(zf.read("META-INF/services/com.example.Codec").decode()))
+            r_attrs = read_manifest(zf)
+            fileutils = zf.read("org/apache/commons/io/FileUtils.class")
+        ok("hot fix bytes win, its service line is merged, the carried legal files stay, the manifest records the origin",
+           fileutils == b"patched FileUtils" and r_services == {"com.example.hotfix.HotCodec", "com.example.codec.a.JsonCodec", "com.example.codec.b.XmlCodec"}
+           and "META-INF/third-party/commons-io-2.16.1/LICENSE.txt" in r_names and "META-INF/third-party/vendor-sdk-2.0.0/LICENSE.txt" in r_names
+           and r_attrs[BUNDLE_CONTENTS_ATTR] == rman["contents_attr"] and r_attrs[BUNDLE_REWORKED_FROM_ATTR] == "com.company.platform:thirdparty-bundle:1.0.0")
+        bad = fx.simulate_shade(rproj, r_inputs, new_bundle, rman["contents_attr"], source_attr, True, rproj / "target" / "bad-rework.jar",
+                                boot_version="3.3.5", extra_manifest=r_extra, drop=["com/example/hotfix/Patch.class"])
+        run("verify_bundle.py", "--manifest", out / "rework-manifest.json", "--bundle", bad, "--out", out / "rework-bv-bad.json", expect=1)
+        ok("a lost entry of an added jar fails the verification",
+           "Patch" in next(c["detail"] for c in read_json(out / "rework-bv-bad.json")["checks"] if c["check"] == "classes-and-resources-identical"))
+        run("publish_bundle.py", "--manifest", out / "rework-manifest.json", "--verification", out / "rework-verification.json",
+            "--release-url", release, "--snapshot-url", snapshot, "--dry-run", "--out", out / "rework-publish.json")
+        ok("reworked bundle publishes under the new version",
+           read_json(out / "rework-publish.json")["coordinate"] == "com.company.platform:thirdparty-bundle:1.0.0.1" and read_json(out / "rework-publish.json")["url"] == release)
+
+        # new versions of embedded components replace them; merged resources lose the lines the old versions contributed
+        new_io = fx.dep_jar(work / "upload", "commons-io", "commons-io", "2.17.0",
+                            ["org/apache/commons/io/IOUtils.class", "org/apache/commons/io/FileUtils.class", "org/apache/commons/io/file/PathUtils.class"],
+                            extra={"org/apache/commons/io/messages.properties": b"hello=world\nbye=world\n"})
+        new_codec = fx.dep_jar(work / "upload", "com.example.codec", "codec-a", "1.1", ["com/example/codec/a/JsonCodec2.class"],
+                               extra={"META-INF/services/com.example.Codec": b"com.example.codec.a.JsonCodec2\n",
+                                      "META-INF/spring.factories": b"com.example.Factory=com.example.codec.a.A2Factory\n",
+                                      "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports": b"com.example.codec.a.A2AutoConfiguration\n"},
+                               deps=[("commons-io", "commons-io", "compile")])
+        uproj = work / "rework-upgrade"
+        run("rework_bundle.py", "--bundle-meta", out / "rework-bundle-plain.json", "--add-jar", new_io, "--add-jar", new_codec, "--repo-url", repo_url,
+            "--new-version", "1.1.0", "--out", uproj, "--manifest-out", out / "upgrade-manifest.json", "--plan-out", out / "upgrade-plan.json", env=with_creds)
+        uman = read_json(out / "upgrade-manifest.json")
+        uplan = read_json(out / "upgrade-plan.json")
+        by_name = {a["name"]: a for a in uplan["added"]}
+        io_strip = by_name["commons-io-2.17.0.jar"]["replaces"]["strip"]
+        codec_strip = by_name["codec-a-1.1.jar"]["replaces"]["strip"]
+        ok("new versions replace the embedded components; the old entries go by the repository jar",
+           uman["bundle"]["version"] == "1.1.0" and uplan["version"]["source"] == "parameter"
+           and by_name["commons-io-2.17.0.jar"]["action"] == "replace" and by_name["commons-io-2.17.0.jar"]["replaces"]["coordinate"] == "commons-io:commons-io:2.16.1"
+           and io_strip["by"] == "repository jar" and "org/apache/commons/io/input/BOMInputStream.class" in io_strip["removed"]
+           and io_strip["legal_dir"] == "META-INF/third-party/commons-io-2.16.1/" and not io_strip["kept_other"]
+           and by_name["commons-io-2.17.0.jar"]["replaces"]["repository_sha256_matches"] is True)
+        ok("merged resources lose the lines the replaced component contributed",
+           codec_strip["merged_lines"]["META-INF/services/com.example.Codec"] == ["com.example.codec.a.JsonCodec"]
+           and codec_strip["merged_lines"]["META-INF/spring.factories"] == ["com.example.Factory=com.example.codec.a.AFactory"]
+           and "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports" in codec_strip["merged_lines"]
+           and "com.example.codec:codec-a:1.0" not in uman["contents_attr"] and "com.example.codec:codec-a:1.1" in uman["contents_attr"]
+           and "commons-io:commons-io:2.16.1" not in uman["contents_attr"] and len(uman["components"]) == 10
+           and uman["transformers"]["props_merge"] == ["META-INF/spring.factories"] and uman["transformers"]["log4j_plugins"] is False
+           and set(uman["rework"]["stale"]["lines"]) == {"META-INF/services/com.example.Codec", "META-INF/spring.factories",
+                                                          "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports",
+                                                          "META-INF/spring-autoconfigure-metadata.properties"})
+        u_inputs = [Path(i["file"]) for i in uman["inputs"]]
+        u_bundle = dict(bundle, version="1.1.0")
+        u_good = fx.simulate_shade(uproj, u_inputs, u_bundle, uman["contents_attr"], source_attr, True, uproj / "target" / "thirdparty-bundle-1.1.0.jar",
+                                   boot_version="3.3.5", extra_manifest=r_extra)
+        fx.write_reduced_pom(uproj / "target" / "dependency-reduced-pom.xml", u_bundle, [("org.yaml", "snakeyaml", "2.2"), ("commons-io", "commons-io", "2.17.0")])
+        run("finalize_bundle_pom.py", "--manifest", out / "upgrade-manifest.json", "--report", out / "upgrade-pom.json")
+        run("verify_bundle.py", "--manifest", out / "upgrade-manifest.json", "--out", out / "upgrade-verification.json")
+        uver = read_json(out / "upgrade-verification.json")
+        uchecks = {c["check"]: c for c in uver["checks"]}
+        with zipfile.ZipFile(u_good) as zf:
+            u_names = zf.namelist()
+            u_services = set(significant_lines(zf.read("META-INF/services/com.example.Codec").decode()))
+            u_props = properties_values(parse_properties(zf.read("META-INF/spring.factories").decode()))
+        ok("upgraded bundle holds the new versions only and its POM drops the embedded commons-io the new codec declares",
+           uver["ok"] and uchecks["replaced-components-removed"]["status"] == "pass" and uchecks["spring-properties-merged"]["status"] == "pass"
+           and "org/apache/commons/io/input/BOMInputStream.class" not in u_names and "org/apache/commons/io/file/PathUtils.class" in u_names
+           and "com/example/codec/a/JsonCodec.class" not in u_names and "com/example/codec/a/JsonCodec2.class" in u_names
+           and "META-INF/third-party/commons-io-2.16.1/LICENSE.txt" not in u_names and "META-INF/third-party/commons-io-2.17.0/LICENSE.txt" in u_names
+           and u_services == {"com.example.codec.a.JsonCodec2", "com.example.codec.b.XmlCodec"}
+           and set(u_props["com.example.Factory"]) == {"com.example.codec.a.A2Factory", "com.example.codec.b.BFactory", "com.example.codec.b.B2Factory"}
+           and [d["artifactId"] for d in read_json(out / "upgrade-pom.json")["pruned_embedded"]] == ["commons-io"])
+        stale_src = fx.make_jar(work / "upload" / "stale-line.jar", {"META-INF/services/com.example.Codec": b"com.example.codec.a.JsonCodec\n"})
+        stale = fx.simulate_shade(uproj, u_inputs + [stale_src], u_bundle, uman["contents_attr"], source_attr, True, uproj / "target" / "stale.jar",
+                                  boot_version="3.3.5", extra_manifest=r_extra)
+        run("verify_bundle.py", "--manifest", out / "upgrade-manifest.json", "--bundle", stale, "--out", out / "upgrade-bv-stale.json", expect=1)
+        ok("a line of the replaced component that survives the merge fails the verification",
+           any(c["check"] == "replaced-components-removed" and c["status"] == "fail" and "JsonCodec" in c["detail"] for c in read_json(out / "upgrade-bv-stale.json")["checks"]))
+
+        # refusals, and the version chain of a bundle that is itself a rework
+        run("rework_bundle.py", "--bundle-meta", out / "rework-bundle-plain.json", "--add-jar", libs["commons-codec"], "--repo-url", repo_url, "--out", work / "rework-noop",
+            "--manifest-out", out / "noop-manifest.json", "--plan-out", out / "noop-plan.json", env=with_creds, expect=1)
+        ok("a jar identical to an embedded component leaves nothing to do", not (out / "noop-manifest.json").exists())
+        run("rework_bundle.py", "--bundle-meta", out / "rework-bundle-plain.json", "--add-jar", libs["snakeyaml"], "--new-version", "1.0.0", "--out", work / "rework-same",
+            "--manifest-out", out / "same-manifest.json", "--plan-out", out / "same-plan.json", expect=2)
+        ok("republishing a release under its own version is refused", not (out / "same-manifest.json").exists())
+        notjar = work / "upload" / "notes.txt"
+        notjar.write_text("not a jar", encoding="utf-8")
+        run("rework_bundle.py", "--bundle-meta", out / "rework-bundle-plain.json", "--add-jar", notjar, "--out", work / "rework-notjar",
+            "--manifest-out", out / "notjar-manifest.json", "--plan-out", out / "notjar-plan.json", expect=2)
+        ok("an upload that is not a jar is refused", not (out / "notjar-manifest.json").exists())
+        fx.put_artifact(nexus_root, bundle["groupId"], bundle["artifactId"], "1.0.0.1", r_good, (rproj / "target" / "thirdparty-bundle-1.0.0.1.pom").read_bytes())
+        run("fetch_bundle.py", "--bundle", "com.company.platform:thirdparty-bundle:1.0.0.1", "--repo-url", repo_url, "--out", work / "rework-in2", "--meta", out / "rework-bundle2.json", env=with_creds)
+        run("rework_bundle.py", "--bundle-meta", out / "rework-bundle2.json", "--add-jar", libs["snakeyaml"], "--repo-url", repo_url, "--out", work / "rework-chain",
+            "--manifest-out", out / "chain-manifest.json", "--plan-out", out / "chain-plan.json", env=with_creds)
+        cman = read_json(out / "chain-manifest.json")
+        ok("a rework of a rework counts the version up and keeps the base",
+           cman["bundle"]["version"] == "1.0.0.2" and cman["rework"]["base"] == "com.company.platform:thirdparty-bundle:1.0.0"
+           and cman["rework"]["from"] == "com.company.platform:thirdparty-bundle:1.0.0.1" and len(cman["components"]) == 15
+           and read_json(out / "rework-bundle2.json")["manifest"]["reworked_from"] == "com.company.platform:thirdparty-bundle:1.0.0"
+           and "<%s>com.company.platform:thirdparty-bundle:1.0.0.1</%s>" % (BUNDLE_REWORKED_FROM_ATTR, BUNDLE_REWORKED_FROM_ATTR) in (work / "rework-chain" / "pom.xml").read_text(encoding="utf-8"))
+        run("rework_bundle.py", "--bundle-meta", out / "rework-bundle2.json", "--add-jar", libs["snakeyaml"], "--repo-url", repo_url, "--new-version", "1.0.0", "--out", work / "rework-taken",
+            "--manifest-out", out / "taken-manifest.json", "--plan-out", out / "taken-plan.json", env=with_creds, expect=2)
+        ok("a version the repository already has is refused", not (out / "taken-manifest.json").exists())
+        ok("derived versions: .1 for a release, counting up along the base, a SNAPSHOT keeps its version",
+           derive_version("1.0.0", "1.0.0") == "1.0.0.1" and derive_version("2.1.7", "2.1") == "2.1.8" and derive_version("2.1.7", "3.0") == "2.1.7.1"
+           and derive_version("1.0.0-SNAPSHOT", None) == "1.0.0-SNAPSHOT")
 
         # ---- stage 7: consumer patch -------------------------------------------------------
         print("[consumer patch]")
@@ -882,7 +1093,11 @@ def main() -> None:
         # ---- summary + settings -----------------------------------------------------------
         print("[summary]")
         run("write_summary.py", "--out-dir", out)
-        ok("summary written", (out / "SUMMARY.md").is_file() and "Bundle verification: passed" in (out / "SUMMARY.md").read_text(encoding="utf-8"))
+        summary = (out / "SUMMARY.md").read_text(encoding="utf-8")
+        ok("summary written", (out / "SUMMARY.md").is_file() and "Bundle verification: passed" in summary)
+        ok("summary describes the rework", "## Rework of `com.company.platform:thirdparty-bundle:1.0.0`" in summary
+           and "- New coordinates: `com.company.platform:thirdparty-bundle:1.0.0.1` (version derived)" in summary
+           and "`hotfix.jar` (upload): add as `rebundle.unidentified:hotfix:" in summary and "replaces 1 entry of the bundle: `org/apache/commons/io/FileUtils.class`" in summary)
         run("gen_maven_settings.py", "--mirror-url", "https://nexus.example.com/repository/maven-public/", "--out", work / "settings.xml")
         ok("settings with mirror", "<mirrorOf>*</mirrorOf>" in (work / "settings.xml").read_text(encoding="utf-8"))
         run("gen_maven_settings.py", "--out", work / "settings-plain.xml")

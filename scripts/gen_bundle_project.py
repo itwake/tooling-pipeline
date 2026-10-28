@@ -123,7 +123,7 @@ POM_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 @@MULTI_RELEASE@@
                     <@@CONTENTS_ATTR@@>@@CONTENTS@@</@@CONTENTS_ATTR@@>
                     <@@SOURCE_ATTR@@>@@SOURCE_ATTR_VALUE@@</@@SOURCE_ATTR@@>
-@@BOOT_ATTR_LINE@@
+@@MANIFEST_LINES@@
                   </manifestEntries>
                 </transformer>
               </transformers>
@@ -190,6 +190,61 @@ def component_dir(gav: dict) -> str:
     return d
 
 
+def render_pom(group_id: str, artifact_id: str, version: str, dependencies: list, includes: list, transformers: dict,
+               boot_version, log4j_transform_version: str, shade_version: str, sources_jar: str, timestamp: str,
+               source_desc: str, source_attr: str, contents: str, release_url: str = "", snapshot_url: str = "",
+               server_id: str = "nexus", extra_manifest: dict = None) -> str:
+    """The Shade project POM.
+
+    dependencies: gav dicts in the order Shade must see them (the first copy of a duplicate entry wins);
+    includes: groupId:artifactId strings of the artifactSet; extra_manifest: further manifest attributes
+    (the rework job records where the bundle comes from)."""
+    if transformers.get("props_merge") and not boot_version:
+        fail("properties merging needs a Spring Boot version (--spring-boot-version)")
+    shade_plugin_deps = ""
+    if transformers.get("props_merge"):
+        shade_plugin_deps += BOOT_PLUGIN_DEP % escape(boot_version)
+    if transformers.get("log4j_plugins"):
+        shade_plugin_deps += LOG4J_TRANSFORM_DEP % escape(log4j_transform_version)
+    manifest_lines = []
+    if boot_version:
+        manifest_lines.append("                    <%s>%s</%s>" % (BUNDLE_BOOT_ATTR, escape(boot_version), BUNDLE_BOOT_ATTR))
+    for k, v in (extra_manifest or {}).items():
+        manifest_lines.append("                    <%s>%s</%s>" % (k, escape(v), k))
+    repl = {
+        "@@GROUP_ID@@": escape(group_id),
+        "@@ARTIFACT_ID@@": escape(artifact_id),
+        "@@VERSION@@": escape(version),
+        "@@CONTENTS@@": escape(contents),
+        "@@SOURCE_DESC@@": escape(source_desc),
+        "@@TIMESTAMP@@": escape(timestamp),
+        "@@DEPENDENCIES@@": "\n".join(dep_xml(g) for g in dependencies),
+        "@@SHADE_VERSION@@": escape(shade_version),
+        "@@SHADE_PLUGIN_DEPENDENCIES@@": (SHADE_PLUGIN_DEPS % shade_plugin_deps) if shade_plugin_deps else "",
+        "@@LEGAL_EXCLUDES@@": "\n".join("                    <exclude>%s</exclude>" % escape(p) for p in LEGAL_PATTERNS),
+        "@@LOG4J_TRANSFORMER@@": LOG4J_TRANSFORMER if transformers.get("log4j_plugins") else "",
+        "@@SOURCES_JAR@@": sources_jar,
+        "@@INCLUDES@@": "\n".join("                  <include>%s</include>" % escape(ga) for ga in includes),
+        "@@APPEND_TRANSFORMERS@@": "".join(APPEND_TRANSFORMER % escape(r) for r in transformers.get("append", [])),
+        "@@PROPS_TRANSFORMERS@@": "".join(PROPS_TRANSFORMER % escape(r) for r in transformers.get("props_merge", [])),
+        "@@MULTI_RELEASE@@": "                    <Multi-Release>true</Multi-Release>" if transformers.get("multi_release") else "",
+        "@@CONTENTS_ATTR@@": BUNDLE_CONTENTS_ATTR,
+        "@@SOURCE_ATTR@@": BUNDLE_SOURCE_ATTR,
+        "@@SOURCE_ATTR_VALUE@@": escape(source_attr),
+        "@@MANIFEST_LINES@@": "\n".join(manifest_lines),
+    }
+    dist = ""
+    if release_url or snapshot_url:
+        rel = "    <repository>\n      <id>%s</id>\n      <url>%s</url>\n    </repository>\n" % (escape(server_id), escape(release_url)) if release_url else ""
+        snap = "    <snapshotRepository>\n      <id>%s</id>\n      <url>%s</url>\n    </snapshotRepository>\n" % (escape(server_id), escape(snapshot_url)) if snapshot_url else ""
+        dist = DIST_MGMT % (rel, snap)
+    repl["@@DISTRIBUTION_MANAGEMENT@@"] = dist
+    pom = POM_TEMPLATE
+    for k, v in repl.items():
+        pom = pom.replace(k, v)
+    return pom
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--selection", default="out/selection.json")
@@ -237,11 +292,6 @@ def main() -> None:
     boot_version = args.spring_boot_version or sel.get("spring_boot_version")
     if transformers.get("props_merge") and not boot_version:
         fail("properties merging needs a Spring Boot version (--spring-boot-version)")
-    shade_plugin_deps = ""
-    if transformers.get("props_merge"):
-        shade_plugin_deps += BOOT_PLUGIN_DEP % escape(boot_version)
-    if transformers.get("log4j_plugins"):
-        shade_plugin_deps += LOG4J_TRANSFORM_DEP % escape(args.log4j_transform_version)
 
     source = read_json(args.source) if args.source and Path(args.source).exists() else None
     if source:
@@ -271,37 +321,9 @@ def main() -> None:
         if ga_str(d["gav"]) not in includes:
             includes.append(ga_str(d["gav"]))
 
-    pom = POM_TEMPLATE
-    repl = {
-        "@@GROUP_ID@@": escape(args.group_id),
-        "@@ARTIFACT_ID@@": escape(args.artifact_id),
-        "@@VERSION@@": escape(args.version),
-        "@@CONTENTS@@": escape(contents),
-        "@@SOURCE_DESC@@": escape(source_desc),
-        "@@TIMESTAMP@@": escape(args.timestamp),
-        "@@DEPENDENCIES@@": "\n".join(dep_xml(d["gav"]) for d in selected),
-        "@@SHADE_VERSION@@": escape(args.shade_version),
-        "@@SHADE_PLUGIN_DEPENDENCIES@@": (SHADE_PLUGIN_DEPS % shade_plugin_deps) if shade_plugin_deps else "",
-        "@@LEGAL_EXCLUDES@@": "\n".join("                    <exclude>%s</exclude>" % escape(p) for p in LEGAL_PATTERNS),
-        "@@LOG4J_TRANSFORMER@@": LOG4J_TRANSFORMER if transformers.get("log4j_plugins") else "",
-        "@@SOURCES_JAR@@": args.sources_jar,
-        "@@INCLUDES@@": "\n".join("                  <include>%s</include>" % escape(ga) for ga in includes),
-        "@@APPEND_TRANSFORMERS@@": "".join(APPEND_TRANSFORMER % escape(r) for r in transformers.get("append", [])),
-        "@@PROPS_TRANSFORMERS@@": "".join(PROPS_TRANSFORMER % escape(r) for r in transformers.get("props_merge", [])),
-        "@@MULTI_RELEASE@@": "                    <Multi-Release>true</Multi-Release>" if transformers.get("multi_release") else "",
-        "@@CONTENTS_ATTR@@": BUNDLE_CONTENTS_ATTR,
-        "@@SOURCE_ATTR@@": BUNDLE_SOURCE_ATTR,
-        "@@SOURCE_ATTR_VALUE@@": escape(source_attr),
-        "@@BOOT_ATTR_LINE@@": ("                    <%s>%s</%s>" % (BUNDLE_BOOT_ATTR, escape(boot_version), BUNDLE_BOOT_ATTR)) if boot_version else "",
-    }
-    dist = ""
-    if args.release_url or args.snapshot_url:
-        rel = "    <repository>\n      <id>%s</id>\n      <url>%s</url>\n    </repository>\n" % (escape(args.server_id), escape(args.release_url)) if args.release_url else ""
-        snap = "    <snapshotRepository>\n      <id>%s</id>\n      <url>%s</url>\n    </snapshotRepository>\n" % (escape(args.server_id), escape(args.snapshot_url)) if args.snapshot_url else ""
-        dist = DIST_MGMT % (rel, snap)
-    repl["@@DISTRIBUTION_MANAGEMENT@@"] = dist
-    for k, v in repl.items():
-        pom = pom.replace(k, v)
+    pom = render_pom(args.group_id, args.artifact_id, args.version, [d["gav"] for d in selected], includes, transformers,
+                     boot_version, args.log4j_transform_version, args.shade_version, args.sources_jar, args.timestamp,
+                     source_desc, source_attr, contents, args.release_url, args.snapshot_url, args.server_id)
     (out / "pom.xml").write_text(pom, encoding="utf-8")
 
     # ---- third-party legal files + contents list ---------------------------------------

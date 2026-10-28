@@ -79,6 +79,10 @@ THIRD_PARTY_DIR = "META-INF/third-party/"
 BUNDLE_CONTENTS_ATTR = "X-Dependency-Bundle-Contents"
 BUNDLE_SOURCE_ATTR = "X-Dependency-Bundle-Source"
 BUNDLE_BOOT_ATTR = "X-Dependency-Bundle-Spring-Boot"
+# written by the rework job: the original build a bundle descends from, and the bundle it was derived from
+BUNDLE_BASE_ATTR = "X-Dependency-Bundle-Base"
+BUNDLE_REWORKED_FROM_ATTR = "X-Dependency-Bundle-Reworked-From"
+BUNDLE_CONTENTS_FILE = THIRD_PARTY_DIR + "BUNDLE-CONTENTS.txt"
 
 # --------------------------------------------------------------------------- small utils
 
@@ -320,6 +324,33 @@ def read_manifest(zf: zipfile.ZipFile) -> Dict[str, str]:
         return parse_manifest(zf.read("META-INF/MANIFEST.MF"))
     except KeyError:
         return {}
+
+
+def parse_contents_attr(text: str) -> List[dict]:
+    """gav dicts from the X-Dependency-Bundle-Contents manifest attribute (comma separated g:a:v[:classifier])."""
+    out: List[dict] = []
+    for tok in (text or "").replace(",", "\n").split():
+        p = tok.strip().split(":")
+        if len(p) < 3 or not all(p[:3]):
+            continue
+        g = {"groupId": p[0], "artifactId": p[1], "version": p[2]}
+        if len(p) > 3 and p[3]:
+            g["classifier"] = p[3]
+        out.append(g)
+    return out
+
+
+def parse_contents_file(text: str) -> Dict[str, dict]:
+    """{coordinate: {"sha256", "file"}} from META-INF/third-party/BUNDLE-CONTENTS.txt (coordinate, sha256, file name)."""
+    out: Dict[str, dict] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            out[parts[0]] = {"sha256": parts[1], "file": parts[2] if len(parts) > 2 else None}
+    return out
 
 
 # --------------------------------------------------------------------------- GAV identification

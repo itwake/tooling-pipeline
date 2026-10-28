@@ -106,6 +106,17 @@ class Repository:
         data = self._get(self.artifact_url(g, a, v, "pom"))
         return data.decode("utf-8", "replace") if data else None
 
+    def get(self, url: str, auth: bool = True) -> Optional[bytes]:
+        """Body of a GET on the repository (basic auth when SOURCE_USERNAME/SOURCE_PASSWORD are set); None when absent."""
+        return self._get(url, auth)
+
+    def artifact(self, g: str, a: str, v: str, ext: str = "jar", classifier: Optional[str] = None) -> Optional[bytes]:
+        """The artifact's bytes, None when the repository does not have it."""
+        return self._get(self.artifact_url(g, a, v, ext, classifier))
+
+    def exists(self, g: str, a: str, v: str, ext: str = "pom", classifier: Optional[str] = None) -> bool:
+        return self._get(self.artifact_url(g, a, v, ext, classifier)) is not None
+
     def search_sha1(self, sha1: str) -> List[dict]:
         hits: List[dict] = []
         if self.nexus_base:

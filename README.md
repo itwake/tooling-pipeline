@@ -18,17 +18,18 @@ Design principles:
 | `mvn-rebundle` | `Jenkinsfile` | Fetch → inventory → selection and expansion → Shade project generation → build → verification → optional publish |
 | `mvn-rebundle-consumer` | `jenkins/Jenkinsfile.consumer` | POM change proposal for a consuming project, per module and per path when its dependency tree is available |
 | `mvn-rebundle-verify` | `jenkins/Jenkinsfile.verify` | Equivalence check of the application built before and after the POM change |
+| `mvn-rebundle-rework` | `jenkins/Jenkinsfile.rework` | Change a published bundle (merge an uploaded jar or Nexus coordinates into it, replace an embedded component by a newer version) and publish it under a new version |
 
-The three jobs are independent. The consumer job takes the bundle from an archived `mvn-rebundle` build (Copy Artifact plugin) or downloads it from Nexus by coordinates, so it also works for a bundle published long ago.
+The four jobs are independent. The consumer job takes the bundle from an archived `mvn-rebundle` build (Copy Artifact plugin) or downloads it from Nexus by coordinates, so it also works for a bundle published long ago; the rework job always starts from Nexus.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `Jenkinsfile`, `jenkins/` | The three jobs |
+| `Jenkinsfile`, `jenkins/` | The four jobs |
 | `scripts/*.py` | The stages, standard-library Python only, shared by Jenkins and the local runner |
 | `config/policy.json` | Families that must stay together, notes, and the ignore list of the equivalence check |
-| `run-local.sh` | Runs the same stages on a workstation (`bundle`, `consumer`, `verify` modes) |
+| `run-local.sh` | Runs the same stages on a workstation (`bundle`, `consumer`, `verify`, `rework` modes) |
 | `tests/` | Synthetic fixtures, a fake Nexus, and the self-test (no Maven needed) |
 
 ## Agent requirements
@@ -37,12 +38,13 @@ The three jobs are independent. The consumer job takes the bundle from an archiv
 - `mvn-rebundle`: JDK 17+, Maven 3.6+, Python 3.8+ on the PATH; `docker` (with a reachable daemon) or `crane` for images, plus the `aws` CLI for images in ECR. `crane` needs no daemon and suits CI better.
 - `mvn-rebundle-consumer`: Python 3.8+; JDK and Maven when a consumer project is analysed.
 - `mvn-rebundle-verify`: Python 3.8+; `docker` or `crane` for image inputs.
-- Jenkins plugins: Pipeline, Git, Credentials Binding, Copy Artifact (consumer job, unless coordinates are used), CloudBees AWS Credentials (only when `AWS_CREDENTIALS_ID` is set).
+- `mvn-rebundle-rework`: JDK 17+, Maven 3.6+, Python 3.8+; no image tools.
+- Jenkins plugins: Pipeline, Git, Credentials Binding, Copy Artifact (consumer job, unless coordinates are used), File Parameter (rework job: the uploaded jar is a `stashedFile` parameter, and the Jenkinsfile does not load without the plugin), CloudBees AWS Credentials (only when `AWS_CREDENTIALS_ID` is set).
 
 ## Creating the Jenkins jobs
 
 1. Push this repository to your git server.
-2. Create the three Pipeline jobs, Definition "Pipeline script from SCM", with the Script Paths from the table above.
+2. Create the four Pipeline jobs, Definition "Pipeline script from SCM", with the Script Paths from the table above.
 3. Edit the site settings in the `environment` block at the top of each Jenkinsfile once. Everything that describes your site lives there, not in the run parameters:
 
    | Variable | Meaning |
@@ -140,6 +142,28 @@ Only a build error or the Enforcer gate stops the job before the push; what the 
 
 `OLD_SOURCE_REF` / `NEW_SOURCE_REF` are the artifacts built before and after the change, detected like `SOURCE_REF` above (`#/path` selects the application inside an image), plus an optional `BUNDLE_ARTIFACT_ID` to pin which jar is the bundle. The job lists every difference as the consumer job's step 3 above describes and ends UNSTABLE when there is anything to review; it never fails on a difference. Locally, `./run-local.sh verify ... --fail-on dependencies|any` turns findings of that scope into a non-zero exit for scripts that want a gate.
 
+## `mvn-rebundle-rework` parameters
+
+Changes a bundle that is already in Nexus and publishes the result under a new version, without the application artifact: a jar that was left out, a hot fix for a class inside the bundle, or a newer version of an embedded library.
+
+| Parameter | Meaning |
+|---|---|
+| `BUNDLE_COORDINATES` | `groupId:artifactId:version` of the published bundle to change |
+| `ADD_JAR` | A jar uploaded with the build (File Parameter plugin, `stashedFile`). Its coordinates come from its `pom.properties`, else from the Nexus checksum search confirmed by the `.sha1`, else it is embedded under synthetic coordinates as the main job does |
+| `ADD_COORDINATES` | Jars to add from Nexus, one `groupId:artifactId:version[:classifier]` per line; their POMs are fetched too |
+| `NEW_VERSION` | Version of the new bundle. Empty derives it: `<version>.1` for a release, counting up when the bundle is itself a rework (`<base>.N`), the same version for a SNAPSHOT. A version Nexus already has is refused before anything is built |
+| `PUBLISH` | `false` builds and verifies only; `true` uploads the verified jar, its POM and the sources jar with `deploy-file` |
+
+What happens:
+
+1. **Fetch bundle**: `fetch_bundle.py` downloads the bundle jar, its POM and its sources jar (when published) by coordinates, checks that the jar is an mvn-rebundle bundle, reads its manifest (contents, source, Spring Boot version, origin) and `META-INF/third-party/BUNDLE-CONTENTS.txt` (the SHA-256 of every embedded component), and downloads the `ADD_COORDINATES` jars with their POMs.
+2. **Plan rework**: `rework_bundle.py` decides what each added jar does. A coordinate that is not embedded is added. A jar whose `groupId:artifactId` is embedded at another version (or at the same version with other bytes) replaces that component: its old jar is fetched from Nexus and its entries are removed from a copy of the bundle, a class or resource only when the bundle holds the same bytes (a copy that came from another component stays), SPI files, Spring metadata and the Log4j plugin cache lose the lines it contributed, its legal files go. When Nexus does not have the old jar, only the entries the new jar carries too are replaced and the plan warns that entries the new version dropped stay. A jar identical to an embedded component is skipped. Then the Shade project is generated with the added jars first and the bundle copy last, so an entry both have is taken from the added jar (a hot fix wins) and is listed as replaced; merged resources use the transformers of the original build, with the Boot version from the bundle's manifest. The new manifest lists the new contents and records `X-Dependency-Bundle-Reworked-From` (the bundle this one came from) and `X-Dependency-Bundle-Base` (the original build); `BUNDLE-CONTENTS.txt` is rewritten.
+3. **Build bundle**: the inputs are installed into the job-local repository (the bundle with the POM it was published with, added coordinates with their POMs, an uploaded jar with the POM Nexus has for its coordinates or a generated one), then `mvn clean verify`. `finalize_bundle_pom.py` derives the POM: the dependencies the previous bundle POM declared stay at their versions, a dependency an added jar's POM brings is kept and reported as new (make sure the consumer has or wants it), and an embedded coordinate an added jar's POM declares is pruned.
+4. **Verify bundle**: `verify_bundle.py` compares the result with the inputs the way the main job compares with the application's jars, and also checks that no line of a replaced component survived in a merged resource; a dependency promoted from an added jar is a warning, not a failure.
+5. **Publish to Nexus** (`PUBLISH=true`) with `deploy-file`, as in the main job.
+
+Afterwards run `mvn-rebundle-consumer` with the new coordinates: the jar's manifest lists what it embeds now, so the proposal adds the exclusions for the added coordinates and moves the consumer to the new version. Removing a component is not a rework: rebuild the bundle with `mvn-rebundle` and a smaller `SELECT`.
+
 ## What the consumer has to do
 
 Run `mvn-rebundle-consumer` (ideally with the consumer's git URL) and apply `out/consumer-patch.md` to the POM: delete the replaced direct dependencies, add the bundle dependency, add the proposed exclusions and put the Enforcer rule into the parent POM. Then run `mvn clean verify`; a passing Enforcer check means no path brings the original coordinates back.
@@ -155,6 +179,8 @@ Finally run the existing tests, rebuild the image and smoke-test it.
 ## Living with a bundle
 
 The bundle freezes its contents at the versions of one build. Families managed by the Spring Boot BOM are therefore tied to the Boot version the application had; the Enforcer rule keeps the consumer on that Boot line, and moving to another line means running `mvn-rebundle` again against the upgraded application, publishing a new bundle version and re-running the verify job. Treat the bundle version as part of the application's upgrade procedure, not as a library with its own lifecycle.
+
+For a change that does not justify a rebuild from the application, such as a hot fix class, a jar that was left out, or a newer version of one library, `mvn-rebundle-rework` changes the published bundle and publishes it under the next version; the consumer job then proposes the matching POM change.
 
 ## Running locally
 
@@ -174,7 +200,11 @@ The bundle freezes its contents at the versions of one build. Families managed b
 ./run-local.sh verify --old /path/old-app.jar --new /path/new-app.jar
 ```
 
-`--ref` takes the same forms as `SOURCE_REF` and is detected the same way. Pass `--maven-repo-url URL` (Maven coordinates and jar identification) and `--nexus-hosts host1,host2` so that references on Nexus use the exported `SOURCE_USERNAME` / `SOURCE_PASSWORD`; images in ECR use the AWS credentials of the environment or the instance role. Without `--select` the bundle mode stops after the inventory. On a machine without Maven add `--skip-maven` to stop after project generation. Publishing needs `export NEXUS_USERNAME NEXUS_PASSWORD` plus `--release-url`, `--snapshot-url` and `--publish`. The consumer mode reads `out/bundle-manifest.json` from a previous bundle run, or takes `--bundle-jar` or `--bundle g:a:v --embedded "..."`. The verify mode exits 0 whenever the comparison ran and prints the differences; `--fail-on dependencies|any` makes findings of that scope exit 1.
+```bash
+./run-local.sh rework --bundle com.company.platform:thirdparty-bundle:1.0.0 --maven-repo-url https://nexus.example.com/repository/maven-public/ --add-jar fix.jar --add org.apache.commons:commons-lang3:3.14.0
+```
+
+`--ref` takes the same forms as `SOURCE_REF` and is detected the same way. Pass `--maven-repo-url URL` (Maven coordinates and jar identification) and `--nexus-hosts host1,host2` so that references on Nexus use the exported `SOURCE_USERNAME` / `SOURCE_PASSWORD`; images in ECR use the AWS credentials of the environment or the instance role. Without `--select` the bundle mode stops after the inventory. On a machine without Maven add `--skip-maven` to stop after project generation. Publishing needs `export NEXUS_USERNAME NEXUS_PASSWORD` plus `--release-url`, `--snapshot-url` and `--publish`. The consumer mode reads `out/bundle-manifest.json` from a previous bundle run, or takes `--bundle-jar` or `--bundle g:a:v --embedded "..."`. The verify mode exits 0 whenever the comparison ran and prints the differences; `--fail-on dependencies|any` makes findings of that scope exit 1. The rework mode needs `--maven-repo-url` with `SOURCE_USERNAME` / `SOURCE_PASSWORD` exported, takes any number of `--add-jar` files and `--add` coordinates, derives the version unless `--new-version` is given, and publishes like the bundle mode.
 
 Self-test (no Maven needed; a fake Nexus runs locally and the Shade output is simulated from synthetic fixtures):
 
@@ -202,3 +232,6 @@ python tests/run_selftest.py
 - The comparison with the original artifact proves equivalence only when both builds come from the same commit and JDK. With another commit, the differences it lists mix the code change with the effect of the swap; the report says which case applies when the archives carry `git.properties` or `build-info.properties`, and the decision is left to the person approving the push.
 - The consumer POM is modified only on a branch created by `APPLY=true`, never on the branch that was checked out, and nothing is merged by the pipeline.
 - A direct dependency of a build plugin that is embedded in the bundle cannot be removed from the plugin's class realm: Maven has no exclusion at the plugin level and re-declaring the coordinate still resolves it. The bundle is placed ahead of it, so classes load from the bundle, but the original jar is still downloaded and listed by `dependency:resolve-plugins`; `plugins.direct_hits=skip` in the policy leaves such plugins alone.
+- The rework job replaces a component with the help of the jar Nexus has under the component's coordinates. An entry whose bytes differ from the bundle's copy stays (it came from another component), and a component under synthetic coordinates, or whose jar Nexus no longer has, is replaced only where the new jar carries the same entry; the plan warns in both cases, and the published `BUNDLE-CONTENTS.txt` still lists the SHA-256 of every component for a check by hand. Removing a component is a rebuild with `mvn-rebundle`.
+- A dependency an added jar's POM declares enters the published POM of the reworked bundle (the original application never had it); the finalize step and the verification report it, the reviewer decides whether the consumer should take it.
+- The uploaded jar needs the File Parameter plugin. Without it, remove the `ADD_JAR` parameter and the `Uploaded jar` stage from `jenkins/Jenkinsfile.rework` and add jars by coordinates only.

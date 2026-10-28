@@ -17,6 +17,10 @@
 #        [--maven-repo-url URL] [--nexus-hosts host1,host2] [--aws-region R]
 #        (the comparison only reports; --fail-on makes findings of that scope exit 1)
 #
+#   ./run-local.sh rework --bundle g:a:v --maven-repo-url URL [--add-jar X.jar]... [--add g:a:v[:classifier]]... [--new-version V] \
+#        [--no-sources] [--mirror-url URL] [--release-url URL --snapshot-url URL --publish] [--skip-maven]
+#        (adds jars to a published bundle, or replaces embedded components by newer versions, and republishes it)
+#
 # REF is detected like SOURCE_REF in Jenkins: an image reference (append #/path for the application inside
 # it), Maven coordinates g:a:v[:packaging[:classifier]], an http(s) URL, or a local file / directory.
 # Credentials come from the environment: SOURCE_USERNAME / SOURCE_PASSWORD for the Nexus hosts, the usual
@@ -30,7 +34,7 @@ command -v "$PY" >/dev/null 2>&1 || PY=python
 mode=${1:-bundle}
 [ $# -gt 0 ] && shift
 
-usage() { sed -n '2,20p' "$0"; exit 2; }
+usage() { sed -n '2,27p' "$0"; exit 2; }
 
 extract() {  # <ref> <path> <out dir> <meta file>
     "$PY" scripts/extract_source.py --ref "$1" --path "$2" --type "$type" --nexus-hosts "$nexus_hosts" \
@@ -169,6 +173,51 @@ elif [ "$mode" = "verify" ]; then
     extract "$new" "$path" work/new out/new-source.json
     "$PY" scripts/verify_app_equivalence.py --old-source out/old-source.json --new-source out/new-source.json \
         --bundle-artifact-id "$bundle_artifact_id" --policy config/policy.json "${fail_on[@]}" --out out/equivalence.json
+    "$PY" scripts/write_summary.py --out-dir out
+    echo "done: see out/SUMMARY.md"
+
+elif [ "$mode" = "rework" ]; then
+    bundle="" maven_repo_url="" new_version="" sources=true mirror_url="" release_url="" snapshot_url="" publish=false skip_maven=false
+    add_jars=() adds=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --bundle) bundle=$2; shift 2;;
+            --maven-repo-url) maven_repo_url=$2; shift 2;;
+            --add-jar) add_jars+=(--add-jar "$2"); shift 2;;
+            --add) adds+=(--add "$2"); shift 2;;
+            --new-version) new_version=$2; shift 2;;
+            --no-sources) sources=false; shift;;
+            --mirror-url) mirror_url=$2; shift 2;;
+            --release-url) release_url=$2; shift 2;;
+            --snapshot-url) snapshot_url=$2; shift 2;;
+            --publish) publish=true; shift;;
+            --skip-maven) skip_maven=true; shift;;
+            *) echo "unknown option: $1"; usage;;
+        esac
+    done
+    [ -n "$bundle" ] && [ -n "$maven_repo_url" ] || usage
+    rm -rf work out && mkdir -p work out
+    "$PY" scripts/gen_maven_settings.py --server-id nexus --mirror-url "$mirror_url" --out work/settings.xml
+    "$PY" scripts/fetch_bundle.py --bundle "$bundle" "${adds[@]}" --repo-url "$maven_repo_url" \
+        --out work/bundle-in --added-out work/added --meta out/rework-bundle.json
+    "$PY" scripts/rework_bundle.py --bundle-meta out/rework-bundle.json "${add_jars[@]}" --new-version "$new_version" \
+        --repo-url "$maven_repo_url" --release-url "$release_url" --snapshot-url "$snapshot_url" --server-id nexus \
+        --sources-jar "$sources" --out work/rework --manifest-out out/bundle-manifest.json --plan-out out/rework-plan.json
+    if [ "$skip_maven" = false ]; then
+        local_repo="$PWD/work/m2"   # job-local repository: the inputs are installed here from the fetched bytes
+        "$PY" scripts/install_components.py --manifest out/bundle-manifest.json --settings work/settings.xml \
+            --repo-url "$maven_repo_url" --local-repo "$local_repo"
+        mvn -B -ntp -s work/settings.xml -Dmaven.repo.local="$local_repo" -f work/rework/pom.xml clean verify
+        "$PY" scripts/finalize_bundle_pom.py --manifest out/bundle-manifest.json --report out/bundle-pom.json
+        "$PY" scripts/verify_bundle.py --manifest out/bundle-manifest.json --out out/bundle-verification.json
+        if [ "$publish" = true ]; then
+            "$PY" scripts/publish_bundle.py --manifest out/bundle-manifest.json --verification out/bundle-verification.json \
+                --settings work/settings.xml --release-url "$release_url" --snapshot-url "$snapshot_url" --server-id nexus \
+                --local-repo "$local_repo" --out out/publish.json
+        fi
+    else
+        echo "skipping Maven build, bundle verification and publishing (--skip-maven)"
+    fi
     "$PY" scripts/write_summary.py --out-dir out
     echo "done: see out/SUMMARY.md"
 else
