@@ -937,6 +937,48 @@ def parse_dependency_trees(text: str) -> List[dict]:
     return trees
 
 
+def node_classifier(node: dict) -> Optional[str]:
+    """Classifier of a dependency (tree node or coordinates); a test-jar is the tests classifier even
+    when none is given."""
+    c = node.get("classifier") or None
+    if c is None and node.get("type") == "test-jar":
+        c = "tests"
+    return c
+
+
+def variant_key(node: dict) -> str:
+    """groupId:artifactId[:classifier]: one file as Maven resolves it (a test-jar and the tests
+    classifier are the same jar)."""
+    c = node_classifier(node)
+    return ga_str(node) + ((":" + c) if c else "")
+
+
+def embedded_variants(gavs, skip_group: str = "rebundle.unidentified") -> Dict[str, set]:
+    """groupId:artifactId -> the classifiers a bundle embeds under it (None for the main jar). Synthetic
+    coordinates (skip_group) are left out: their real groupId is unknown."""
+    out: Dict[str, set] = {}
+    for g in gavs or []:
+        if g.get("groupId") and g.get("groupId") != skip_group:
+            out.setdefault(ga_str(g), set()).add(g.get("classifier") or None)
+    return out
+
+
+def is_test_variant(node: dict, variants: Dict[str, set], ga: Optional[str] = None) -> bool:
+    """A test-scope jar that shares groupId:artifactId with an embedded coordinate under another
+    classifier (a test-jar, the tests or test classifier...). The bundle does not contain it, but Maven
+    exclusions and an Enforcer groupId:artifactId pattern cannot tell it from the embedded jar."""
+    if (node.get("scope") or "") != "test":
+        return False
+    classifiers = variants.get(ga or ga_str(node))
+    return classifiers is not None and node_classifier(node) not in classifiers
+
+
+def test_variant_include(group_id: str, artifact_id: str, classifier: str) -> str:
+    """bannedDependencies include (groupId:artifactId:version:type:scope:classifier) letting one test jar
+    through a groupId:artifactId ban: only in test scope and only under that classifier."""
+    return "%s:%s:*:*:test:%s" % (group_id, artifact_id, classifier)
+
+
 # --------------------------------------------------------------------------- misc
 
 

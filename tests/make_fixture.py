@@ -1054,6 +1054,196 @@ rebundle.plugins:plugin-5:jar:1
 """
 
 
+# Test jars of embedded coordinates and version drift. The bundle embeds spring-kafka, kafka-clients (main
+# jar), orders-common (the project's own module, as a SELECT of * would) and the x86_64 epoll native; the
+# consumer was built on Spring Boot 3.3.6 while the bundle comes from 3.3.5. orders declares the test-jar of
+# orders-common and gets kafka-clients:test through spring-kafka-test, whose exclusion of kafka-clients cuts
+# it; orders-it declares kafka-clients:test itself and gets the orders-common test-jar through a testkit.
+VARIANT_EMBEDDED = [
+    ("org.springframework.kafka", "spring-kafka", "3.2.4", None), ("org.springframework", "spring-core", "6.1.14", None),
+    ("org.springframework", "spring-jcl", "6.1.14", None), ("org.springframework.boot", "spring-boot", "3.3.5", None),
+    ("org.springframework.boot", "spring-boot-autoconfigure", "3.3.5", None), ("org.apache.kafka", "kafka-clients", "3.7.1", None),
+    ("com.github.luben", "zstd-jni", "1.5.6-3", None), ("com.example", "orders-common", "1.0.0", None),
+    ("org.apache.commons", "commons-lang3", "3.14.0", None), ("io.netty", "netty-transport-native-epoll", "4.1.112.Final", "linux-x86_64"),
+    ("io.micrometer", "micrometer-core", "1.13.6", None), ("io.micrometer", "micrometer-tracing", "1.3.5", None),
+]
+
+VARIANT_TREE = r"""com.example:orders:jar:1.0.0
++- org.springframework.kafka:spring-kafka:jar:3.2.4:compile
+|  +- org.springframework:spring-core:jar:6.1.14:compile
+|  |  \- org.springframework:spring-jcl:jar:6.1.14:compile
+|  \- org.apache.kafka:kafka-clients:jar:3.7.1:compile
+|     \- com.github.luben:zstd-jni:jar:1.5.6-3:runtime
++- org.springframework.boot:spring-boot-starter:jar:3.3.6:compile
+|  +- org.springframework.boot:spring-boot:jar:3.3.6:compile
+|  |  \- (org.springframework:spring-core:jar:6.1.14:compile - omitted for duplicate)
+|  \- org.springframework.boot:spring-boot-autoconfigure:jar:3.3.6:compile
+|     \- (org.springframework.boot:spring-boot:jar:3.3.6:compile - omitted for duplicate)
++- com.example:orders-common:jar:1.0.0:compile
+|  \- org.apache.commons:commons-lang3:jar:3.14.0:compile
++- com.example:orders-common:test-jar:tests:1.0.0:test
+|  \- (org.apache.commons:commons-lang3:jar:3.14.0:test - omitted for duplicate)
++- io.netty:netty-transport-native-epoll:jar:linux-x86_64:4.1.112.Final:compile
++- io.netty:netty-transport-native-epoll:jar:linux-aarch_64:4.1.112.Final:runtime
++- org.springframework.kafka:spring-kafka-test:jar:3.2.4:test
+|  +- (org.springframework.kafka:spring-kafka:jar:3.2.4:test - omitted for duplicate)
+|  +- org.springframework:spring-test:jar:6.1.15:test
+|  |  \- (org.springframework:spring-core:jar:6.1.14:test - omitted for duplicate)
+|  +- (org.apache.kafka:kafka-clients:jar:3.7.1:test - omitted for duplicate)
+|  \- org.apache.kafka:kafka-clients:jar:test:3.7.1:test
+|     +- (com.github.luben:zstd-jni:jar:1.5.6-3:test - omitted for duplicate)
+|     \- org.example.testing:kafka-test-helper:jar:1.0:test
++- io.micrometer:micrometer-observation-test:jar:1.13.7:test
+\- org.springframework.boot:spring-boot-starter-test:jar:3.3.6:test
+   +- (org.springframework.boot:spring-boot-starter:jar:3.3.6:test - omitted for duplicate)
+   \- org.springframework.boot:spring-boot-test:jar:3.3.6:test
+      \- (org.springframework.boot:spring-boot:jar:3.3.6:test - omitted for duplicate)
+com.example:orders-it:jar:1.0.0
++- org.apache.commons:commons-lang3:jar:3.14.0:compile
++- org.apache.kafka:kafka-clients:jar:3.7.1:compile
+|  \- com.github.luben:zstd-jni:jar:1.5.6-3:runtime
++- org.apache.kafka:kafka-clients:jar:test:3.7.1:test
+|  \- (com.github.luben:zstd-jni:jar:1.5.6-3:test - omitted for duplicate)
+\- com.example:orders-testkit:jar:1.0.0:test
+   \- com.example:orders-common:test-jar:tests:1.0.0:test
+      \- (org.apache.commons:commons-lang3:jar:3.14.0:test - omitted for duplicate)
+"""
+
+VARIANT_ROOT_POM = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>shop-parent</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <modules>
+    <module>orders</module>
+    <module>orders-it</module>
+  </modules>
+</project>
+"""
+
+VARIANT_ORDERS_POM = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>shop-parent</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <artifactId>orders</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>orders-common</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>orders-common</artifactId>
+      <version>1.0.0</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-transport-native-epoll</artifactId>
+      <classifier>linux-x86_64</classifier>
+    </dependency>
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-transport-native-epoll</artifactId>
+      <classifier>linux-aarch_64</classifier>
+      <scope>runtime</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-observation-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
+"""
+
+VARIANT_IT_POM = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>shop-parent</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <artifactId>orders-it</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-lang3</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.kafka</groupId>
+      <artifactId>kafka-clients</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.kafka</groupId>
+      <artifactId>kafka-clients</artifactId>
+      <classifier>test</classifier>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>orders-testkit</artifactId>
+      <version>1.0.0</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+  <profiles>
+    <profile>
+      <id>arm64</id>
+      <dependencies>
+        <dependency>
+          <groupId>io.netty</groupId>
+          <artifactId>netty-transport-native-epoll</artifactId>
+          <classifier>linux-aarch_64</classifier>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+</project>
+"""
+
+
+def build_variant_consumer_project(target: Path) -> Path:
+    """The consumer project matching VARIANT_TREE: a root POM with the modules orders and orders-it."""
+    if target.exists():
+        import shutil
+
+        shutil.rmtree(target)
+    for module, pom in (("orders", VARIANT_ORDERS_POM), ("orders-it", VARIANT_IT_POM)):
+        (target / module).mkdir(parents=True)
+        (target / module / "pom.xml").write_text(pom, encoding="utf-8")
+    (target / "pom.xml").write_text(VARIANT_ROOT_POM, encoding="utf-8")
+    return target
+
+
 if __name__ == "__main__":
     target = Path(sys.argv[1] if len(sys.argv) > 1 else "fixture")
     libs = build_libs(target / "libs")

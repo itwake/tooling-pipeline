@@ -174,6 +174,24 @@ def main() -> None:
                     e["plugin"], e.get("action"), len(e.get("remove_declared") or {}), len(e.get("declared_exclusions") or {}),
                     len(e.get("redeclare") or {}), ", ".join("`%s`" % ga for ga in (e.get("shadowed") or {})) or "none",
                     (": " + e["reason"]) if e.get("reason") else ""))
+        drift = patch.get("version_drift") or []
+        if drift:
+            md += ["", "Version drift between the consumer and the bundle: after the switch the embedded libraries run at the bundle's versions, everything else keeps the consumer's."]
+            for d in drift:
+                where = ", ".join(d.get("modules") or [])
+                if d.get("kind") == "embedded":
+                    md.append("- WARNING: `%s` resolved at %s by the consumer, the bundle embeds %s (%s)" % (d["coordinate"], d["version"], d["bundle_version"], where))
+                else:
+                    md.append("- WARNING: `%s` %s (%s scope) belongs to `%s`, embedded at %s (%s)" % (
+                        d["coordinate"], d["version"], d.get("scope"), d.get("train"), d["bundle_version"], where))
+        variants = [(m["module"], k, k in (m.get("redeclare") or {})) for m in patch.get("modules") or [] for k in (m.get("test_variants") or {})]
+        if variants:
+            md += ["", "Test jars under another classifier of an embedded coordinate, not inside the bundle: " + ", ".join(
+                "`%s` in %s (%s)" % (k, mod, "declared directly with test scope" if redeclared else "kept") for mod, k, redeclared in variants)]
+        for m in patch.get("modules") or []:
+            for k, v in (m.get("other_variants") or {}).items():
+                md.append("- WARNING: `%s` %s (%s scope) in %s goes with the embedded coordinate although the bundle does not contain it" % (
+                    k, v.get("version"), v.get("scope"), m["module"]))
         md.append("")
     if applied:
         md += ["## Consumer POMs %s" % ("(dry run)" if applied.get("dry_run") else "changed"), "", "- Branch: `%s`" % applied.get("branch")]
@@ -187,6 +205,11 @@ def main() -> None:
                 plugin.get("version"), (": " + "; ".join(plugin["notes"])) if plugin.get("notes") else ""))
         for p in applied.get("plugins") or []:
             md.append("- plugin `%s`: %s%s" % (p["plugin"], p.get("action"), ("; " + "; ".join(p["notes"])) if p.get("notes") else ""))
+        tv = applied.get("test_variants") or {}
+        for k in tv.get("declared") or []:
+            md.append("- test jar declared with test scope: %s" % k)
+        for k in tv.get("kept") or []:
+            md.append("- test jar kept: %s" % k)
         md.append("")
     if plugin_check:
         md += ["## Plugin dependency check: %s" % (

@@ -37,21 +37,28 @@ from collections import OrderedDict, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pomedit  # noqa: E402
 from bundlelib import (  # noqa: E402
     BUNDLE_BOOT_ATTR,
     BUNDLE_CONTENTS_ATTR,
+    embedded_variants,
     fail,
     ga_str,
     gav_str,
     identify_gav,
+    is_test_variant,
     log,
+    node_classifier,
     parse_dependency_trees,
     parse_selection_text,
     read_json,
     read_manifest,
+    test_variant_include,
+    variant_key,
     write_json,
 )
 from identify import SYNTHETIC_GROUP, synthetic_hint  # noqa: E402
+from resolve_selection import family_of  # noqa: E402
 
 ENFORCER = """<plugin>
   <groupId>org.apache.maven.plugins</groupId>
@@ -68,7 +75,7 @@ ENFORCER = """<plugin>
           <bannedDependencies>
             <excludes>
 %s
-            </excludes>
+            </excludes>%s
             <message>%s</message>
           </bannedDependencies>
         </rules>
@@ -179,12 +186,19 @@ def plugin_policy(path) -> dict:
     return policy
 
 
-def hit_ga(node, embedded_ga, hints, resolved):
+def hit_ga(node, embedded_ga, hints, resolved, variants=None):
     """groupId:artifactId when the node is an embedded coordinate, by coordinates or through a synthetic
-    hint (artifactId and, when known, version); the hint's real coordinates are recorded in resolved."""
+    hint (artifactId and, when known, version); the hint's real coordinates are recorded in resolved.
+    With variants (bundlelib.embedded_variants) a test-scope jar under a classifier the bundle does not
+    embed is no hit (bundlelib.is_test_variant), and a synthetic hint never stands for a classified test
+    jar: it describes one of the application's own jars."""
     ga = ga_str(node)
     if ga in embedded_ga:
+        if variants is not None and is_test_variant(node, variants):
+            return None
         return ga
+    if variants is not None and node_classifier(node) and (node.get("scope") or "") == "test":
+        return None
     hit = next((h for h in (hints or []) if h["artifactId"] == node["artifactId"]
                 and (not h.get("version") or h["version"] == node.get("version"))), None)
     if hit is None:
@@ -218,43 +232,159 @@ def promoted_dispositions(nodes, matched, promoted_ga, what="module"):
     return exclusions, kept
 
 
-def analyse_trees(texts, embedded_ga, hints=None, resolved=None, promoted_ga=None):
+def descendants(nodes, i):
+    """Indexes of the nodes below nodes[i]; the tree is in pre-order."""
+    depth, j, out = nodes[i]["depth"], i + 1, []
+    while j < len(nodes) and nodes[j]["depth"] > depth:
+        out.append(j)
+        j += 1
+    return out
+
+
+def analyse_trees(texts, embedded_ga, hints=None, resolved=None, promoted_ga=None, variants=None, embedded=None, families=None):
     """Modules with the changes they need. Nodes matching a synthetic hint (artifactId and, when
     known, version) count as embedded too; their real coordinates are recorded in `resolved`.
 
     promoted_ga: transitive dependencies the bundle POM still declares. Per module each one is
     either excluded on the bundle dependency (the module never had it, already reaches it through a
     path without embedded coordinates, or only in test/provided scope) or kept (reachable only
-    through an embedded coordinate: once the exclusions are in place the bundle is its only path)."""
-    modules = []
+    through an embedded coordinate: once the exclusions are in place the bundle is its only path).
+
+    variants (bundlelib.embedded_variants): the classifiers embedded under each groupId:artifactId. A
+    test-scope jar under another classifier (test-jar, tests, test...) is not inside the bundle and is no
+    hit: it is kept (`test_variants`), and when every path to it is cut, by a deleted direct dependency or
+    by an exclusion (Maven excludes a groupId:artifactId whatever the classifier), it is listed under
+    `redeclare`, to be declared directly with test scope. Under another classifier outside test scope a
+    jar still counts as the embedded coordinate, since such variants usually hold the same classes, and
+    is listed under `other_variants`.
+
+    embedded (the bundle's coordinates) and families (policy.json) add `drift` per module: see
+    drift_in_tree."""
     resolved = resolved if resolved is not None else {}
+    parsed = []
     for text in texts:
         for tree in parse_dependency_trees(text):
-            root = tree["root"]
-            module = {"module": ga_str(root), "remove_direct": OrderedDict(), "exclusions": OrderedDict(), "paths": [],
-                      "bundle_exclusions": OrderedDict(), "promoted_kept": OrderedDict(),
-                      "direct": list(OrderedDict.fromkeys(ga_str(n) for n in tree["nodes"] if n["depth"] == 1))}
-            matched = set()
-            for node in tree["nodes"]:
-                ga = hit_ga(node, embedded_ga, hints, resolved)
-                if ga is None:
-                    continue
-                matched.add(ga)
-                path = node["path"]
-                module["paths"].append(" -> ".join(path[1:]) + (" (%s)" % node["note"] if node.get("note") else ""))
-                if node["depth"] == 1:
-                    module["remove_direct"].setdefault(ga, {"scope": node.get("scope"), "version": node.get("version")})
-                else:
-                    direct = path[1]
-                    entry = module["exclusions"].setdefault(direct, {"version": None, "targets": []})
-                    if ga not in entry["targets"]:
-                        entry["targets"].append(ga)
-            for node in tree["nodes"]:
-                if node["depth"] == 1 and ga_str(node) in module["exclusions"]:
-                    module["exclusions"][ga_str(node)]["version"] = node.get("version")
-            module["bundle_exclusions"], module["promoted_kept"] = promoted_dispositions(tree["nodes"], matched, promoted_ga, "module")
-            modules.append(module)
+            nodes = tree["nodes"]
+            hits = [hit_ga(n, embedded_ga, hints, resolved, variants) for n in nodes]
+            tops, top = [], None
+            for i, n in enumerate(nodes):
+                if n["depth"] == 1 or top is None:
+                    top = i
+                tops.append(top)
+            parsed.append((tree, hits, tops))
+    modules = []
+    # what the exclusions take away below each direct dependency, over all modules: a declaration in a
+    # parent POM carries them into every module that inherits it
+    cut = defaultdict(set)
+    for tree, hits, tops in parsed:
+        nodes = tree["nodes"]
+        module = {"module": ga_str(tree["root"]), "remove_direct": OrderedDict(), "exclusions": OrderedDict(), "paths": [],
+                  "bundle_exclusions": OrderedDict(), "promoted_kept": OrderedDict(),
+                  "test_variants": OrderedDict(), "redeclare": OrderedDict(), "other_variants": OrderedDict(), "drift": [],
+                  "direct": list(OrderedDict.fromkeys(ga_str(n) for n in nodes if n["depth"] == 1))}
+        matched = set()
+        for i, node in enumerate(nodes):
+            ga = hits[i]
+            if ga is None:
+                continue
+            matched.add(ga)
+            path = node["path"]
+            module["paths"].append(" -> ".join(path[1:]) + (" (%s)" % node["note"] if node.get("note") else ""))
+            if variants is not None and ga in variants and node_classifier(node) not in variants[ga]:
+                module["other_variants"].setdefault(variant_key(node), {
+                    "version": node.get("version"), "scope": node.get("scope") or "compile", "path": " -> ".join(path[1:])})
+            if node["depth"] == 1:
+                module["remove_direct"].setdefault(ga, {"scope": node.get("scope"), "version": node.get("version")})
+            elif hits[tops[i]] is None:  # below a deleted direct dependency the path goes away with it
+                entry = module["exclusions"].setdefault(path[1], {"version": None, "targets": []})
+                if ga not in entry["targets"]:
+                    entry["targets"].append(ga)
+        for node in nodes:
+            if node["depth"] == 1 and ga_str(node) in module["exclusions"]:
+                module["exclusions"][ga_str(node)]["version"] = node.get("version")
+        for direct, entry in module["exclusions"].items():
+            cut[direct].update(entry["targets"])
+        module["bundle_exclusions"], module["promoted_kept"] = promoted_dispositions(nodes, matched, promoted_ga, "module")
+        modules.append(module)
+    if variants is None:
+        return modules
+    known = dict(variants)
+    for real in resolved.values():
+        known.setdefault(real, {None})
+    for module, (tree, hits, tops) in zip(modules, parsed):
+        nodes = tree["nodes"]
+        occurrences = OrderedDict()
+        for i, n in enumerate(nodes):
+            if hits[i] is None and is_test_variant(n, known):
+                occurrences.setdefault(variant_key(n), []).append(i)
+        for key, idxs in occurrences.items():
+            winner = next((i for i in idxs if not nodes[i]["omitted"]), idxs[0])
+            w = nodes[winner]
+            survivors = [i for i in idxs if nodes[i]["depth"] == 1 or (
+                hits[tops[i]] is None and not any(ga in cut[nodes[i]["path"][1]] for ga in nodes[i]["path"][2:]))]
+            info = {"groupId": w["groupId"], "artifactId": w["artifactId"], "classifier": node_classifier(w),
+                    "type": w.get("type") or "jar", "version": w.get("version"),
+                    "declared": any(nodes[i]["depth"] == 1 for i in idxs), "path": " -> ".join(w["path"][1:]),
+                    "kept_through": " -> ".join(nodes[survivors[0]]["path"][1:]) if survivors else None}
+            module["test_variants"][key] = info
+            if survivors:
+                continue
+            direct, excluded = tops[winner], None
+            if hits[direct] is not None:
+                reason = "%s, which brought it, is deleted (it is inside the bundle)" % ga_str(nodes[direct])
+            else:
+                excluded = next(ga for ga in w["path"][2:] if ga in cut[w["path"][1]])
+                reason = "the exclusion of %s on %s removes it as well: Maven excludes by groupId:artifactId, whatever the classifier" % (
+                    excluded, ga_str(nodes[direct]))
+            targets = []
+            for j in descendants(nodes, winner):
+                if hits[j] and hits[j] not in targets:
+                    targets.append(hits[j])
+            module["redeclare"][key] = dict(info, scope="test", exclusions=targets, reason=reason, via=ga_str(nodes[direct]),
+                                            cut_by=excluded, after=ga_str(nodes[direct]) if hits[direct] is None else None)
+    if embedded is not None:
+        for module, (tree, hits, tops) in zip(modules, parsed):
+            module["drift"] = drift_in_tree(tree["nodes"], hits, embedded, families or {}, known)
     return modules
+
+
+def drift_in_tree(nodes, hits, embedded, families, known):
+    """Versions in one module's tree that will not match the bundle after the switch. After it the
+    embedded libraries run at the bundle's versions while everything else keeps the consumer's:
+
+      embedded  an embedded coordinate the module resolves at another version
+      train     a jar outside the bundle from a release train the bundle embeds, at another version
+                (spring-boot-test or spring-test next to the bundle's Spring Boot and Spring Framework,
+                a test jar of an embedded coordinate). A train is a groupId whose embedded jars all share
+                one version, that is a policy family or holds at least two of them."""
+    versions, trains, size = {}, defaultdict(set), defaultdict(int)
+    for g in embedded:
+        if g.get("groupId") == SYNTHETIC_GROUP or not g.get("version"):
+            continue
+        versions[(ga_str(g), g.get("classifier") or None)] = g["version"]
+        versions.setdefault((ga_str(g), "*"), g["version"])
+        trains[g["groupId"]].add(g["version"])
+        size[g["groupId"]] += 1
+    out = []
+    for i, n in enumerate(nodes):
+        v = n.get("version")
+        if n.get("omitted") or not v:
+            continue
+        ga, scope = ga_str(n), n.get("scope") or "compile"
+        if hits[i]:
+            bv = versions.get((ga, node_classifier(n))) or versions.get((ga, "*"))
+            if hits[i] == ga and bv and v != bv:
+                out.append({"kind": "embedded", "coordinate": variant_key(n), "version": v, "bundle_version": bv, "scope": scope})
+            continue
+        if ga in known:
+            bv, train = versions.get((ga, "*")), ga
+        elif len(trains.get(n["groupId"], ())) == 1 and (family_of(n["groupId"], families) or size[n["groupId"]] >= 2):
+            bv, train = next(iter(trains[n["groupId"]])), n["groupId"]
+        else:
+            continue
+        if bv and v != bv:
+            out.append({"kind": "train", "coordinate": variant_key(n), "version": v, "bundle_version": bv, "scope": scope, "train": train})
+    return out
 
 
 def classify_plugin_tree(tree, plugin_ga, embedded_ga, hints=None, resolved=None):
@@ -382,6 +512,46 @@ def exclusion_snippet(direct_ga: str, targets, version) -> str:
     return "\n".join(lines)
 
 
+def policy_families(path) -> dict:
+    """The families section of policy.json: groupId prefixes that share one release train."""
+    try:
+        return read_json(Path(path)).get("families") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def variant_snippet(v: dict) -> str:
+    return pomedit.dependency_xml(v["groupId"], v["artifactId"], v.get("version"), "test", v.get("type"), v.get("classifier"), v.get("exclusions") or [])
+
+
+def collect_drift(modules) -> list:
+    """The modules' drift entries, one per coordinate and version, with the modules that show it."""
+    found = OrderedDict()
+    for m in modules:
+        for d in m.get("drift") or []:
+            e = found.setdefault((d["kind"], d["coordinate"], d["version"]), dict(d, modules=[]))
+            if m["module"] not in e["modules"]:
+                e["modules"].append(m["module"])
+    return sorted(found.values(), key=lambda d: (d["kind"] != "embedded", d["coordinate"], d["version"]))
+
+
+def drift_text(d: dict) -> str:
+    where = ", ".join(d.get("modules") or [])
+    if d["kind"] == "embedded":
+        return "`%s`: the consumer resolves %s, the bundle embeds %s (%s)" % (d["coordinate"], d["version"], d["bundle_version"], where)
+    return "`%s` %s (%s scope) belongs to `%s`, which the bundle embeds at %s (%s)" % (
+        d["coordinate"], d["version"], d["scope"], d["train"], d["bundle_version"], where)
+
+
+def drift_advice(drift, boot_version) -> str:
+    spring = boot_version and any(d["coordinate"].startswith("org.springframework") for d in drift)
+    return ("After the switch the embedded libraries run at the bundle's versions, while everything outside the bundle, test "
+            "libraries included, keeps the versions the consumer manages. A library run against other versions of the classes "
+            "it was built for typically fails with NoClassDefFoundError or NoSuchMethodError, often in the tests only. Align the "
+            "consumer with the bundle%s, or rebuild the bundle from an application built at the consumer's versions." % (
+                " (Spring Boot parent or BOM %s)" % boot_version if spring else ""))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manifest", default="out/bundle-manifest.json", help="bundle manifest written by gen_bundle_project.py")
@@ -397,6 +567,7 @@ def main() -> None:
                     help="policy.json; its plugins section says how to treat plugins whose own direct dependencies are embedded")
     ap.add_argument("--out", default="out/consumer-patch.md")
     ap.add_argument("--out-json", default="out/consumer-patch.json")
+    ap.add_argument("--findings-out", default="", help="findings one per line: [drift], [variant], [info] (default: <out-json>-findings.txt)")
     args = ap.parse_args()
 
     if args.bundle_jar:
@@ -414,6 +585,7 @@ def main() -> None:
     embedded = [c["gav"] for c in man["components"]]
     synthetic = [(g, synthetic_hint(g)) for g in embedded if g.get("groupId") == SYNTHETIC_GROUP]
     embedded_ga = {ga_str(g) for g in embedded if g.get("groupId") != SYNTHETIC_GROUP}
+    variants = embedded_variants(embedded, SYNTHETIC_GROUP)
     boot_version = man.get("spring_boot_version")
     boot_embedded = "org.springframework.boot:spring-boot" in embedded_ga
     boot_excludes = boot_line_excludes(boot_version) if boot_version and not boot_embedded else []
@@ -430,7 +602,8 @@ def main() -> None:
         else:
             log("WARN: tree file not found: %s" % t)
     resolved_synthetic = {}
-    modules = analyse_trees(texts, embedded_ga, [h for _, h in synthetic], resolved_synthetic, promoted_ga) if texts else []
+    modules = analyse_trees(texts, embedded_ga, [h for _, h in synthetic], resolved_synthetic, promoted_ga,
+                            variants, embedded, policy_families(args.policy)) if texts else []
     plugin_texts = []
     for t in args.plugin_tree:
         p = Path(t)
@@ -446,6 +619,10 @@ def main() -> None:
     plugin_entries, plugins_clean = analyse_plugin_trees(plugin_texts, plugins_map, embedded_ga, [h for _, h in synthetic],
                                                          resolved_synthetic, promoted_ga, policy) if plugins_checked else ([], 0)
     banned_ga = sorted(embedded_ga | set(resolved_synthetic.values()))
+    # test jars that share a banned groupId:artifactId under a classifier the bundle does not embed
+    includes = sorted({test_variant_include(v["groupId"], v["artifactId"], v["classifier"]) for m in modules
+                       for v in m["test_variants"].values() if v.get("classifier") and ga_str(v) in banned_ga})
+    drift = collect_drift(modules)
 
     includes_arg = ",".join(banned_ga)
     md = []
@@ -466,7 +643,7 @@ def main() -> None:
         for m in modules:
             md.append("### Module %s" % m["module"])
             md.append("")
-            if not m["paths"]:
+            if not m["paths"] and not m["test_variants"]:
                 md.append("No embedded coordinate appears in this module's dependency tree; nothing to change.")
                 md.append("")
                 continue
@@ -482,6 +659,24 @@ def main() -> None:
                 for direct, info in m["exclusions"].items():
                     md.append("```xml\n%s\n```" % exclusion_snippet(direct, info["targets"], info.get("version")))
                     md.append("")
+            if m["redeclare"]:
+                md.append("Declare these test jars directly. They share groupId:artifactId with an embedded coordinate under another classifier, so the bundle does not contain them, and the changes above would take them away:")
+                md.append("")
+                for key, v in m["redeclare"].items():
+                    md.append("- `%s` %s: %s" % (key, v["version"], v["reason"]))
+                md.append("")
+                for key, v in m["redeclare"].items():
+                    md.append("```xml\n%s\n```" % variant_snippet(v))
+                    md.append("")
+            kept = [(k, v) for k, v in m["test_variants"].items() if k not in m["redeclare"]]
+            if kept:
+                md.append("Test jars that stay as they are (same groupId:artifactId as an embedded coordinate, another classifier, not inside the bundle): " + ", ".join(
+                    "`%s` %s (%s)" % (k, v["version"], "declared directly" if v["declared"] else "through " + v["kept_through"]) for k, v in kept))
+                md.append("")
+            if m["other_variants"]:
+                md.append("Taken away with the embedded coordinate although the bundle does not contain them (another classifier outside test scope; Maven exclusions and the Enforcer only see groupId:artifactId). Check that the module does not need them: " + ", ".join(
+                    "`%s` %s (%s scope)" % (k, v["version"], v["scope"]) for k, v in m["other_variants"].items()))
+                md.append("")
             if m["bundle_exclusions"]:
                 md.append("The bundle POM still declares transitive dependencies this module must not take from the bundle; add the bundle dependency with these exclusions:")
                 md.append("")
@@ -509,6 +704,19 @@ def main() -> None:
         md.append("")
         md.append("```bash\nmvn dependency:tree -Dverbose -Dincludes=%s\n```" % includes_arg)
         md.append("")
+        md.append("Test jars that share groupId:artifactId with an embedded coordinate under another classifier (`<type>test-jar</type>`, classifier `tests` or `test`) are not inside the bundle: keep them. Maven excludes by groupId:artifactId whatever the classifier, so where an exclusion takes one away, declare it directly with `<scope>test</scope>`, and let it through the Enforcer rule with an include such as `groupId:artifactId:*:*:test:tests`.")
+        md.append("")
+
+    if drift:
+        md.append("## Version drift between the consumer and the bundle")
+        md.append("")
+        md.append("The dependency tree resolves these at other versions than the bundle:")
+        md.append("")
+        for d in drift:
+            md.append("- " + drift_text(d))
+        md.append("")
+        md.append(drift_advice(drift, boot_version))
+        md.append("")
 
     if synthetic:
         md.append("## Jars embedded under synthetic coordinates")
@@ -534,8 +742,13 @@ def main() -> None:
         message += " Spring Boot outside the %s.x line needs a rebuilt bundle." % ".".join(boot_version.split(".")[:2])
     md.append("## 3. Enforcer gate (put it in the parent POM's build/plugins so every module inherits it)")
     md.append("")
-    md.append("```xml\n%s\n```" % (ENFORCER % ("\n".join(excludes), message)))
+    includes_block = ("\n            <includes>\n%s\n            </includes>" % "\n".join(
+        "              <include>%s</include>" % i for i in includes)) if includes else ""
+    md.append("```xml\n%s\n```" % (ENFORCER % ("\n".join(excludes), includes_block, message)))
     md.append("")
+    if includes:
+        md.append("The includes let the test jars of section 2 through: each pattern (groupId:artifactId:version:type:scope:classifier) admits one classifier in test scope only, so the embedded jars stay banned in every scope.")
+        md.append("")
 
     md.append("## 4. Spring Boot version")
     md.append("")
@@ -619,9 +832,12 @@ def main() -> None:
         "boot_line_excludes": boot_excludes,
         "synthetic": [{"gav": g, "hint": h, "resolved": resolved_synthetic.get(h["artifactId"]) if h else None} for g, h in synthetic],
         "banned": banned_ga,
+        "enforcer_includes": includes,
+        "version_drift": drift,
         "modules": [{"module": m["module"], "remove_direct": m["remove_direct"], "exclusions": m["exclusions"],
                      "bundle_exclusions": m["bundle_exclusions"], "promoted_kept": m["promoted_kept"], "paths": m["paths"],
-                     "direct": m["direct"]} for m in modules],
+                     "test_variants": m["test_variants"], "redeclare": m["redeclare"], "other_variants": m["other_variants"],
+                     "drift": m["drift"], "direct": m["direct"]} for m in modules],
         "promoted_dependencies": promoted,
         "tree_provided": bool(texts),
         "plugins": plugin_entries,
@@ -629,11 +845,29 @@ def main() -> None:
         "plugin_tree_provided": plugins_checked,
         "plugin_policy": policy,
     })
+    findings = ["[drift] " + drift_text(d).replace("`", "") for d in drift]
+    for m in modules:
+        for k, v in m["other_variants"].items():
+            findings.append("[variant] %s: %s %s (%s scope) goes with the embedded %s although the bundle does not contain it: check that the module does not need it" % (
+                m["module"], k, v["version"], v["scope"], ":".join(k.split(":")[:2])))
+        for k, v in m["redeclare"].items():
+            findings.append("[info] %s: test jar %s %s re-declared with test scope, %s" % (m["module"], k, v["version"], v["reason"]))
+        for k, v in m["test_variants"].items():
+            if k not in m["redeclare"]:
+                findings.append("[info] %s: test jar %s %s kept, the bundle does not contain it" % (m["module"], k, v["version"]))
+    findings_path = Path(args.findings_out) if args.findings_out else Path(args.out_json).with_name(Path(args.out_json).stem + "-findings.txt")
+    findings_path.parent.mkdir(parents=True, exist_ok=True)
+    findings_path.write_text("".join(f + "\n" for f in findings), encoding="utf-8")
+
     log("Consumer patch proposal written to %s" % args.out)
     for m in modules:
-        log("  %s: remove %d direct, exclusions on %d direct dependencies, %d paths%s" % (
+        log("  %s: remove %d direct, exclusions on %d direct dependencies, %d paths%s%s" % (
             m["module"], len(m["remove_direct"]), len(m["exclusions"]), len(m["paths"]),
-            (", exclude on the bundle: %s" % ", ".join(m["bundle_exclusions"])) if m["bundle_exclusions"] else ""))
+            (", exclude on the bundle: %s" % ", ".join(m["bundle_exclusions"])) if m["bundle_exclusions"] else "",
+            (", test jars kept %d, re-declared %d" % (len(m["test_variants"]) - len(m["redeclare"]), len(m["redeclare"]))) if m["test_variants"] else ""))
+    for f in findings:
+        if not f.startswith("[info]"):
+            log("  WARN: %s" % f)
     if plugins_checked:
         log("  build plugins: %d with an embedded coordinate in their dependency tree (%d to patch, %d skipped), %d without" % (
             len(plugin_entries), sum(1 for e in plugin_entries if e["action"] == "patch"), sum(1 for e in plugin_entries if e["action"] != "patch"), plugins_clean))

@@ -40,7 +40,7 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pomedit  # noqa: E402
-from bundlelib import fail, log, read_json, write_json  # noqa: E402
+from bundlelib import embedded_variants, fail, log, read_json, test_variant_include, write_json  # noqa: E402
 
 ENFORCER_PLUGIN = """<plugin>
   <groupId>org.apache.maven.plugins</groupId>
@@ -61,7 +61,7 @@ ENFORCER_EXECUTION = """<execution>
       <bannedDependencies>
         <excludes>
 %s
-        </excludes>
+        </excludes>%s
         <message>%s</message>
       </bannedDependencies>
     </rules>
@@ -145,13 +145,40 @@ def declarations(pom: Pom, poms: Dict[str, Pom], g: str, a: str):
     return found
 
 
-def remove_dependency(pom: Pom, poms: Dict[str, Pom], ga: str, removed: set, warnings: List[str]) -> None:
+def declared_classifier(owner: Pom, poms: Dict[str, Pom], dep) -> Tuple[Optional[str], bool]:
+    """Classifier of a declaration (a test-jar is the tests classifier) and whether it is known: a property
+    the checkout does not define, such as ${os.detected.classifier}, leaves it unknown."""
+    text = dep.child_text(owner.src, "classifier")
+    if text:
+        value = resolve_property(owner, poms, text) if "${" in text else text
+        return value, value is not None
+    return ("tests", True) if dep.child_text(owner.src, "type") == "test-jar" else (None, True)
+
+
+def keeps_test_variant(owner: Pom, poms: Dict[str, Pom], dep, ga: str, variants: Dict[str, set], seen: set) -> bool:
+    """A declaration of an embedded groupId:artifactId that is a test jar the bundle does not contain:
+    another classifier than the embedded ones (a test-jar, the tests or test classifier...) in test scope,
+    declared so or shown so by the dependency tree (seen: the module's test_variants)."""
+    embedded = variants.get(ga)
+    if embedded is None:
+        return False
+    classifier, known = declared_classifier(owner, poms, dep)
+    if known and classifier in embedded:
+        return False
+    if known and classifier and "%s:%s" % (ga, classifier) in seen:
+        return True
+    return (dep.child_text(owner.src, "scope") or "") == "test"
+
+
+def remove_dependency(pom: Pom, poms: Dict[str, Pom], ga: str, removed: set, warnings: List[str], keep=None) -> List[str]:
     """Delete every declaration of a replaced coordinate the module sees. The Enforcer bans it whatever
-    the active profiles, so one left in an inactive profile would fail the build the day it is used."""
+    the active profiles, so one left in an inactive profile would fail the build the day it is used.
+    keep(owner, dep) spares the test jars of that groupId:artifactId the bundle does not contain; they
+    are returned, as groupId:artifactId:classifier and where they are declared."""
     g, a = ga.split(":", 1)
     found = False
     while True:
-        decls = declarations(pom, poms, g, a)
+        decls = [d for d in declarations(pom, poms, g, a) if not (keep and keep(d[0], d[2]))]
         if not decls:
             break
         owner, place, dep = decls[0]
@@ -160,8 +187,11 @@ def remove_dependency(pom: Pom, poms: Dict[str, Pom], ga: str, removed: set, war
         owner.actions.append("removed dependency %s%s" % (ga, (" from %s" % place) if place else ""))
         found = True
         removed.add(ga)
-    if not found and ga not in removed:
+    kept = ["%s:%s in %s%s" % (ga, declared_classifier(o, poms, d)[0] or "?", o.ga, (" %s" % place) if place else "")
+            for o, place, d in declarations(pom, poms, g, a) if keep and keep(o, d)]
+    if not found and ga not in removed and not kept:
         warnings.append("%s: direct dependency %s not found in the POM, its profiles or its parents inside the checkout (removed by an earlier run, or declared in a parent POM outside the checkout?)" % (pom.ga, ga))
+    return kept
 
 
 def ensure_exclusions(owner: Pom, dep, targets: List[str]) -> List[str]:
@@ -193,6 +223,59 @@ def add_exclusions(pom: Pom, poms: Dict[str, Pom], direct_ga: str, targets: List
         added = ensure_exclusions(owner, dep, targets)
         if added:
             owner.actions.append("excluded %s from %s%s" % (", ".join(added), direct_ga, (" in %s" % place) if place else ""))
+
+
+def declared_test_variants(poms: Dict[str, Pom], variants: Dict[str, set]) -> List[str]:
+    """Enforcer includes for every test jar the POMs declare under a classifier the bundle does not embed,
+    profiles included: the dependency tree only showed the profiles that were active."""
+    found = set()
+    for p in poms.values():
+        deps = p.root.child("dependencies")
+        decls = (deps.children_named("dependency") if deps is not None else []) + [d for _, d in pomedit.profile_dependencies(p.root, p.src)]
+        for d in decls:
+            g, a = pomedit.dependency_ga(d, p.src, p.group)
+            ga = "%s:%s" % (g, a)
+            if ga in variants and (d.child_text(p.src, "scope") or "") == "test":
+                c, known = declared_classifier(p, poms, d)
+                if known and c and c not in variants[ga]:
+                    found.add(test_variant_include(g, a, c))
+    return sorted(found)
+
+
+def redeclare_variant(pom: Pom, poms: Dict[str, Pom], entry: dict) -> bool:
+    """Declare a test jar directly, with test scope, when the changes cut every path that brought it: it
+    shares groupId:artifactId with an embedded coordinate, and Maven excludes that whatever the
+    classifier. It goes right after the dependency that brought it, where that one is declared (its main
+    declaration first), else at the end of the module's dependencies. False when it is declared already."""
+    g, a, classifier = entry["groupId"], entry["artifactId"], entry.get("classifier")
+    for owner, _, dep in declarations(pom, poms, g, a):
+        c, known = declared_classifier(owner, poms, dep)
+        if known and c == classifier:
+            return False
+    target = None
+    if entry.get("after"):
+        decls = declarations(pom, poms, *entry["after"].split(":", 1))
+        target = next((d for d in decls if d[1] == ""), decls[0] if decls else None)
+    if entry.get("cut_by") and entry.get("after"):
+        why = "the exclusion of %s on %s removes this test jar too" % (entry["cut_by"], entry["after"])
+    else:
+        why = "%s, which brought this test jar, is inside the bundle" % (entry.get("via") or "the dependency")
+    block = pomedit.dependency_xml(g, a, entry.get("version"), "test", entry.get("type"), classifier, entry.get("exclusions") or [],
+                                   comment="mvn-rebundle: " + why)
+    if target is not None:
+        owner, place, dep = target
+        owner.src = pomedit.insert_after(owner.src, dep, block, owner.root)
+    else:
+        owner, place = pom, ""
+        if pom.root.child("dependencies") is None:
+            pom.src, _ = pomedit.ensure_child(pom.src, ["dependencies"], {})
+            pom.reparse()
+        pom.src = pomedit.insert_child(pom.src, pom.root.child("dependencies"), block, pom.root)
+    owner.reparse()
+    owner.actions.append("declared test jar %s:%s:%s %s with test scope%s%s (%s)" % (
+        g, a, classifier, entry.get("version"), (" after %s" % entry["after"]) if target is not None else "",
+        (" in %s" % place) if place else "", why))
+    return True
 
 
 def profile_dependencies_unseen(pom: Pom, poms: Dict[str, Pom], project: Path, direct: List[str], skip: set) -> List[str]:
@@ -547,7 +630,8 @@ def apply_plugin_entry(entry: dict, poms: Dict[str, Pom], root_pom: Pom, bundle:
     return report
 
 
-def install_enforcer(root_pom: Pom, banned: List[str], boot_excludes: List[str], coordinate: str, boot_version: Optional[str]) -> None:
+def install_enforcer(root_pom: Pom, banned: List[str], boot_excludes: List[str], coordinate: str, boot_version: Optional[str],
+                     includes: Optional[List[str]] = None) -> None:
     excludes = ["<exclude>%s</exclude>" % ga for ga in banned]
     if boot_excludes:
         excludes.append("<!-- the bundle was built from Spring Boot %s: stay on that minor line or rebuild the bundle -->" % boot_version)
@@ -556,7 +640,10 @@ def install_enforcer(root_pom: Pom, banned: List[str], boot_excludes: List[str],
         coordinate, ",".join(banned))
     if boot_excludes:
         message += " Spring Boot outside the %s.x line needs a rebuilt bundle." % ".".join((boot_version or "").split(".")[:2])
-    execution = ENFORCER_EXECUTION % ("\n".join("          " + e for e in excludes), xml_escape(message))
+    # test jars that share a banned groupId:artifactId under a classifier the bundle does not embed
+    includes_block = ("\n        <includes>\n%s\n        </includes>" % "\n".join(
+        "          <include>%s</include>" % i for i in includes)) if includes else ""
+    execution = ENFORCER_EXECUTION % ("\n".join("          " + e for e in excludes), includes_block, xml_escape(message))
 
     root_pom.src, plugins = pomedit.ensure_child(root_pom.src, ["build", "plugins"], {})
     root_pom.reparse()
@@ -619,18 +706,29 @@ def main() -> None:
     warnings: List[str] = []
     touched: List[Pom] = []
     removed: set = set()
+    variants = embedded_variants(patch.get("embedded") or [])
+    kept_variants: List[str] = []
+    declared_variants: List[str] = []
     for module in patch.get("modules", []):
-        if not module.get("remove_direct") and not module.get("exclusions"):
+        changes = bool(module.get("remove_direct") or module.get("exclusions"))
+        if not changes and not module.get("redeclare"):
             continue
         pom = poms.get(module["module"])
         if pom is None:
             warnings.append("module %s has changes in the proposal but no pom.xml was found for it" % module["module"])
             continue
-        touched.append(pom)
+        seen = set(module.get("test_variants") or {})
         for ga in module.get("remove_direct", {}):
-            remove_dependency(pom, poms, ga, removed, warnings)
+            kept_variants += remove_dependency(pom, poms, ga, removed, warnings,
+                                               keep=lambda o, d, ga=ga: keeps_test_variant(o, poms, d, ga, variants, seen))
         for direct_ga, info in module.get("exclusions", {}).items():
             add_exclusions(pom, poms, direct_ga, info.get("targets", []), warnings)
+        for key, entry in (module.get("redeclare") or {}).items():
+            if redeclare_variant(pom, poms, entry):
+                declared_variants.append("%s: %s %s" % (pom.ga, key, entry.get("version")))
+        if not changes:
+            continue
+        touched.append(pom)
         add_bundle_dependency(pom, bundle, with_version=not multi_module, exclusions=list(module.get("bundle_exclusions") or {}))
         if module.get("direct") is not None:
             unseen = profile_dependencies_unseen(pom, poms, project, module["direct"], set(banned) | {bundle_ga})
@@ -645,7 +743,8 @@ def main() -> None:
     if touched and patch.get("boot_embedded") and patch.get("spring_boot_version"):
         plugin_report = {"version": patch["spring_boot_version"],
                          "notes": align_boot_plugin(touched, poms, project, patch["spring_boot_version"], warnings)}
-    install_enforcer(root_pom, banned, patch.get("boot_line_excludes") or [], patch["coordinate"], patch.get("spring_boot_version"))
+    includes = sorted(set(patch.get("enforcer_includes") or []) | set(declared_test_variants(poms, variants)))
+    install_enforcer(root_pom, banned, patch.get("boot_line_excludes") or [], patch["coordinate"], patch.get("spring_boot_version"), includes)
 
     changed = [p for p in poms.values() if p.changed()]
     diff_chunks = []
@@ -673,6 +772,8 @@ def main() -> None:
         "warnings": warnings,
         "spring_boot_plugin": plugin_report,
         "plugins": plugins_report,
+        "test_variants": {"kept": kept_variants, "declared": declared_variants},
+        "enforcer_includes": includes,
         "dry_run": args.dry_run,
     }
     write_json(args.out, result)
@@ -681,6 +782,10 @@ def main() -> None:
         log("  %s" % p.path.relative_to(project).as_posix())
         for a in p.actions:
             log("    - %s" % a)
+    for k in kept_variants:
+        log("  [test jar] kept %s: the bundle does not contain it" % k)
+    for k in declared_variants:
+        log("  [test jar] declared %s with test scope" % k)
     for w in warnings:
         log("  [WARN] %s" % w)
     for n in (plugin_report or {}).get("notes", []):

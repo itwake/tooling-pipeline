@@ -866,6 +866,105 @@ def main() -> None:
         ok("rebuilt boot archive located and the original artifact remembered",
            Path(found["new_jar"]) == rebuilt and found["old_ref"] == str(app) and found["old_type"] == "file")
 
+        # ---- test jars of embedded coordinates and version drift -----------------------------
+        print("[test jars and version drift]")
+        main_patch = read_json(out / "consumer-patch.json")
+        ok("the sample proposal has no test jar, no drift and no include",
+           main_patch["enforcer_includes"] == [] and main_patch["version_drift"] == []
+           and not any(m["test_variants"] or m["redeclare"] or m["other_variants"] for m in main_patch["modules"]))
+        vout = work / "out-variants"
+        vout.mkdir(parents=True, exist_ok=True)
+        vbundle = {"groupId": "com.company.platform", "artifactId": "orders-thirdparty", "version": "1.0.0"}
+        vcomponents = [{"gav": dict({"groupId": g, "artifactId": a, "version": v}, **({"classifier": c} if c else {}))}
+                       for g, a, v, c in fx.VARIANT_EMBEDDED]
+        write_json(vout / "variant-manifest.json", {"bundle": vbundle, "coordinate": gav_str(vbundle), "components": vcomponents,
+                                                    "reduced_pom": "", "pom": "", "spring_boot_version": "3.3.5"})
+        (vout / "tree.txt").write_text(fx.VARIANT_TREE, encoding="utf-8")
+        run("gen_consumer_patch.py", "--manifest", vout / "variant-manifest.json", "--tree", vout / "tree.txt",
+            "--out", vout / "consumer-patch.md", "--out-json", vout / "consumer-patch.json")
+        vp = read_json(vout / "consumer-patch.json")
+        vm = {m["module"]: m for m in vp["modules"]}
+        orders, orders_it = vm["com.example:orders"], vm["com.example:orders-it"]
+        ok("a test-scope jar under another classifier is no embedded coordinate, a runtime one still is",
+           list(orders["remove_direct"]) == ["org.springframework.kafka:spring-kafka", "com.example:orders-common", "io.netty:netty-transport-native-epoll"]
+           and set(orders["test_variants"]) == {"com.example:orders-common:tests", "org.apache.kafka:kafka-clients:test"}
+           and list(orders["other_variants"]) == ["io.netty:netty-transport-native-epoll:linux-aarch_64"])
+        ok("no exclusions on a deleted direct dependency, the kept test-jar gets the ones below it",
+           "org.springframework.kafka:spring-kafka" not in orders["exclusions"]
+           and orders["exclusions"]["com.example:orders-common"]["targets"] == ["org.apache.commons:commons-lang3"]
+           and orders["exclusions"]["org.springframework.kafka:spring-kafka-test"]["targets"] == [
+               "org.springframework.kafka:spring-kafka", "org.springframework:spring-core", "org.apache.kafka:kafka-clients", "com.github.luben:zstd-jni"])
+        rd = orders["redeclare"].get("org.apache.kafka:kafka-clients:test") or {}
+        ok("a test jar every path to which is cut is re-declared after its dependency, with the exclusions below it",
+           list(orders["redeclare"]) == ["org.apache.kafka:kafka-clients:test"] and rd.get("after") == "org.springframework.kafka:spring-kafka-test"
+           and rd.get("exclusions") == ["com.github.luben:zstd-jni"] and rd.get("version") == "3.7.1" and rd.get("cut_by") == "org.apache.kafka:kafka-clients")
+        ok("declared and still reachable test jars are only kept",
+           not orders_it["redeclare"] and orders_it["test_variants"]["org.apache.kafka:kafka-clients:test"]["declared"]
+           and orders_it["test_variants"]["com.example:orders-common:tests"]["kept_through"] == "com.example:orders-testkit -> com.example:orders-common"
+           and orders_it["exclusions"]["org.apache.kafka:kafka-clients"]["targets"] == ["com.github.luben:zstd-jni"]
+           and orders_it["exclusions"]["com.example:orders-testkit"]["targets"] == ["org.apache.commons:commons-lang3"])
+        ok("the Enforcer rule lets the test jars through in test scope only",
+           vp["enforcer_includes"] == ["com.example:orders-common:*:*:test:tests", "org.apache.kafka:kafka-clients:*:*:test:test"])
+        drift = {(d["kind"], d["coordinate"]): d for d in vp["version_drift"]}
+        boot_test = drift.get(("train", "org.springframework.boot:spring-boot-test")) or {}
+        ok("version drift: embedded coordinates at other versions and jars of an embedded release train, not unrelated groups",
+           set(drift) == {("embedded", "org.springframework.boot:spring-boot"), ("embedded", "org.springframework.boot:spring-boot-autoconfigure"),
+                          ("train", "org.springframework.boot:spring-boot-starter"), ("train", "org.springframework:spring-test"),
+                          ("train", "org.springframework.boot:spring-boot-starter-test"), ("train", "org.springframework.boot:spring-boot-test")}
+           and boot_test.get("bundle_version") == "3.3.5" and boot_test.get("version") == "3.3.6" and boot_test.get("scope") == "test"
+           and drift[("embedded", "org.springframework.boot:spring-boot")]["modules"] == ["com.example:orders"])
+        vfind = (vout / "consumer-patch-findings.txt").read_text(encoding="utf-8").splitlines()
+        vmd = (vout / "consumer-patch.md").read_text(encoding="utf-8")
+        ok("findings and proposal list the drift, the variant and the test jars",
+           sum(1 for f in vfind if f.startswith("[drift]")) == 6 and sum(1 for f in vfind if f.startswith("[variant]")) == 1
+           and any(f.startswith("[info] com.example:orders: test jar org.apache.kafka:kafka-clients:test 3.7.1 re-declared") for f in vfind)
+           and "## Version drift between the consumer and the bundle" in vmd and "Spring Boot parent or BOM 3.3.5" in vmd
+           and "<classifier>test</classifier>" in vmd and "<include>org.apache.kafka:kafka-clients:*:*:test:test</include>" in vmd)
+        vcons = fx.build_variant_consumer_project(work / "consumer-variants")
+        run("apply_consumer_patch.py", "--patch", vout / "consumer-patch.json", "--project", vcons,
+            "--out", vout / "consumer-apply.json", "--diff", vout / "consumer-apply.diff")
+        va = read_json(vout / "consumer-apply.json")
+        opom = (vcons / "orders" / "pom.xml").read_text(encoding="utf-8")
+        ipom = (vcons / "orders-it" / "pom.xml").read_text(encoding="utf-8")
+        rpom = (vcons / "pom.xml").read_text(encoding="utf-8")
+        tj_start = opom.rindex("<dependency>", 0, opom.index("<type>test-jar</type>"))
+        tj = opom[tj_start:opom.index("</dependency>", tj_start)]
+        ok("the test-jar declaration stays with its exclusion, the main jar and both natives go",
+           "commons-lang3" in tj and opom.count("<artifactId>orders-common</artifactId>") == 1
+           and "netty-transport-native-epoll" not in opom)
+        note = "mvn-rebundle: the exclusion of org.apache.kafka:kafka-clients on org.springframework.kafka:spring-kafka-test removes this test jar too"
+        rd_at = opom.find(note)
+        rd_block = opom[rd_at:opom.index("</dependency>", max(rd_at, 0))] if rd_at >= 0 else ""
+        ok("the cut test jar is declared right after spring-kafka-test, with test scope and its exclusion",
+           opom.index("<artifactId>spring-kafka-test</artifactId>") < rd_at < opom.index("micrometer-observation-test")
+           and "<classifier>test</classifier>" in rd_block and "<scope>test</scope>" in rd_block and "<version>3.7.1</version>" in rd_block
+           and "<artifactId>zstd-jni</artifactId>" in rd_block)
+        ok("a declared test classifier stays next to the removed main jar",
+           ipom.count("<artifactId>kafka-clients</artifactId>") == 1 and "<classifier>test</classifier>" in ipom
+           and "<artifactId>zstd-jni</artifactId>" in ipom and ipom.count("<artifactId>commons-lang3</artifactId>") == 1)
+        ok("the root POM's Enforcer rule carries the includes, one also for a test jar only a profile declares",
+           "<include>com.example:orders-common:*:*:test:tests</include>" in rpom and "<include>org.apache.kafka:kafka-clients:*:*:test:test</include>" in rpom
+           and "<include>io.netty:netty-transport-native-epoll:*:*:test:linux-aarch_64</include>" in rpom
+           and rpom.index("</excludes>") < rpom.index("<includes>") < rpom.index("<message>")
+           and len(va["enforcer_includes"]) == 3 and "linux-aarch_64</classifier>" in ipom)
+        ok("the apply report lists the kept and declared test jars, without a warning about deleted dependencies",
+           va["test_variants"]["declared"] == ["com.example:orders: org.apache.kafka:kafka-clients:test 3.7.1"]
+           and sorted(va["test_variants"]["kept"]) == ["com.example:orders-common:tests in com.example:orders", "org.apache.kafka:kafka-clients:test in com.example:orders-it"]
+           and not any("not found" in w for w in va["warnings"])
+           and all(ET.fromstring(p.encode("utf-8")) is not None for p in (opom, ipom, rpom)))
+        run("apply_consumer_patch.py", "--patch", vout / "consumer-patch.json", "--project", vcons,
+            "--out", vout / "consumer-apply2.json", "--diff", vout / "consumer-apply2.diff")
+        ok("applying the variant proposal twice changes nothing",
+           (vout / "consumer-apply2.diff").read_text(encoding="utf-8") == "" and not read_json(vout / "consumer-apply2.json")["changed_files"])
+        run("write_summary.py", "--out-dir", vout)
+        vsum = (vout / "SUMMARY.md").read_text(encoding="utf-8")
+        ok("summary lists the drift, the test jars and the variant",
+           "Version drift between the consumer and the bundle" in vsum
+           and "- WARNING: `org.springframework.boot:spring-boot-test` 3.3.6 (test scope) belongs to `org.springframework.boot`, embedded at 3.3.5 (com.example:orders)" in vsum
+           and "`org.apache.kafka:kafka-clients:test` in com.example:orders (declared directly with test scope)" in vsum
+           and "- test jar declared with test scope: com.example:orders: org.apache.kafka:kafka-clients:test 3.7.1" in vsum
+           and "goes with the embedded coordinate although the bundle does not contain it" in vsum)
+
         # ---- unidentified jar end to end: synthetic coordinates ---------------------------
         print("[synthetic coordinates]")
         run("resolve_selection.py", "--inventory", out / "inventory-offline.json", "--select", "vendor-sdk", "--out", out / "sel-syn.json")

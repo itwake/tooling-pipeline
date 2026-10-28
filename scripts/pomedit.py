@@ -267,6 +267,30 @@ def dependency_declarations(root: Element, src: str, g: str, a: str) -> List[Tup
     return found
 
 
+def dependency_xml(g: str, a: str, version: Optional[str] = None, scope: Optional[str] = None, type_: Optional[str] = None,
+                   classifier: Optional[str] = None, exclusions=(), comment: Optional[str] = None) -> str:
+    """A <dependency> block, two spaces per level, for insert_child / insert_after. A test-jar needs no
+    classifier element (it is the tests classifier); compile scope and the jar type are left implicit."""
+    lines = ["<!-- %s -->" % comment.replace("--", "-")] if comment else []
+    lines += ["<dependency>", "  <groupId>%s</groupId>" % g, "  <artifactId>%s</artifactId>" % a]
+    if version:
+        lines.append("  <version>%s</version>" % version)
+    if type_ and type_ != "jar":
+        lines.append("  <type>%s</type>" % type_)
+    if classifier and not (type_ == "test-jar" and classifier == "tests"):
+        lines.append("  <classifier>%s</classifier>" % classifier)
+    if scope and scope != "compile":
+        lines.append("  <scope>%s</scope>" % scope)
+    if exclusions:
+        lines.append("  <exclusions>")
+        for t in exclusions:
+            tg, ta = t.split(":", 1)
+            lines += ["    <exclusion>", "      <groupId>%s</groupId>" % tg, "      <artifactId>%s</artifactId>" % ta, "    </exclusion>"]
+        lines.append("  </exclusions>")
+    lines.append("</dependency>")
+    return "\n".join(lines)
+
+
 def existing_exclusions(dep: Element, src: str) -> List[Tuple[str, str]]:
     exc = dep.child("exclusions")
     if exc is None:
