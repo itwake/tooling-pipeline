@@ -1,5 +1,13 @@
-// mvn-rebundle / consumer: propose, and on request apply, the POM change of a project that will
-// consume a bundle.
+// mvn-rebundle / consumer: propose, and on request apply, the POM change that brings a project to a version of
+// a bundle: the first switch, an upgrade to a changed bundle, a rollback, or leaving the bundle.
+//
+// The project's current bundle version is read from its effective POM (else from the tool's record
+// .mvn/rebundle.json), and the proposal is the transition from it to BUNDLE_COORDINATES: coordinates that joined
+// the bundle are deleted or excluded as in the first switch, coordinates that left it come back (the direct
+// dependencies the switch deleted, the exclusions and test jars it added for them, exactly as the record says),
+// the bundle dependency moves to the new version and the Enforcer rule is regenerated. BUNDLE_COORDINATES=
+// groupId:artifactId:none undoes the switch completely. On a transition the untouched checkout is built first,
+// so the comparison runs against the application as the project builds it today.
 //
 // The bundle comes from an mvn-rebundle build (its archived bundle-manifest.json and published POM are
 // copied with the Copy Artifact plugin) or, with BUNDLE_COORDINATES, from Nexus (the bundle jar and its
@@ -91,7 +99,13 @@ def pluginFindings() {
     return readFile('out/plugin-trees-findings.txt').tokenize('\n').findAll { it.trim() }
 }
 
-// Findings of the patch proposal ([drift], [variant], [info]); empty when it found none.
+// BUNDLE_COORDINATES names no bundle version but the end of the bundle: groupId:artifactId:none (or none alone, with the record).
+def isUnbundle() {
+    def c = params.BUNDLE_COORDINATES?.trim()?.toLowerCase()
+    return c == 'none' || (c && c.endsWith(':none'))
+}
+
+// Findings of the patch proposal ([drift], [variant], [record], [info]); empty when it found none.
 def patchFindings() {
     if (!fileExists('out/consumer-patch-findings.txt')) {
         return []
@@ -134,7 +148,7 @@ pipeline {
     parameters {
         string(name: 'UPSTREAM_BUILD', defaultValue: '', description: 'Build number of the UPSTREAM_JOB run to take the bundle from; empty = last successful build')
         string(name: 'BUNDLE_COORDINATES', defaultValue: '',
-               description: 'Alternative to the upstream build: groupId:artifactId:version of a bundle already published to Nexus')
+               description: 'Alternative to the upstream build: groupId:artifactId:version of a bundle in Nexus, groupId:artifactId for its newest release, or groupId:artifactId:none to leave the bundle (undo the switch)')
         string(name: 'CONSUMER_GIT_URL', defaultValue: '', description: 'Git URL of the consumer project; enables the per-path exclusion list and APPLY')
         string(name: 'CONSUMER_GIT_REF', defaultValue: 'main', description: 'Consumer branch, tag or commit')
         string(name: 'CONSUMER_MAVEN_ARGS', defaultValue: '', description: 'Extra arguments for the consumer dependency:tree run, e.g. -Pprod')
@@ -160,6 +174,7 @@ pipeline {
         PUSH_BRANCH           = 'true'           // APPLY: push the branch to the consumer repository
         ON_DIFFERENCES        = 'ask'            // APPLY, the rebuilt application differs from the original artifact: ask (input step), push (push, build UNSTABLE), stop (no push)
         ON_DIFFERENCES_TIMEOUT = '60'            // minutes to wait for the answer when ON_DIFFERENCES=ask; no answer = not pushed
+        COMPARE_WITH_BASELINE = 'true'           // APPLY on a transition: build the untouched checkout first and compare the rebuilt application with it
         DEFAULT_APP_PATH      = '/app/app.jar'   // original artifact as an image: application path inside it
         IMAGE_PLATFORM        = ''
         IMAGE_TOOL            = 'auto'
@@ -177,6 +192,9 @@ pipeline {
                     "$PY" --version
                 '''
                 sh '"$PY" scripts/gen_maven_settings.py --server-id nexus --mirror-url "$MAVEN_MIRROR_URL" --out work/settings.xml'
+                script {
+                    env.UNBUNDLE = isUnbundle() ? 'true' : 'false'
+                }
             }
         }
 
@@ -193,15 +211,14 @@ pipeline {
         }
 
         stage('Bundle from Nexus') {
-            when { expression { params.BUNDLE_COORDINATES?.trim() } }
+            when { allOf { expression { params.BUNDLE_COORDINATES?.trim() }; expression { !isUnbundle() } } }
             steps {
                 script {
+                    // the bundle jar and its published POM; groupId:artifactId alone resolves to the newest release
                     withSourceCredentials('nexus') {
                         sh '''
-                            "$PY" scripts/extract_source.py --ref "$BUNDLE_COORDINATES" --nexus-hosts "$NEXUS_HOSTS" \
-                                --maven-repo-url "$NEXUS_MAVEN_REPO_URL" --out work/bundle-jar --meta out/bundle-jar-source.json
-                            "$PY" scripts/extract_source.py --ref "$BUNDLE_COORDINATES:pom" --nexus-hosts "$NEXUS_HOSTS" \
-                                --maven-repo-url "$NEXUS_MAVEN_REPO_URL" --out work/bundle-pom --meta out/bundle-pom-source.json
+                            "$PY" scripts/fetch_bundle.py --bundle "$BUNDLE_COORDINATES" --repo-url "$NEXUS_MAVEN_REPO_URL" \
+                                --out work/bundle-jar --meta out/bundle-jar.json
                         '''
                     }
                 }
@@ -230,6 +247,27 @@ pipeline {
                         }
                     }
                 }
+                // the bundle version the project uses today, from its effective POM (else the tool's record): the
+                // proposal is the transition from it; its jar and POM come from Nexus
+                script {
+                    sh '''
+                        set --
+                        if [ -z "$BUNDLE_COORDINATES" ]; then set -- --manifest out/bundle-manifest.json; else set -- --bundle "$BUNDLE_COORDINATES"; fi
+                        "$PY" scripts/bundle_diff.py --detect "$@" --effective-pom out/consumer-effective-pom.xml \
+                            --record work/consumer/.mvn/rebundle.json --out out/consumer-bundle-current.json > out/consumer-bundle-current.txt
+                    '''
+                    def current = readFile('out/consumer-bundle-current.txt').trim()
+                    if (current) {
+                        env.PREVIOUS_BUNDLE = current
+                        withSourceCredentials('nexus') {
+                            sh '"$PY" scripts/fetch_bundle.py --bundle "$PREVIOUS_BUNDLE" --repo-url "$NEXUS_MAVEN_REPO_URL" --out work/bundle-prev --meta out/prev-bundle.json'
+                        }
+                    } else if (env.UNBUNDLE == 'true') {
+                        error "The project does not use the bundle; nothing to leave"
+                    } else {
+                        echo 'The project does not use the bundle yet: this is the first switch'
+                    }
+                }
                 // the build plugins: a throwaway reactor with one module per plugin configuration, whose
                 // dependency trees are the plugins' class realms
                 script {
@@ -247,7 +285,7 @@ pipeline {
             }
         }
 
-        stage('Patch proposal') {
+        stage('Transition proposal') {
             steps {
                 sh '''
                     ARGS=""
@@ -255,9 +293,17 @@ pipeline {
                     if [ -f out/consumer-plugin-trees.txt ] && [ -f out/consumer-plugins.json ]; then
                         ARGS="$ARGS --plugin-tree out/consumer-plugin-trees.txt --plugins out/consumer-plugins.json"
                     fi
-                    if [ -n "$BUNDLE_COORDINATES" ]; then
-                        JAR=$(ls work/bundle-jar/*.jar | head -1)
-                        POM=$(ls work/bundle-pom/*.pom | head -1)
+                    if [ -f work/consumer/.mvn/rebundle.json ]; then ARGS="$ARGS --record work/consumer/.mvn/rebundle.json"; fi
+                    if [ -f out/prev-bundle.json ]; then
+                        # the bundle the project uses today: the proposal is the transition from it
+                        ARGS="$ARGS --previous-jar $("$PY" -c "import json; print(json.load(open('out/prev-bundle.json'))['jar'])")"
+                        ARGS="$ARGS --previous-pom $("$PY" -c "import json; print(json.load(open('out/prev-bundle.json'))['pom'])")"
+                    fi
+                    if [ "$UNBUNDLE" = true ]; then
+                        "$PY" scripts/gen_consumer_patch.py --unbundle $ARGS --out out/consumer-patch.md --out-json out/consumer-patch.json
+                    elif [ -n "$BUNDLE_COORDINATES" ]; then
+                        JAR=$("$PY" -c "import json; print(json.load(open('out/bundle-jar.json'))['jar'])")
+                        POM=$("$PY" -c "import json; print(json.load(open('out/bundle-jar.json'))['pom'])")
                         "$PY" scripts/gen_consumer_patch.py --bundle-jar "$JAR" --reduced-pom "$POM" $ARGS \
                             --out out/consumer-patch.md --out-json out/consumer-patch.json
                     else
@@ -267,6 +313,8 @@ pipeline {
                         "$PY" scripts/gen_consumer_patch.py --manifest out/bundle-manifest.json --reduced-pom "$POM" $ARGS \
                             --out out/consumer-patch.md --out-json out/consumer-patch.json
                     fi
+                    # the transition for the comparison of the rebuilt application with the baseline
+                    "$PY" -c "import json; p = json.load(open('out/consumer-patch.json')); json.dump(p.get('transition') or {}, open('out/bundle-transition.json', 'w'), indent=2)"
                 '''
                 script {
                     def findings = patchFindings().findAll { !it.startsWith('[info]') }
@@ -281,11 +329,40 @@ pipeline {
             }
         }
 
+        stage('Baseline build') {
+            // a transition: the application as the project builds it today, with the bundle it uses, is the
+            // reference the rebuilt application is compared with
+            when {
+                allOf {
+                    expression { params.APPLY }
+                    expression { params.CONSUMER_GIT_URL?.trim() }
+                    expression { env.PREVIOUS_BUNDLE?.trim() }
+                    expression { env.COMPARE_WITH_BASELINE == 'true' }
+                }
+            }
+            steps {
+                dir('work/consumer') {
+                    script {
+                        withNexusCredentials {
+                            sh 'mvn -B -ntp -s "$WORKSPACE/work/settings.xml" $CONSUMER_BUILD_ARGS package'
+                        }
+                    }
+                }
+                sh '''
+                    "$PY" scripts/find_app_jar.py --project work/consumer --manifest /nonexistent --out out/baseline-app.json
+                    mkdir -p work/baseline
+                    cp "$("$PY" -c "import json; print(json.load(open('out/baseline-app.json'))['new_jar'])")" work/baseline/
+                    ls -l work/baseline
+                '''
+            }
+        }
+
         stage('Apply patch') {
             when { allOf { expression { params.APPLY }; expression { params.CONSUMER_GIT_URL?.trim() } } }
             steps {
                 sh '''
                     "$PY" scripts/apply_consumer_patch.py --patch out/consumer-patch.json --project work/consumer \
+                        --record work/consumer/.mvn/rebundle.json --effective-pom out/consumer-effective-pom.xml \
                         --out out/consumer-apply.json --diff out/consumer-apply.diff
                     "$PY" -c "import json; print(json.load(open('out/consumer-apply.json'))['branch'])" > out/consumer-apply.branch
                     git -C work/consumer checkout -B "$(cat out/consumer-apply.branch)"
@@ -347,6 +424,10 @@ pipeline {
                 script {
                     sh '"$PY" scripts/find_app_jar.py --project work/consumer --manifest out/bundle-manifest.json --out out/rebuilt-app.json'
                     def oldRef = params.VERIFY_AGAINST?.trim()
+                    if (!oldRef && fileExists('out/baseline-app.json')) {
+                        // a transition: the baseline built from the untouched checkout
+                        oldRef = sh(returnStdout: true, script: 'ls work/baseline/*.jar work/baseline/*.war 2>/dev/null | head -1').trim()
+                    }
                     if (!oldRef) {
                         oldRef = sh(returnStdout: true, script: '"$PY" -c "import json; print(json.load(open(\'out/rebuilt-app.json\')).get(\'old_ref\') or \'\')"').trim()
                     }
@@ -360,7 +441,9 @@ pipeline {
                     // out/equivalence-findings.txt and decided on before the push (ON_DIFFERENCES)
                     sh '''
                         NEW=$("$PY" -c "import json; print(json.load(open('out/rebuilt-app.json'))['new_jar'])")
-                        "$PY" scripts/verify_app_equivalence.py --old-source out/old-source.json --new "$NEW" \
+                        TRANSITION=""
+                        if [ -s out/bundle-transition.json ] && [ "$(cat out/bundle-transition.json)" != "{}" ]; then TRANSITION="--transition out/bundle-transition.json"; fi
+                        "$PY" scripts/verify_app_equivalence.py --old-source out/old-source.json --new "$NEW" $TRANSITION \
                             --policy config/policy.json --out out/equivalence.json
                         "$PY" scripts/write_summary.py --out-dir out || true
                     '''
@@ -413,12 +496,16 @@ pipeline {
                                     git config user.name "$GIT_USER_NAME"
                                     git config user.email "$GIT_USER_EMAIL"
                                     git add -A -- '*pom.xml'
+                                    # the tool's record of the switch travels with the POMs (deleted when the project leaves the bundle)
+                                    if [ -f .mvn/rebundle.json ] || git ls-files --error-unmatch .mvn/rebundle.json >/dev/null 2>&1; then git add -A -- .mvn/rebundle.json; fi
                                     git commit -q -F - <<EOF
-Replace bundled dependencies with $(sed 's#^rebundle/##' "$WORKSPACE/out/consumer-apply.branch")
+$("$PY" -c "import json; p = json.load(open('$WORKSPACE/out/consumer-patch.json')); t = p.get('transition') or {}; print(('Leave bundle ' + t['from']) if p.get('unbundle') else (('Move bundle ' + t['from'] + ' to ' + p['coordinate']) if t.get('from') else ('Replace bundled dependencies with ' + p['coordinate'])))")
 
 Generated by mvn-rebundle: direct dependencies removed, exclusions added on the
 paths that reintroduce embedded coordinates, Enforcer gate installed, build plugins
-whose dependencies contained embedded coordinates given the bundle as first dependency.
+whose dependencies contained embedded coordinates given the bundle as first dependency;
+on a transition, what left the bundle is declared again and its exclusions dropped
+(.mvn/rebundle.json records the switch).
 Patch proposal: $PATCH_NOTE
 Comparison with the original artifact: $EQUIVALENCE_NOTE
 Plugin dependency check: $PLUGIN_NOTE

@@ -83,6 +83,7 @@ BUNDLE_BOOT_ATTR = "X-Dependency-Bundle-Spring-Boot"
 BUNDLE_BASE_ATTR = "X-Dependency-Bundle-Base"
 BUNDLE_REWORKED_FROM_ATTR = "X-Dependency-Bundle-Reworked-From"
 BUNDLE_CONTENTS_FILE = THIRD_PARTY_DIR + "BUNDLE-CONTENTS.txt"
+BUNDLE_OVERLAPS_FILE = THIRD_PARTY_DIR + "BUNDLE-OVERLAPS.txt"
 
 # --------------------------------------------------------------------------- small utils
 
@@ -351,6 +352,29 @@ def parse_contents_file(text: str) -> Dict[str, dict]:
         if len(parts) >= 2:
             out[parts[0]] = {"sha256": parts[1], "file": parts[2] if len(parts) > 2 else None}
     return out
+
+
+def parse_overlaps_file(text: str) -> Dict[str, dict]:
+    """{path: {"kept": coordinate, "others": [coordinates], "identical": bool}} from BUNDLE-OVERLAPS.txt: the
+    entries several components carried, which copy the bundle kept (the first in class-loading order) and
+    whether the other copies had the same bytes. The change job uses it when a component is removed."""
+    out: Dict[str, dict] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 4:
+            out[parts[0]] = {"kept": parts[1], "others": [o for o in parts[2].split(",") if o], "identical": parts[3] == "identical"}
+    return out
+
+
+def overlaps_file_text(header: List[str], overlaps: Dict[str, dict]) -> str:
+    lines = ["# " + h for h in header] + ["# path  kept-from  also-in  identical|different"]
+    for path in sorted(overlaps):
+        o = overlaps[path]
+        lines.append("%s  %s  %s  %s" % (path, o["kept"], ",".join(o["others"]) or "-", "identical" if o["identical"] else "different"))
+    return "\n".join(lines) + "\n"
 
 
 # --------------------------------------------------------------------------- GAV identification

@@ -57,6 +57,7 @@ from bundlelib import (  # noqa: E402
     variant_key,
     write_json,
 )
+from bundle_diff import describe as describe_transition, diff as bundle_transition, empty_state, state_from_jar, state_from_manifest  # noqa: E402
 from identify import SYNTHETIC_GROUP, synthetic_hint  # noqa: E402
 from resolve_selection import family_of  # noqa: E402
 
@@ -208,15 +209,19 @@ def hit_ga(node, embedded_ga, hints, resolved, variants=None):
     return ga
 
 
-def promoted_dispositions(nodes, matched, promoted_ga, what="module"):
+def promoted_dispositions(nodes, matched, promoted_ga, what="module", carry=None):
     """Per transitive dependency the bundle POM still declares: excluded on the bundle dependency (never
     in this tree, already reached through a path without embedded coordinates, or only in test/provided
-    scope) or kept (reachable only through an embedded coordinate)."""
+    scope) or kept (reachable only through an embedded coordinate, or a coordinate that left the bundle: the
+    consumer had it inside the bundle and keeps it through the bundle POM)."""
     exclusions, kept = OrderedDict(), OrderedDict()
     occurrences = defaultdict(list)
     for node in nodes:
         occurrences[ga_str(node)].append(node)
     for ga in promoted_ga or []:
+        if ga in (carry or ()):
+            kept[ga] = "left the bundle; its POM brings it back"
+            continue
         occ = occurrences.get(ga, [])
         if not occ:
             exclusions[ga] = "not in this %s's dependency tree" % what
@@ -241,7 +246,7 @@ def descendants(nodes, i):
     return out
 
 
-def analyse_trees(texts, embedded_ga, hints=None, resolved=None, promoted_ga=None, variants=None, embedded=None, families=None):
+def analyse_trees(texts, embedded_ga, hints=None, resolved=None, promoted_ga=None, variants=None, embedded=None, families=None, carry=None):
     """Modules with the changes they need. Nodes matching a synthetic hint (artifactId and, when
     known, version) count as embedded too; their real coordinates are recorded in `resolved`.
 
@@ -304,7 +309,7 @@ def analyse_trees(texts, embedded_ga, hints=None, resolved=None, promoted_ga=Non
                 module["exclusions"][ga_str(node)]["version"] = node.get("version")
         for direct, entry in module["exclusions"].items():
             cut[direct].update(entry["targets"])
-        module["bundle_exclusions"], module["promoted_kept"] = promoted_dispositions(nodes, matched, promoted_ga, "module")
+        module["bundle_exclusions"], module["promoted_kept"] = promoted_dispositions(nodes, matched, promoted_ga, "module", carry)
         modules.append(module)
     if variants is None:
         return modules
@@ -512,6 +517,41 @@ def exclusion_snippet(direct_ga: str, targets, version) -> str:
     return "\n".join(lines)
 
 
+def restore_plan(module: str, removed_ga: set, prev_components: list, record, new_pom_ga: set, unbundle: bool, uses_bundle: bool) -> dict:
+    """What a module gets back when coordinates leave the bundle: the direct dependencies the switch deleted, the
+    exclusions it added for them, the test jars it declared because of them. Exact with the record of the switch
+    (.mvn/rebundle.json). Without it, a coordinate the new bundle POM does not bring is declared at the version the
+    old bundle embedded, in the modules that use the bundle, and the exclusions stay, listed for a clean-up by hand."""
+    plan = {"restore_direct": OrderedDict(), "drop_exclusions": OrderedDict(), "drop_test_jars": [], "notes": []}
+    if not removed_ga:
+        return plan
+    if record is not None:
+        rec = (record.get("modules") or {}).get(module) or {}
+        for ga, info in (rec.get("removed_direct") or {}).items():
+            if ga in removed_ga:
+                plan["restore_direct"][ga] = dict(info, source="the record of the switch")
+        for direct, targets in (rec.get("exclusions_added") or {}).items():
+            hit = [t for t in targets if t in removed_ga]
+            if hit:
+                plan["drop_exclusions"][direct] = hit
+        for tj in rec.get("test_jars_declared") or []:
+            if "%s:%s" % (tj.get("groupId"), tj.get("artifactId")) in removed_ga:
+                plan["drop_test_jars"].append(tj)
+        return plan
+    if not uses_bundle:
+        return plan
+    prev_versions = {ga_str(g): g.get("version") for g in prev_components}
+    for ga in sorted(removed_ga):
+        if ga in new_pom_ga and not unbundle:
+            plan["notes"].append("%s comes through the bundle POM" % ga)
+            continue
+        g, a = ga.split(":", 1)
+        plan["restore_direct"][ga] = {"groupId": g, "artifactId": a, "version": prev_versions.get(ga), "scope": None, "type": None,
+                                      "classifier": None, "pom": None, "place": "", "source": "the previous bundle's contents (no record of the switch)"}
+    plan["notes"].append("no record of the switch (.mvn/rebundle.json): the exclusions the switch added for %s stay; remove them by hand" % ", ".join(sorted(removed_ga)))
+    return plan
+
+
 def policy_families(path) -> dict:
     """The families section of policy.json: groupId prefixes that share one release train."""
     try:
@@ -568,9 +608,20 @@ def main() -> None:
     ap.add_argument("--out", default="out/consumer-patch.md")
     ap.add_argument("--out-json", default="out/consumer-patch.json")
     ap.add_argument("--findings-out", default="", help="findings one per line: [drift], [variant], [info] (default: <out-json>-findings.txt)")
+    ap.add_argument("--previous-jar", default="", help="the bundle the consumer uses today: the proposal becomes the transition from it to the new one")
+    ap.add_argument("--previous-pom", default="", help="the published POM of that bundle")
+    ap.add_argument("--record", default="", help="the consumer's .mvn/rebundle.json (what earlier runs changed), needed to undo what a coordinate that left the bundle caused")
+    ap.add_argument("--unbundle", action="store_true", help="the target is no bundle: the switch is undone completely (needs --previous-jar and the record)")
     args = ap.parse_args()
 
-    if args.bundle_jar:
+    previous = state_from_jar(args.previous_jar, args.previous_pom) if args.previous_jar else empty_state()
+    record = read_json(args.record) if args.record and Path(args.record).is_file() else None
+    if args.unbundle:
+        if not args.previous_jar:
+            fail("--unbundle needs --previous-jar: the bundle the consumer leaves")
+        man = {"bundle": previous["bundle"], "coordinate": previous["coordinate"], "components": [], "reduced_pom": "", "pom": "",
+               "spring_boot_version": previous["spring_boot_version"]}
+    elif args.bundle_jar:
         man = manifest_from_jar(args.bundle_jar)
     elif args.bundle:
         text = args.embedded or ""
@@ -583,12 +634,21 @@ def main() -> None:
     bundle = man["bundle"]
     coord = man["coordinate"]
     embedded = [c["gav"] for c in man["components"]]
+    if args.unbundle:
+        target = empty_state()
+    elif args.bundle_jar:
+        target = state_from_jar(args.bundle_jar, args.reduced_pom)
+    else:
+        target = state_from_manifest(man, args.reduced_pom)
+    transition = bundle_transition(previous, target)
+    if previous["coordinate"] and previous["coordinate"] == coord and not args.unbundle:
+        log("WARN: the consumer already uses %s; the proposal only repairs what differs from a complete switch" % coord)
     synthetic = [(g, synthetic_hint(g)) for g in embedded if g.get("groupId") == SYNTHETIC_GROUP]
     embedded_ga = {ga_str(g) for g in embedded if g.get("groupId") != SYNTHETIC_GROUP}
     variants = embedded_variants(embedded, SYNTHETIC_GROUP)
     boot_version = man.get("spring_boot_version")
     boot_embedded = "org.springframework.boot:spring-boot" in embedded_ga
-    boot_excludes = boot_line_excludes(boot_version) if boot_version and not boot_embedded else []
+    boot_excludes = boot_line_excludes(boot_version) if boot_version and not boot_embedded and not args.unbundle else []
     pom_candidates = [args.reduced_pom, man.get("pom"), man.get("reduced_pom")]
     reduced_pom = next((Path(c) for c in pom_candidates if c and Path(c).is_file()), Path(""))
     promoted = [d for d in reduced_pom_dependencies(reduced_pom) if "%s:%s" % (d.get("groupId"), d.get("artifactId")) not in embedded_ga] if str(reduced_pom) and reduced_pom.is_file() else []
@@ -602,8 +662,23 @@ def main() -> None:
         else:
             log("WARN: tree file not found: %s" % t)
     resolved_synthetic = {}
+    removed_ga = {ga_str(g) for g in transition["removed"]}
+    if args.unbundle:
+        removed_ga |= {ga_str(g) for g in previous["components"]}
     modules = analyse_trees(texts, embedded_ga, [h for _, h in synthetic], resolved_synthetic, promoted_ga,
-                            variants, embedded, policy_families(args.policy)) if texts else []
+                            variants, embedded, policy_families(args.policy), removed_ga) if texts else []
+    # the transition: what left the bundle comes back to the modules that use it
+    new_pom_ga = {"%s:%s" % (d.get("groupId"), d.get("artifactId")) for d in target["pom_dependencies"]}
+    known_modules = {m["module"] for m in modules}
+    for name in ((record or {}).get("modules") or {}):
+        if name not in known_modules:
+            modules.append({"module": name, "remove_direct": OrderedDict(), "exclusions": OrderedDict(), "paths": [], "bundle_exclusions": OrderedDict(),
+                            "promoted_kept": OrderedDict(), "test_variants": OrderedDict(), "redeclare": OrderedDict(), "other_variants": OrderedDict(),
+                            "drift": [], "direct": None, "from_record": True})
+    for m in modules:
+        in_record = bool(((record or {}).get("modules") or {}).get(m["module"]))
+        m["uses_bundle"] = ga_str(bundle) in (m.get("direct") or []) or in_record
+        m["restore"] = restore_plan(m["module"], removed_ga, previous["components"], record, new_pom_ga, args.unbundle, m["uses_bundle"])
     plugin_texts = []
     for t in args.plugin_tree:
         p = Path(t)
@@ -628,6 +703,29 @@ def main() -> None:
     md = []
     md.append("# Consumer POM change proposal: %s" % coord)
     md.append("")
+    restoring = [m for m in modules if any(m["restore"][k] for k in ("restore_direct", "drop_exclusions", "drop_test_jars", "notes"))]
+    if previous["coordinate"] or args.unbundle:
+        md.append("## Transition: %s -> %s" % (previous["coordinate"] or "no bundle", "no bundle" if args.unbundle else coord))
+        md.append("")
+        md += ["- " + l for l in describe_transition(transition)] or ["- no change in the embedded coordinates"]
+        md.append("")
+        for m in restoring:
+            r = m["restore"]
+            md.append("### Module %s: what comes back" % m["module"])
+            md.append("")
+            for ga, info in r["restore_direct"].items():
+                md.append("- declare `%s` again%s%s (%s)" % (ga, (" at %s" % info["version"]) if info.get("version") else " at the managed version",
+                                                           (", scope %s" % info["scope"]) if info.get("scope") else "", info.get("source")))
+            for direct, targets in r["drop_exclusions"].items():
+                md.append("- drop the exclusion of %s on `%s`" % (", ".join("`%s`" % t for t in targets), direct))
+            for tj in r["drop_test_jars"]:
+                md.append("- drop the declaration of the test jar `%s:%s:%s`; its dependency brings it again" % (tj.get("groupId"), tj.get("artifactId"), tj.get("classifier")))
+            for n in r["notes"]:
+                md.append("- %s" % n)
+            md.append("")
+        if not args.unbundle:
+            md.append("The bundle dependency moves to version `%s`, its exclusions and the Enforcer rule are regenerated for the new contents, the record `.mvn/rebundle.json` is updated." % bundle["version"])
+            md.append("")
     md.append("Coordinates embedded in the bundle: %s" % ", ".join(gav_str(g) for g in embedded))
     md.append("")
     md.append("No Java code changes; package names stay the same. Three things to do: delete the replaced direct dependencies, add the bundle dependency, and add an exclusion on every path that still brings an original coordinate transitively. The Enforcer rule below fails the build whenever a path is missed. Section 2 also says, per module, which transitive dependencies of the bundle POM to exclude on the bundle dependency itself.")
@@ -821,11 +919,37 @@ def main() -> None:
     md.append("3. Run the existing tests, rebuild the image, smoke-test it.")
     md.append("")
 
+    if args.unbundle:
+        md = ["# Leaving %s" % previous["coordinate"], "",
+              "The project stops using the bundle: every change the switch made is undone from the record `.mvn/rebundle.json`, the bundle dependency and its managed version go, the `ban-bundled-coordinates` Enforcer execution goes, the record is deleted. Embedded coordinates come back as ordinary dependencies at the versions the bundle embedded unless the project manages them.", ""]
+        md += ["- " + l for l in describe_transition(transition)]
+        md.append("")
+        for m in restoring:
+            r = m["restore"]
+            md.append("## Module %s" % m["module"])
+            md.append("")
+            for ga, info in r["restore_direct"].items():
+                md.append("- declare `%s` again%s%s (%s)" % (ga, (" at %s" % info["version"]) if info.get("version") else " at the managed version",
+                                                           (", scope %s" % info["scope"]) if info.get("scope") else "", info.get("source")))
+            for direct, targets in r["drop_exclusions"].items():
+                md.append("- drop the exclusion of %s on `%s`" % (", ".join("`%s`" % t for t in targets), direct))
+            for tj in r["drop_test_jars"]:
+                md.append("- drop the declaration of the test jar `%s:%s:%s`" % (tj.get("groupId"), tj.get("artifactId"), tj.get("classifier")))
+            for n in r["notes"]:
+                md.append("- %s" % n)
+            md.append("")
+        if record is None:
+            md.append("Without the record, only the coordinates the bundle embedded are declared again; exclusions and test jar declarations the switch added have to be found by hand (`git log` of the POMs).")
+            md.append("")
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text("\n".join(md), encoding="utf-8")
     write_json(args.out_json, {
         "bundle": bundle,
         "coordinate": coord,
+        "previous": {"coordinate": previous["coordinate"], "components": previous["components"], "spring_boot_version": previous["spring_boot_version"]} if previous["coordinate"] else None,
+        "transition": transition,
+        "unbundle": args.unbundle,
+        "record_used": record is not None,
         "embedded": embedded,
         "spring_boot_version": boot_version,
         "boot_embedded": boot_embedded,
@@ -837,15 +961,19 @@ def main() -> None:
         "modules": [{"module": m["module"], "remove_direct": m["remove_direct"], "exclusions": m["exclusions"],
                      "bundle_exclusions": m["bundle_exclusions"], "promoted_kept": m["promoted_kept"], "paths": m["paths"],
                      "test_variants": m["test_variants"], "redeclare": m["redeclare"], "other_variants": m["other_variants"],
-                     "drift": m["drift"], "direct": m["direct"]} for m in modules],
+                     "drift": m["drift"], "direct": m["direct"], "restore": m["restore"], "uses_bundle": m["uses_bundle"]} for m in modules],
         "promoted_dependencies": promoted,
-        "tree_provided": bool(texts),
+        "tree_provided": bool(texts) or args.unbundle,
         "plugins": plugin_entries,
         "plugins_without_hits": plugins_clean,
         "plugin_tree_provided": plugins_checked,
         "plugin_policy": policy,
     })
     findings = ["[drift] " + drift_text(d).replace("`", "") for d in drift]
+    if previous["coordinate"] or args.unbundle:
+        findings += ["[info] transition %s -> %s: %s" % (previous["coordinate"] or "no bundle", "no bundle" if args.unbundle else coord, l) for l in describe_transition(transition)]
+        for m in restoring:
+            findings += ["[record] %s: %s" % (m["module"], n) for n in m["restore"]["notes"] if n.startswith("no record")]
     for m in modules:
         for k, v in m["other_variants"].items():
             findings.append("[variant] %s: %s %s (%s scope) goes with the embedded %s although the bundle does not contain it: check that the module does not need it" % (

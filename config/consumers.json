@@ -1,0 +1,8 @@
+{
+  "_comment": "Projects that use each bundle, keyed by the bundle's groupId:artifactId. After a producer job (mvn-rebundle, mvn-rebundle-change) publishes a version of the bundle, it starts mvn-rebundle-consumer for every project listed here with that version; apply=true lets the consumer job edit the POMs on a branch and push it for review, apply=false only writes the proposal. Replace the placeholders with real repositories.",
+  "consumers": {
+    "com.company.platform:thirdparty-bundle": [
+      {"git": "https://git.example.com/team/orders.git", "ref": "main", "apply": true}
+    ]
+  }
+}

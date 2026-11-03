@@ -116,9 +116,14 @@ def main() -> None:
     # rework job: the known versions are the previous bundle POM's; dependencies the added jars' POMs bring are kept
     # and reported, an embedded coordinate they declare is pruned
     rework = man.get("rework")
+    removed_ga = {ga_str(r["gav"]) for r in ((rework or {}).get("removed") or [])}
     src = reduced.read_text(encoding="utf-8")
     src, kept, pruned, aligned, still, new, pruned_embedded = finalize(src, embedded_ga, app_versions,
                                                                          prune_unknown=not rework, prune_embedded=bool(rework))
+    # a component the change job took out of the jar is declared as an ordinary dependency now
+    unbundled = [d for d in new if "%s:%s" % (d["groupId"], d["artifactId"]) in removed_ga]
+    new = [d for d in new if d not in unbundled]
+    missing_unbundled = sorted(removed_ga - {"%s:%s" % (d["groupId"], d["artifactId"]) for d in kept})
     pomedit.parse(src)  # must still be well-formed
     ET.fromstring(src.encode("utf-8"))
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -131,6 +136,8 @@ def main() -> None:
         "rework": bool(rework),
         "kept": kept,
         "new": new,
+        "unbundled": unbundled,
+        "unbundled_missing": missing_unbundled,
         "pruned": pruned,
         "pruned_embedded": pruned_embedded,
         "aligned": aligned,
@@ -142,7 +149,11 @@ def main() -> None:
         return "%s:%s:%s%s" % (d["groupId"], d["artifactId"], d.get("version"), (" (%s)" % d["scope"]) if d.get("scope") not in (None, "compile") else "")
 
     log("Published POM written to %s" % out)
-    log("  kept    : %s" % (", ".join(fmt(d) for d in kept if d not in new) if [d for d in kept if d not in new] else "no promoted dependencies"))
+    log("  kept    : %s" % (", ".join(fmt(d) for d in kept if d not in new and d not in unbundled) if [d for d in kept if d not in new and d not in unbundled] else "no promoted dependencies"))
+    if unbundled:
+        log("  unbundled: %s (taken out of the jar by the change job; declared as ordinary dependencies, the consumer keeps them on the classpath)" % ", ".join(fmt(d) for d in unbundled))
+    if missing_unbundled:
+        log("  WARN: removed components missing from the POM, verify_bundle.py will fail: %s" % ", ".join(missing_unbundled))
     if new:
         log("  new     : %s (promoted from the added jars' POMs; make sure the consumer has or wants them)" % ", ".join(fmt(d) for d in new))
     if pruned:

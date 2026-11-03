@@ -1244,6 +1244,69 @@ def build_variant_consumer_project(target: Path) -> Path:
     return target
 
 
+# The consumer's tree after the switch to thirdparty-bundle 1.0.0: the bundle is a direct dependency, the
+# embedded coordinates are excluded everywhere, snakeyaml is excluded on the bundle (the modules have it).
+SAMPLE_TREE_SWITCHED = r"""com.example:app:jar:1.0.0
++- com.company.platform:thirdparty-bundle:jar:1.0.0:compile
++- org.springframework.boot:spring-boot-starter-web:jar:3.3.5:compile
+|  +- org.springframework.boot:spring-boot-starter:jar:3.3.5:compile
+|  \- org.springframework:spring-web:jar:6.1.14:compile
++- com.vendor:vendor-sdk:jar:2.0.0:compile
++- org.yaml:snakeyaml:jar:2.2:compile
+\- org.apache.commons:commons-text:jar:1.12.0:test
+com.example:app-batch:jar:1.0.0
++- com.company.platform:thirdparty-bundle:jar:1.0.0:compile
++- com.example:app:jar:1.0.0:compile
+\- org.yaml:snakeyaml:jar:2.2:compile
+"""
+
+# `mvn help:effective-pom` of that consumer, reduced to what bundle_diff.py --detect reads
+SAMPLE_EFFECTIVE_POM_SWITCHED = """<?xml version="1.0" encoding="UTF-8"?>
+<projects>
+  <project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>consumer-parent</artifactId>
+    <version>1.0.0</version>
+    <packaging>pom</packaging>
+  </project>
+  <project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+      <groupId>com.example</groupId>
+      <artifactId>consumer-parent</artifactId>
+      <version>1.0.0</version>
+    </parent>
+    <artifactId>app</artifactId>
+    <version>1.0.0</version>
+    <dependencyManagement>
+      <dependencies>
+        <dependency>
+          <groupId>org.yaml</groupId>
+          <artifactId>snakeyaml</artifactId>
+          <version>2.2</version>
+        </dependency>
+      </dependencies>
+    </dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.company.platform</groupId>
+        <artifactId>thirdparty-bundle</artifactId>
+        <version>1.0.0</version>
+        <scope>compile</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.yaml</groupId>
+        <artifactId>snakeyaml</artifactId>
+        <version>2.2</version>
+        <scope>compile</scope>
+      </dependency>
+    </dependencies>
+  </project>
+</projects>
+"""
+
+
 if __name__ == "__main__":
     target = Path(sys.argv[1] if len(sys.argv) > 1 else "fixture")
     libs = build_libs(target / "libs")

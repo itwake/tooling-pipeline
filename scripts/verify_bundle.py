@@ -93,6 +93,8 @@ def main() -> None:
     if not inputs and not app_path:
         fail("manifest has no source.local_path")
     rework = man.get("rework") or {}
+    removed = rework.get("removed") or []
+    removed_ga = {ga_str(r["gav"]) for r in removed}
 
     checks = []
 
@@ -265,7 +267,7 @@ def main() -> None:
                     if key in have.get(category, {}) and key not in log4j_exp.get(category, set()):
                         stale_problems.append("%s still has plugin %s" % (path, entry))
         check("replaced-components-removed", not stale_problems,
-              "; ".join(stale_problems[:10]) if stale_problems else "%d merged resource(s) checked for lines of the replaced component(s), %d stale entries checked above" % (
+              "; ".join(stale_problems[:10]) if stale_problems else "%d merged resource(s) checked for lines of the replaced or removed component(s), %d stale entries checked above" % (
                   len(stale_lines), len((rework.get("stale") or {}).get("entries") or [])))
 
     attrs = read_manifest(bz)
@@ -286,7 +288,19 @@ def main() -> None:
               "still declared: %s" % ", ".join("%s:%s" % (d.get("groupId"), d.get("artifactId")) for d in still) if still
               else "%d remaining dependencies: %s" % (len(promoted), ", ".join("%s:%s:%s" % (d.get("groupId"), d.get("artifactId"), d.get("version")) for d in promoted)))
         app_ga = {ga_str(g) for g in man.get("application_coordinates") or []}
-        foreign = [d for d in promoted if "%s:%s" % (d.get("groupId"), d.get("artifactId")) not in app_ga] if (app_ga or rework) else []
+        foreign = [d for d in promoted if "%s:%s" % (d.get("groupId"), d.get("artifactId")) not in app_ga | removed_ga] if (app_ga or rework) else []
+        if removed:
+            declared = {"%s:%s" % (d.get("groupId"), d.get("artifactId")): d for d in deps}
+            problems = []
+            for r in removed:
+                d = declared.get(ga_str(r["gav"]))
+                if d is None:
+                    problems.append("%s is not declared" % r["coordinate"])
+                elif d.get("version") != r["gav"].get("version"):
+                    problems.append("%s is declared at %s" % (r["coordinate"], d.get("version")))
+            check("pom-declares-removed-components", not problems,
+                  "; ".join(problems) if problems else "%s now ordinary dependenc%s of the bundle" % (
+                      ", ".join(r["coordinate"] for r in removed), "y" if len(removed) == 1 else "ies"))
         if not finalized:
             check("pom-promotes-only-application-dependencies", False,
                   "finalize_bundle_pom.py did not run: Shade's dependency-reduced POM would be published as is%s" % (
@@ -321,7 +335,8 @@ def main() -> None:
         "pom_finalized": finalized and pom_path.is_file(),
         "checks": checks,
         "promoted_dependencies": promoted,
-        "rework": {"from": rework.get("from"), "added": rework.get("added"), "replaced": rework.get("replaced")} if rework else None,
+        "rework": {"from": rework.get("from"), "added": rework.get("added"), "replaced": rework.get("replaced"),
+                   "removed": [r["coordinate"] for r in removed]} if rework else None,
         "ok": not failed,
     }
     write_json(args.out, result)

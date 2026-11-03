@@ -35,6 +35,7 @@ import argparse
 import difflib
 import re
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -170,7 +171,7 @@ def keeps_test_variant(owner: Pom, poms: Dict[str, Pom], dep, ga: str, variants:
     return (dep.child_text(owner.src, "scope") or "") == "test"
 
 
-def remove_dependency(pom: Pom, poms: Dict[str, Pom], ga: str, removed: set, warnings: List[str], keep=None) -> List[str]:
+def remove_dependency(pom: Pom, poms: Dict[str, Pom], ga: str, removed: set, warnings: List[str], keep=None, captured=None, project=None) -> List[str]:
     """Delete every declaration of a replaced coordinate the module sees. The Enforcer bans it whatever
     the active profiles, so one left in an inactive profile would fail the build the day it is used.
     keep(owner, dep) spares the test jars of that groupId:artifactId the bundle does not contain; they
@@ -182,6 +183,8 @@ def remove_dependency(pom: Pom, poms: Dict[str, Pom], ga: str, removed: set, war
         if not decls:
             break
         owner, place, dep = decls[0]
+        if captured is not None and project is not None:
+            captured.append(declaration_info(owner, poms, dep, project, place))
         owner.src = pomedit.remove_element(owner.src, dep)
         owner.reparse()
         owner.actions.append("removed dependency %s%s" % (ga, (" from %s" % place) if place else ""))
@@ -210,19 +213,22 @@ def ensure_exclusions(owner: Pom, dep, targets: List[str]) -> List[str]:
     return missing
 
 
-def add_exclusions(pom: Pom, poms: Dict[str, Pom], direct_ga: str, targets: List[str], warnings: List[str]) -> None:
+def add_exclusions(pom: Pom, poms: Dict[str, Pom], direct_ga: str, targets: List[str], warnings: List[str]) -> List[str]:
     """Add the exclusions on every declaration of the direct dependency the module sees: a profile that
-    re-declares it replaces the main declaration, exclusions included, while it is active."""
+    re-declares it replaces the main declaration, exclusions included, while it is active. Returns the targets added."""
     g, a = direct_ga.split(":", 1)
     count = len(declarations(pom, poms, g, a))
     if not count:
         warnings.append("%s: dependency %s (needs exclusions for %s) not found in the POM, its profiles or its parents inside the checkout" % (pom.ga, direct_ga, ", ".join(targets)))
-        return
+        return []
+    all_added: List[str] = []
     for i in range(count):
         owner, place, dep = declarations(pom, poms, g, a)[i]
         added = ensure_exclusions(owner, dep, targets)
         if added:
             owner.actions.append("excluded %s from %s%s" % (", ".join(added), direct_ga, (" in %s" % place) if place else ""))
+            all_added += [t for t in added if t not in all_added]
+    return all_added
 
 
 def declared_test_variants(poms: Dict[str, Pom], variants: Dict[str, set]) -> List[str]:
@@ -291,8 +297,13 @@ def profile_dependencies_unseen(pom: Pom, poms: Dict[str, Pom], project: Path, d
     return out
 
 
-def add_bundle_dependency(pom: Pom, bundle: dict, with_version: bool, exclusions: List[str]) -> None:
+def add_bundle_dependency(pom: Pom, bundle: dict, with_version: bool, exclusions: List[str], warnings: Optional[List[str]] = None) -> None:
     dep = pomedit.find_dependency(pom.root, pom.src, bundle["groupId"], bundle["artifactId"])
+    if dep is not None:
+        set_bundle_version(pom, dep, bundle, warnings if warnings is not None else [])
+        dep = pomedit.find_dependency(pom.root, pom.src, bundle["groupId"], bundle["artifactId"])
+        prune_bundle_exclusions(pom, dep, exclusions)
+        dep = pomedit.find_dependency(pom.root, pom.src, bundle["groupId"], bundle["artifactId"])
     if dep is None:
         block = "<dependency>\n  <groupId>%s</groupId>\n  <artifactId>%s</artifactId>\n%s</dependency>" % (
             bundle["groupId"], bundle["artifactId"], ("  <version>%s</version>\n" % bundle["version"]) if with_version else "")
@@ -630,6 +641,215 @@ def apply_plugin_entry(entry: dict, poms: Dict[str, Pom], root_pom: Pom, bundle:
     return report
 
 
+def record_rel(path: Path, project: Path) -> str:
+    try:
+        return path.relative_to(project).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def record_path_for(project: Path, given: str) -> Path:
+    return Path(given) if given else project / ".mvn" / "rebundle.json"
+
+
+def load_record(path: Path) -> Optional[dict]:
+    """The tool's record of what earlier runs changed in this project, or None."""
+    if not path.is_file():
+        return None
+    try:
+        rec = read_json(path)
+    except ValueError as e:
+        fail("%s cannot be read: %s" % (path, e))
+    rec.setdefault("modules", {})
+    return rec
+
+
+def module_record(record: dict, name: str) -> dict:
+    m = record["modules"].setdefault(name, {})
+    for key, empty in (("removed_direct", {}), ("exclusions_added", {}), ("test_jars_declared", []), ("bundle_exclusions", [])):
+        m.setdefault(key, empty)
+    return m
+
+
+def declaration_info(owner: Pom, poms: Dict[str, Pom], dep, project: Path, place: str) -> dict:
+    """A dependency declaration as the record keeps it, so that it can be put back as it was."""
+    g, a = pomedit.dependency_ga(dep, owner.src, owner.group)
+    return {"groupId": g, "artifactId": a, "version": dep.child_text(owner.src, "version"), "scope": dep.child_text(owner.src, "scope"),
+            "type": dep.child_text(owner.src, "type"), "classifier": dep.child_text(owner.src, "classifier"),
+            "pom": owner.path.relative_to(project).as_posix(), "place": place}
+
+
+def managed_versions(effective_pom) -> Dict[str, Dict[str, str]]:
+    """{module groupId:artifactId: {dependency groupId:artifactId: version}} from help:effective-pom's dependencyManagement."""
+    out: Dict[str, Dict[str, str]] = {}
+    if not effective_pom or not Path(effective_pom).is_file():
+        return out
+    try:
+        root = ET.parse(str(effective_pom)).getroot()
+    except ET.ParseError:
+        return out
+
+    def local(el):
+        return el.tag.split("}", 1)[-1]
+
+    projects = [root] if local(root) == "project" else [p for p in root if local(p) == "project"]
+    for proj in projects:
+        fields = {local(c): (c.text or "").strip() for c in proj if local(c) in ("groupId", "artifactId")}
+        if "groupId" not in fields:
+            parent = next((c for c in proj if local(c) == "parent"), None)
+            if parent is not None:
+                fields["groupId"] = next(((c.text or "").strip() for c in parent if local(c) == "groupId"), "")
+        dm = next((c for c in proj if local(c) == "dependencyManagement"), None)
+        deps = next((c for c in dm if local(c) == "dependencies"), None) if dm is not None else None
+        managed = {}
+        for dep in (deps if deps is not None else []):
+            rec = {local(c): (c.text or "").strip() for c in dep}
+            if rec.get("groupId") and rec.get("artifactId") and rec.get("version"):
+                managed["%s:%s" % (rec["groupId"], rec["artifactId"])] = rec["version"]
+        out["%s:%s" % (fields.get("groupId"), fields.get("artifactId"))] = managed
+    return out
+
+
+def restore_dependency(pom: Pom, poms: Dict[str, Pom], project: Path, ga: str, info: dict, managed: Dict[str, str], bundle_ga: str) -> Optional[str]:
+    """Declare a coordinate that left the bundle again, as the switch found it (the record) or at the version the
+    old bundle embedded; without a recorded version the module's dependencyManagement has to provide one, else the
+    old bundle's is written. It goes into the POM and profile the switch deleted it from, right after the bundle
+    dependency when that container declares it, else at the end of its dependencies. None when it is declared."""
+    g, a = ga.split(":", 1)
+    classifier = info.get("classifier") or ("tests" if info.get("type") == "test-jar" else None)
+    for owner, _, dep in declarations(pom, poms, g, a):
+        c, known = declared_classifier(owner, poms, dep)
+        if known and c == classifier:
+            return None
+    owner = pom
+    if info.get("pom"):
+        owner = next((p for p in poms.values() if p.path.relative_to(project).as_posix() == info["pom"]), pom)
+    version = info.get("version")
+    if version is None and ga not in managed:
+        version = info.get("fallback_version")
+    place = info.get("place") or ""
+    container = None
+    if place.startswith("profile "):
+        profiles = owner.root.child("profiles")
+        prof = next((p for p in (profiles.children_named("profile") if profiles is not None else []) if (p.child_text(owner.src, "id") or "?") == place[len("profile "):]), None)
+        if prof is not None:
+            if prof.child("dependencies") is None:
+                owner.src = pomedit.insert_child(owner.src, prof, "<dependencies>\n</dependencies>", owner.root)
+                owner.reparse()
+                profiles = owner.root.child("profiles")
+                prof = next(p for p in profiles.children_named("profile") if (p.child_text(owner.src, "id") or "?") == place[len("profile "):])
+            container = prof.child("dependencies")
+        else:
+            place = ""
+    if container is None:
+        if owner.root.child("dependencies") is None:
+            owner.src, _ = pomedit.ensure_child(owner.src, ["dependencies"], {})
+            owner.reparse()
+        container = owner.root.child("dependencies")
+    block = pomedit.dependency_xml(g, a, version, info.get("scope"), info.get("type"), info.get("classifier"))
+    bg, ba = bundle_ga.split(":", 1)
+    anchor = next((d for d in container.children_named("dependency") if pomedit.dependency_ga(d, owner.src, owner.group) == (bg, ba)), None)
+    if anchor is not None:
+        owner.src = pomedit.insert_after(owner.src, anchor, block, owner.root)
+    else:
+        owner.src = pomedit.insert_child(owner.src, container, block, owner.root)
+    owner.reparse()
+    note = "restored dependency %s%s%s%s (%s)" % (ga, (" " + version) if version else " (managed version)", (" " + info["type"]) if info.get("type") else "",
+                                                 (" in %s" % place) if place else "", info.get("source") or "the record")
+    owner.actions.append(note)
+    return note
+
+
+def drop_exclusions(pom: Pom, poms: Dict[str, Pom], direct_ga: str, targets: List[str]) -> List[str]:
+    """Remove the exclusions of the given targets from every declaration of a direct dependency the module sees."""
+    g, a = direct_ga.split(":", 1)
+    dropped: List[str] = []
+    for i in range(len(declarations(pom, poms, g, a))):
+        owner, place, dep = declarations(pom, poms, g, a)[i]
+        owner.src, removed = pomedit.remove_exclusions(owner.src, dep, targets)
+        owner.reparse()
+        if removed:
+            owner.actions.append("dropped the exclusion of %s from %s%s" % (", ".join(removed), direct_ga, (" in %s" % place) if place else ""))
+            dropped += removed
+    return dropped
+
+
+def drop_declaration(pom: Pom, poms: Dict[str, Pom], ga: str, classifier: Optional[str]) -> bool:
+    """Remove a dependency declaration (with the tool's comment above it) of one classifier of a coordinate."""
+    g, a = ga.split(":", 1)
+    for owner, place, dep in declarations(pom, poms, g, a):
+        c, known = declared_classifier(owner, poms, dep)
+        if known and c == classifier:
+            owner.src = pomedit.remove_element_and_comment(owner.src, dep)
+            owner.reparse()
+            owner.actions.append("dropped the test jar declaration %s:%s%s" % (ga, classifier, (" in %s" % place) if place else ""))
+            return True
+    return False
+
+
+def prune_bundle_exclusions(pom: Pom, dep, keep: List[str]) -> List[str]:
+    """The bundle dependency's exclusions are the tool's: those the proposal no longer lists go."""
+    present = ["%s:%s" % e for e in pomedit.existing_exclusions(dep, pom.src)]
+    stale = [t for t in present if t not in keep]
+    if not stale:
+        return []
+    pom.src, removed = pomedit.remove_exclusions(pom.src, dep, stale)
+    pom.reparse()
+    if removed:
+        pom.actions.append("dropped %s from the bundle dependency's exclusions" % ", ".join(removed))
+    return removed
+
+
+def remove_managed_bundle(root_pom: Pom, bundle: dict) -> None:
+    dm = root_pom.root.child("dependencyManagement")
+    deps = dm.child("dependencies") if dm is not None else None
+    for d in (deps.children_named("dependency") if deps is not None else []):
+        if pomedit.dependency_ga(d, root_pom.src, root_pom.group) == (bundle["groupId"], bundle["artifactId"]):
+            root_pom.src = pomedit.remove_element(root_pom.src, d)
+            root_pom.reparse()
+            root_pom.actions.append("removed the managed bundle version")
+            return
+
+
+def remove_enforcer(root_pom: Pom) -> None:
+    """Remove the ban-bundled-coordinates execution; the plugin goes with it when nothing else is left of it."""
+    build = root_pom.root.child("build")
+    plugins = build.child("plugins") if build is not None else None
+    for plugin in (plugins.children_named("plugin") if plugins is not None else []):
+        if plugin.child_text(root_pom.src, "artifactId") != "maven-enforcer-plugin":
+            continue
+        executions = plugin.child("executions")
+        ours = next((ex for ex in (executions.children_named("execution") if executions is not None else [])
+                     if ex.child_text(root_pom.src, "id") == "ban-bundled-coordinates"), None)
+        if ours is None:
+            return
+        others = [ex for ex in executions.children_named("execution") if ex is not ours]
+        if not others and plugin.child("configuration") is None and plugin.child("dependencies") is None:
+            root_pom.src = pomedit.remove_element(root_pom.src, plugin)
+            root_pom.actions.append("removed maven-enforcer-plugin (it only carried the ban-bundled-coordinates execution)")
+        else:
+            root_pom.src = pomedit.remove_element(root_pom.src, ours)
+            root_pom.actions.append("removed the ban-bundled-coordinates execution")
+        root_pom.reparse()
+        return
+
+
+def set_bundle_version(pom: Pom, dep, bundle: dict, warnings: List[str]) -> None:
+    """An explicit version on an existing bundle dependency follows the target bundle."""
+    ver = dep.child("version")
+    if ver is None:
+        return
+    text = ver.text(pom.src)
+    if text == bundle["version"]:
+        return
+    if "${" in text:
+        warnings.append("%s: the bundle dependency's version is %s; set that property to %s" % (pom.ga, text, bundle["version"]))
+        return
+    pom.src = pomedit.set_text(pom.src, ver, bundle["version"])
+    pom.reparse()
+    pom.actions.append("bundle version %s -> %s" % (text, bundle["version"]))
+
+
 def install_enforcer(root_pom: Pom, banned: List[str], boot_excludes: List[str], coordinate: str, boot_version: Optional[str],
                      includes: Optional[List[str]] = None) -> None:
     excludes = ["<exclude>%s</exclude>" % ga for ga in banned]
@@ -680,13 +900,16 @@ def main() -> None:
     ap.add_argument("--patch", default="out/consumer-patch.json")
     ap.add_argument("--project", required=True, help="checkout of the consumer project")
     ap.add_argument("--root-pom", default="", help="root POM of the build (default: <project>/pom.xml)")
+    ap.add_argument("--record", default="", help="the tool's record in the project (default: <project>/.mvn/rebundle.json): read for what to undo, rewritten with this run's changes")
+    ap.add_argument("--effective-pom", default="", help="help:effective-pom of the project: a restored dependency whose version the project manages is declared without one")
     ap.add_argument("--dry-run", action="store_true", help="compute the diff, write nothing")
     ap.add_argument("--out", default="out/consumer-apply.json")
     ap.add_argument("--diff", default="out/consumer-apply.diff")
     args = ap.parse_args()
 
     patch = read_json(args.patch)
-    if not patch.get("tree_provided"):
+    unbundle = bool(patch.get("unbundle"))
+    if not patch.get("tree_provided") and not unbundle:
         fail("the patch was generated without the consumer's dependency tree; run gen_consumer_patch.py with --tree first")
     project = Path(args.project).resolve()
     if not project.is_dir():
@@ -706,45 +929,98 @@ def main() -> None:
     warnings: List[str] = []
     touched: List[Pom] = []
     removed: set = set()
+    record_path = record_path_for(project, args.record)
+    record = load_record(record_path)
+    new_record = record or {"version": 1, "tool": "mvn-rebundle", "bundle": None, "modules": {}, "enforcer_includes": []}
+    managed_all = managed_versions(args.effective_pom)
+    prev_versions = {"%s:%s" % (g.get("groupId"), g.get("artifactId")): g.get("version") for g in (patch.get("previous") or {}).get("components") or []}
+    transition = patch.get("transition") or {}
     variants = embedded_variants(patch.get("embedded") or [])
     kept_variants: List[str] = []
     declared_variants: List[str] = []
+    restored: List[str] = []
+    exclusions_dropped: List[str] = []
+    declarations_dropped: List[str] = []
     for module in patch.get("modules", []):
+        restore = module.get("restore") or {}
+        restoring = any(restore.get(k) for k in ("restore_direct", "drop_exclusions", "drop_test_jars"))
         changes = bool(module.get("remove_direct") or module.get("exclusions"))
-        if not changes and not module.get("redeclare"):
+        uses_bundle = bool(module.get("uses_bundle"))
+        if not changes and not module.get("redeclare") and not restoring and not uses_bundle:
             continue
         pom = poms.get(module["module"])
         if pom is None:
             warnings.append("module %s has changes in the proposal but no pom.xml was found for it" % module["module"])
             continue
+        mrec = module_record(new_record, module["module"])
+        managed = managed_all.get(module["module"], {})
+        # what left the bundle comes back first: the declarations the switch deleted, the exclusions and the test jars it added for them
+        for ga, info in (restore.get("restore_direct") or {}).items():
+            note = restore_dependency(pom, poms, project, ga, dict(info, fallback_version=prev_versions.get(ga)), managed, bundle_ga)
+            if note:
+                restored.append("%s: %s" % (pom.ga, note))
+            mrec["removed_direct"].pop(ga, None)
+        for direct_ga, targets in (restore.get("drop_exclusions") or {}).items():
+            exclusions_dropped += ["%s: %s from %s" % (pom.ga, t, direct_ga) for t in drop_exclusions(pom, poms, direct_ga, targets)]
+            left = [t for t in mrec["exclusions_added"].get(direct_ga, []) if t not in targets]
+            if left:
+                mrec["exclusions_added"][direct_ga] = left
+            else:
+                mrec["exclusions_added"].pop(direct_ga, None)
+        for tj in restore.get("drop_test_jars") or []:
+            ga = "%s:%s" % (tj.get("groupId"), tj.get("artifactId"))
+            if drop_declaration(pom, poms, ga, tj.get("classifier")):
+                declarations_dropped.append("%s: %s:%s" % (pom.ga, ga, tj.get("classifier")))
+            mrec["test_jars_declared"] = [t for t in mrec["test_jars_declared"]
+                                         if (t.get("groupId"), t.get("artifactId"), t.get("classifier")) != (tj.get("groupId"), tj.get("artifactId"), tj.get("classifier"))]
         seen = set(module.get("test_variants") or {})
+        captured: List[dict] = []
         for ga in module.get("remove_direct", {}):
-            kept_variants += remove_dependency(pom, poms, ga, removed, warnings,
-                                               keep=lambda o, d, ga=ga: keeps_test_variant(o, poms, d, ga, variants, seen))
+            kept_variants += remove_dependency(pom, poms, ga, removed, warnings, keep=lambda o, d, ga=ga: keeps_test_variant(o, poms, d, ga, variants, seen),
+                                               captured=captured, project=project)
+        for info in captured:
+            mrec["removed_direct"].setdefault("%s:%s" % (info["groupId"], info["artifactId"]), info)
         for direct_ga, info in module.get("exclusions", {}).items():
-            add_exclusions(pom, poms, direct_ga, info.get("targets", []), warnings)
+            added = add_exclusions(pom, poms, direct_ga, info.get("targets", []), warnings)
+            if added:
+                have = mrec["exclusions_added"].setdefault(direct_ga, [])
+                have += [t for t in added if t not in have]
         for key, entry in (module.get("redeclare") or {}).items():
             if redeclare_variant(pom, poms, entry):
                 declared_variants.append("%s: %s %s" % (pom.ga, key, entry.get("version")))
-        if not changes:
+                mrec["test_jars_declared"].append({"groupId": entry["groupId"], "artifactId": entry["artifactId"], "classifier": entry.get("classifier"), "version": entry.get("version")})
+        if unbundle:
+            remove_dependency(pom, poms, bundle_ga, set(), [])
+            touched.append(pom)
+            continue
+        if not changes and not uses_bundle:
             continue
         touched.append(pom)
-        add_bundle_dependency(pom, bundle, with_version=not multi_module, exclusions=list(module.get("bundle_exclusions") or {}))
+        add_bundle_dependency(pom, bundle, with_version=not multi_module, exclusions=list(module.get("bundle_exclusions") or {}), warnings=warnings)
+        mrec["bundle_exclusions"] = list(module.get("bundle_exclusions") or {})
         if module.get("direct") is not None:
             unseen = profile_dependencies_unseen(pom, poms, project, module["direct"], set(banned) | {bundle_ga})
             if unseen:
                 warnings.append("%s: not in the dependency tree because the profile was not active when it ran: %s. If they bring an embedded coordinate, rerun the consumer tree with the profile active (CONSUMER_MAVEN_ARGS=-P<id>) or add the exclusions by hand" % (pom.ga, ", ".join(unseen)))
-    if multi_module and touched:
-        manage_bundle_version(root_pom, bundle)
-    # before the Boot plugin alignment: a pluginManagement entry created here for the plugin's dependencies
-    # is then seen by the alignment, so a first and a second run make the same decision about its version
-    plugins_report = [apply_plugin_entry(e, poms, root_pom, bundle, warnings) for e in (patch.get("plugins") or [])]
+    plugins_report: List[dict] = []
     plugin_report = None
-    if touched and patch.get("boot_embedded") and patch.get("spring_boot_version"):
-        plugin_report = {"version": patch["spring_boot_version"],
-                         "notes": align_boot_plugin(touched, poms, project, patch["spring_boot_version"], warnings)}
-    includes = sorted(set(patch.get("enforcer_includes") or []) | set(declared_test_variants(poms, variants)))
-    install_enforcer(root_pom, banned, patch.get("boot_line_excludes") or [], patch["coordinate"], patch.get("spring_boot_version"), includes)
+    includes: List[str] = []
+    if unbundle:
+        remove_managed_bundle(root_pom, bundle)
+        remove_enforcer(root_pom)
+    else:
+        if multi_module and touched:
+            manage_bundle_version(root_pom, bundle)
+        # before the Boot plugin alignment: a pluginManagement entry created here for the plugin's dependencies
+        # is then seen by the alignment, so a first and a second run make the same decision about its version
+        plugins_report = [apply_plugin_entry(e, poms, root_pom, bundle, warnings) for e in (patch.get("plugins") or [])]
+        if touched and patch.get("boot_embedded") and patch.get("spring_boot_version"):
+            plugin_report = {"version": patch["spring_boot_version"],
+                             "notes": align_boot_plugin(touched, poms, project, patch["spring_boot_version"], warnings)}
+        includes = sorted(set(patch.get("enforcer_includes") or []) | set(declared_test_variants(poms, variants)))
+        install_enforcer(root_pom, banned, patch.get("boot_line_excludes") or [], patch["coordinate"], patch.get("spring_boot_version"), includes)
+        new_record["bundle"] = patch["coordinate"]
+        new_record["enforcer_includes"] = includes
 
     changed = [p for p in poms.values() if p.changed()]
     diff_chunks = []
@@ -755,14 +1031,27 @@ def main() -> None:
     diff_text = "".join(diff_chunks)
     Path(args.diff).parent.mkdir(parents=True, exist_ok=True)
     Path(args.diff).write_text(diff_text, encoding="utf-8")
+    record_action = "dry run"
     if not args.dry_run:
         for p in changed:
             p.path.write_text(p.src, encoding="utf-8")
+        if unbundle:
+            if record_path.is_file():
+                record_path.unlink()
+                record_action = "deleted"
+            else:
+                record_action = "absent"
+        else:
+            record_path.parent.mkdir(parents=True, exist_ok=True)
+            before = record_path.read_text(encoding="utf-8") if record_path.is_file() else None
+            write_json(record_path, new_record)
+            after = record_path.read_text(encoding="utf-8")
+            record_action = "unchanged" if before == after else ("written" if before is None else "updated")
 
     unresolved = [s for s in patch.get("synthetic", []) if not s.get("resolved")]
     for s in unresolved:
         warnings.append("embedded jar %s has no known coordinates in the consumer tree; exclude it by hand" % s["gav"].get("artifactId"))
-    branch = "rebundle/%s-%s" % (bundle["artifactId"], bundle["version"])
+    branch = "rebundle/%s-%s" % (bundle["artifactId"], "removed" if unbundle else bundle["version"])
     result = {
         "project": str(project),
         "root_pom": str(root_pom.path),
@@ -774,6 +1063,12 @@ def main() -> None:
         "plugins": plugins_report,
         "test_variants": {"kept": kept_variants, "declared": declared_variants},
         "enforcer_includes": includes,
+        "transition": transition or None,
+        "unbundle": unbundle,
+        "restored": restored,
+        "exclusions_dropped": exclusions_dropped,
+        "declarations_dropped": declarations_dropped,
+        "record": {"path": record_rel(record_path, project), "action": record_action, "used": record is not None},
         "dry_run": args.dry_run,
     }
     write_json(args.out, result)
@@ -786,6 +1081,12 @@ def main() -> None:
         log("  [test jar] kept %s: the bundle does not contain it" % k)
     for k in declared_variants:
         log("  [test jar] declared %s with test scope" % k)
+    for r in restored:
+        log("  [restored] %s" % r)
+    for e in exclusions_dropped:
+        log("  [exclusion dropped] %s" % e)
+    for d in declarations_dropped:
+        log("  [declaration dropped] %s" % d)
     for w in warnings:
         log("  [WARN] %s" % w)
     for n in (plugin_report or {}).get("notes", []):
@@ -793,6 +1094,7 @@ def main() -> None:
     for pr in plugins_report:
         for n in pr["notes"]:
             log("  [plugin] %s: %s" % (pr["plugin"], n))
+    log("Record %s: %s" % (result["record"]["path"], record_action))
     log("Diff written to %s; suggested branch %s" % (args.diff, branch))
 
 

@@ -1,0 +1,295 @@
+// mvn-rebundle / change: add jars to a bundle that is already in Nexus, replace or remove components of it, and
+// publish the result under a new version.
+//
+// The bundle is fetched by coordinates (jar, POM, sources jar when published; groupId:artifactId alone means the
+// newest release). CHANGES holds one token per line: groupId:artifactId:version[:classifier] adds a jar from
+// Nexus, -token (artifactId, groupId:artifactId or g:a:v) removes an embedded component. With SOURCE_REF the
+// add tokens select jars in an application instead (SELECT syntax: artifactId, groupId:artifactId, * for every
+// jar the bundle lacks), taken from the image, the Nexus artifact, the URL or the path exactly as the main job
+// does; what the bundle already embeds is skipped, another version of it replaces only when named. ADD_JAR
+// uploads a jar (File Parameter plugin).
+//
+// maven-shade-plugin merges the added jars followed by a copy of the bundle, with the transformers of the
+// original build: an entry both have is taken from the added jar (a hot fix wins), a jar whose
+// groupId:artifactId is already embedded replaces that component (its entries are removed from the bundle copy
+// first), a jar identical to an embedded component is skipped. A removed component leaves the copy the same way
+// and becomes an ordinary dependency of the published POM, so consumers keep it on the classpath, managed by
+// Maven again; related components (same family, same groupId and version) leave together. The new manifest
+// lists the new contents and records which bundle this one came from, so the consumer job can propose the
+// matching POM change. The result is verified against the inputs and, with PUBLISH=true, uploaded by
+// deploy-file under NEW_VERSION, or <version>.1 (counting up for a bundle that is itself a change; a SNAPSHOT
+// keeps its version); nothing is rebuilt between verification and upload. NOTIFY_CONSUMERS then triggers the
+// consumer job for every project registered for the bundle in config/consumers.json.
+//
+// Agent requirements (Linux): JDK 17+, Maven 3.6+, Python 3.8+; docker or crane (and the aws CLI for ECR) when
+// SOURCE_REF is an image. Jenkins plugins: Pipeline, Credentials Binding, File Parameter (the stashedFile
+// parameter type). Site-specific settings live in `environment`.
+// Job setup: "Pipeline script from SCM", Script Path = jenkins/Jenkinsfile.change. The first run only
+// registers the parameters; use "Build with Parameters" afterwards.
+
+def withNexusCredentials(Closure body) {
+    if (env.NEXUS_CREDENTIALS_ID?.trim()) {
+        withCredentials([usernamePassword(credentialsId: env.NEXUS_CREDENTIALS_ID,
+                                          usernameVariable: 'NEXUS_USERNAME',
+                                          passwordVariable: 'NEXUS_PASSWORD')]) {
+            body()
+        }
+    } else {
+        body()
+    }
+}
+
+// Credentials needed to read a source artifact; `auth` is what `extract_source.py --detect` printed. Reading the
+// bundle, the coordinates to add and the removed components from Nexus is the 'nexus' case.
+def withSourceCredentials(String auth, Closure body) {
+    if (auth == 'ecr' && env.AWS_CREDENTIALS_ID?.trim()) {
+        withCredentials([aws(credentialsId: env.AWS_CREDENTIALS_ID,
+                             accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+            body()
+        }
+    } else if (auth == 'nexus' && env.SOURCE_CREDENTIALS_ID?.trim()) {
+        withCredentials([usernamePassword(credentialsId: env.SOURCE_CREDENTIALS_ID,
+                                          usernameVariable: 'SOURCE_USERNAME', passwordVariable: 'SOURCE_PASSWORD')]) {
+            body()
+        }
+    } else {
+        body()
+    }
+}
+
+// The consumers registered for the published bundle, each started as its own consumer job build.
+def notifyConsumers() {
+    def coord = sh(returnStdout: true, script: '"$PY" -c "import json; print(json.load(open(\'out/publish.json\'))[\'coordinate\'])"').trim()
+    sh '"$PY" scripts/list_consumers.py --bundle "' + coord + '" --config config/consumers.json --out out/consumers.txt --json-out out/consumers.json'
+    def lines = fileExists('out/consumers.txt') ? readFile('out/consumers.txt').tokenize('\n').findAll { it.trim() } : []
+    if (!lines) {
+        echo "No consumer is registered for ${coord} in config/consumers.json; run ${env.CONSUMER_JOB} by hand with BUNDLE_COORDINATES=${coord}"
+        return
+    }
+    lines.each { line ->
+        def f = line.split('\t')
+        build job: env.CONSUMER_JOB, wait: false, propagate: false,
+              parameters: [string(name: 'BUNDLE_COORDINATES', value: coord), string(name: 'CONSUMER_GIT_URL', value: f[0]),
+                           string(name: 'CONSUMER_GIT_REF', value: f[1]), booleanParam(name: 'APPLY', value: f[2] == 'true')]
+        echo "Started ${env.CONSUMER_JOB} for ${f[0]} (${f[1]}, APPLY=${f[2]}) with ${coord}"
+    }
+}
+
+pipeline {
+    agent any            // or: agent { label 'maven-docker' }
+
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+    parameters {
+        string(name: 'BUNDLE_COORDINATES', defaultValue: '',
+               description: 'groupId:artifactId:version of the published bundle to change, or groupId:artifactId for its newest release')
+        text(name: 'CHANGES', defaultValue: '',
+             description: 'One token per line. Add: groupId:artifactId:version[:classifier] from Nexus, or with SOURCE_REF a SELECT token in that application (artifactId | groupId:artifactId | * for every jar the bundle lacks). Remove: -artifactId | -groupId:artifactId | -g:a:v; related components (family, same groupId and version) leave with it')
+        string(name: 'SOURCE_REF', defaultValue: '',
+               description: 'Optional application the added jars are taken from: an image reference (append #/path when the application is not at DEFAULT_APP_PATH), Maven coordinates, an http(s) URL or a path on the agent. Jars the bundle already embeds are skipped, other versions of them replace only when named')
+        stashedFile(name: 'ADD_JAR',
+                    description: 'A jar to merge into the bundle. Its coordinates come from its pom.properties, else from the Nexus checksum search, else it is embedded under synthetic coordinates. A jar whose groupId:artifactId is already embedded replaces that component; an entry the bundle already holds is taken from this jar (hot fix)')
+        string(name: 'NEW_VERSION', defaultValue: '',
+               description: 'Version of the new bundle. Empty: <version>.1, counting up for a bundle that is itself a change; a SNAPSHOT keeps its version. A version Nexus already has is refused')
+        booleanParam(name: 'PUBLISH', defaultValue: false,
+                     description: 'Upload the verified jar, its POM and the sources jar to Nexus; false builds and verifies only')
+        booleanParam(name: 'NOTIFY_CONSUMERS', defaultValue: true,
+                     description: 'After publishing, start the consumer job for every project registered for this bundle in config/consumers.json')
+    }
+
+    environment {
+        // ---- site specific: edit once -------------------------------------------------------
+        NEXUS_RELEASE_URL     = 'https://nexus.example.com/repository/maven-releases/'
+        NEXUS_SNAPSHOT_URL    = 'https://nexus.example.com/repository/maven-snapshots/'
+        NEXUS_MAVEN_REPO_URL  = 'https://nexus.example.com/repository/maven-public/'   // the bundle, the coordinates to add and the removed components are fetched here
+        NEXUS_DOCKER_REGISTRY = 'nexus-docker.example.com'   // host[:port] of the Nexus Docker registry; images from it log in with SOURCE_CREDENTIALS_ID
+        NEXUS_CREDENTIALS_ID  = 'nexus-deploy'   // username/password credential for publishing; empty = anonymous (cannot publish)
+        SOURCE_CREDENTIALS_ID = 'nexus-deploy'   // Nexus credential for reading; may equal NEXUS_CREDENTIALS_ID
+        AWS_CREDENTIALS_ID    = ''               // SOURCE_REF in ECR: AWS credential ID (CloudBees AWS Credentials plugin); empty = the agent's instance role
+        MAVEN_MIRROR_URL      = ''               // Maven mirror for the Shade build, e.g. the group repository above; empty = Maven Central
+        CREATE_SOURCES_JAR    = 'true'           // needs the sources jars of the bundle and the added jars in Nexus; missing ones only warn
+        DEFAULT_APP_PATH      = '/app/app.jar'   // SOURCE_REF as an image: application path inside it (fat jar, or /workspace for buildpacks, /app for Jib)
+        IMAGE_PLATFORM        = ''               // e.g. linux/amd64 for multi-arch images; empty = default
+        IMAGE_TOOL            = 'auto'           // auto | docker | crane
+        CONSUMER_JOB          = 'mvn-rebundle-consumer'   // started for every consumer registered in config/consumers.json
+        // -----------------------------------------------------------------------------------
+        NEXUS_HOSTS = "${NEXUS_DOCKER_REGISTRY},${NEXUS_MAVEN_REPO_URL},${NEXUS_RELEASE_URL},${NEXUS_SNAPSHOT_URL}"
+        MAVEN_LOCAL_REPO = "${WORKSPACE}/work/m2"   // job-local repository: the inputs are installed here from the fetched bytes
+        PY        = 'python3'
+        MVN_FLAGS = "-B -ntp -s work/settings.xml -Dmaven.repo.local=${WORKSPACE}/work/m2"
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                sh '''
+                    rm -rf work out && mkdir -p work out work/upload
+                    echo "mvn-rebundle revision: $(git rev-parse --short HEAD 2>/dev/null || echo unknown) ($(git log -1 --format=%cd --date=short 2>/dev/null || echo 'no git checkout'))"
+                    "$PY" --version
+                    java -version
+                    mvn -v
+                '''
+                writeFile file: 'work/changes.txt', text: params.CHANGES ?: ''
+                sh '"$PY" scripts/gen_maven_settings.py --server-id nexus --mirror-url "$MAVEN_MIRROR_URL" --out work/settings.xml'
+            }
+        }
+
+        stage('Fetch bundle') {
+            steps {
+                script {
+                    if (!params.BUNDLE_COORDINATES?.trim()) {
+                        error 'BUNDLE_COORDINATES is required: groupId:artifactId:version of the published bundle, or groupId:artifactId for its newest release'
+                    }
+                    withSourceCredentials('nexus') {
+                        // with SOURCE_REF the add tokens are resolved in the application later (work/adds.txt); here only the removals
+                        sh '''
+                            set --
+                            if [ -n "${SOURCE_REF:-}" ]; then set -- --adds-from-source --adds-out work/adds.txt; fi
+                            "$PY" scripts/fetch_bundle.py "$@" --bundle "$BUNDLE_COORDINATES" --changes-file work/changes.txt --repo-url "$NEXUS_MAVEN_REPO_URL" \
+                                --out work/bundle-in --added-out work/added --meta out/rework-bundle.json
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Fetch source') {
+            when { expression { params.SOURCE_REF?.trim() } }
+            steps {
+                script {
+                    // kind, auth and host are detected from the reference; bind only the credentials that are needed
+                    def detected = sh(returnStdout: true,
+                                      script: '"$PY" scripts/extract_source.py --detect --ref "$SOURCE_REF" --nexus-hosts "$NEXUS_HOSTS"').trim()
+                    echo "Source detected: ${detected}"
+                    withSourceCredentials(detected.tokenize()[1]) {
+                        sh '''
+                            "$PY" scripts/extract_source.py --ref "$SOURCE_REF" --path "$DEFAULT_APP_PATH" --nexus-hosts "$NEXUS_HOSTS" \
+                                --image-tool "$IMAGE_TOOL" --platform "$IMAGE_PLATFORM" --maven-repo-url "$NEXUS_MAVEN_REPO_URL" \
+                                --out work/app --meta out/source.json
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Inspect application') {
+            when { expression { params.SOURCE_REF?.trim() } }
+            steps {
+                script {
+                    // the inventory identifies the jars like the main job; the selection then skips what the bundle already embeds
+                    withSourceCredentials('nexus') {
+                        sh '''
+                            "$PY" scripts/inspect_app.py --source out/source.json --repo-url "$NEXUS_MAVEN_REPO_URL" --out out/inventory.json
+                            if [ -s work/adds.txt ]; then
+                                "$PY" scripts/resolve_selection.py --inventory out/inventory.json --select-file work/adds.txt \
+                                    --bundle-meta out/rework-bundle.json --policy config/policy.json --out out/selection.json
+                            else
+                                echo "CHANGES names nothing to add from the application"
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Uploaded jar') {
+            // the File Parameter plugin stashes the upload under the parameter name and puts the original
+            // file name into ADD_JAR_FILENAME; nothing is set when no file was chosen
+            when { expression { env.ADD_JAR_FILENAME?.trim() } }
+            steps {
+                dir('work/upload') {
+                    unstash 'ADD_JAR'
+                }
+                sh 'mv work/upload/ADD_JAR "work/upload/$ADD_JAR_FILENAME" && ls -l work/upload'
+            }
+        }
+
+        stage('Plan change') {
+            steps {
+                script {
+                    // the repository identifies uploaded jars and provides the removed and replaced components
+                    withSourceCredentials('nexus') {
+                        sh '''
+                            set --
+                            if [ -n "${ADD_JAR_FILENAME:-}" ]; then set -- "$@" --add-jar "work/upload/$ADD_JAR_FILENAME"; fi
+                            if [ -f out/selection.json ]; then set -- "$@" --selection out/selection.json; fi
+                            "$PY" scripts/rework_bundle.py "$@" --bundle-meta out/rework-bundle.json --new-version "$NEW_VERSION" \
+                                --repo-url "$NEXUS_MAVEN_REPO_URL" --release-url "$NEXUS_RELEASE_URL" --snapshot-url "$NEXUS_SNAPSHOT_URL" \
+                                --server-id nexus --sources-jar "$CREATE_SOURCES_JAR" --policy config/policy.json --out work/rework \
+                                --manifest-out out/bundle-manifest.json --plan-out out/rework-plan.json
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Build bundle') {
+            steps {
+                script {
+                    withSourceCredentials('nexus') {
+                        withNexusCredentials {
+                            // every input is installed into the job-local repository from the fetched bytes: the bundle with
+                            // the POM it was published with, the added jars with theirs, the removed components too (the
+                            // published POM declares them)
+                            sh '''
+                                "$PY" scripts/install_components.py --manifest out/bundle-manifest.json --settings work/settings.xml \
+                                    --repo-url "$NEXUS_MAVEN_REPO_URL" --local-repo "$MAVEN_LOCAL_REPO"
+                            '''
+                            sh 'mvn $MVN_FLAGS -f work/rework/pom.xml clean verify'
+                            // the published POM: the previous bundle POM's dependencies at their versions, the removed
+                            // components as ordinary dependencies, the added jars' dependencies kept and reported
+                            sh '"$PY" scripts/finalize_bundle_pom.py --manifest out/bundle-manifest.json --report out/bundle-pom.json'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Verify bundle') {
+            steps {
+                sh '"$PY" scripts/verify_bundle.py --manifest out/bundle-manifest.json --out out/bundle-verification.json'
+            }
+        }
+
+        stage('Publish to Nexus') {
+            when { expression { params.PUBLISH } }
+            steps {
+                script {
+                    if (!env.NEXUS_CREDENTIALS_ID?.trim()) {
+                        error 'PUBLISH=true requires NEXUS_CREDENTIALS_ID in the environment block'
+                    }
+                    withNexusCredentials {
+                        // deploy-file uploads the jar that was just verified; nothing is rebuilt
+                        sh '''
+                            "$PY" scripts/publish_bundle.py --manifest out/bundle-manifest.json \
+                                --verification out/bundle-verification.json --settings work/settings.xml \
+                                --release-url "$NEXUS_RELEASE_URL" --snapshot-url "$NEXUS_SNAPSHOT_URL" --server-id nexus \
+                                --local-repo "$MAVEN_LOCAL_REPO" --out out/publish.json
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Notify consumers') {
+            when { allOf { expression { params.PUBLISH }; expression { params.NOTIFY_CONSUMERS } } }
+            steps {
+                script {
+                    notifyConsumers()
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '"$PY" scripts/write_summary.py --out-dir out || true'
+            archiveArtifacts artifacts: 'out/**, work/rework/pom.xml, work/rework/target/*.jar, work/rework/target/*.pom, work/rework/target/dependency-reduced-pom.xml',
+                             allowEmptyArchive: true, fingerprint: true
+        }
+    }
+}

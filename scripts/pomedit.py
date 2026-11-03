@@ -296,3 +296,59 @@ def existing_exclusions(dep: Element, src: str) -> List[Tuple[str, str]]:
     if exc is None:
         return []
     return [(e.child_text(src, "groupId") or "", e.child_text(src, "artifactId") or "") for e in exc.children_named("exclusion")]
+
+
+def preceding_comment(src: str, el: Element, marker: str) -> Optional[Tuple[int, int]]:
+    """Offsets of a comment line right above the element whose text starts with marker, else None."""
+    a, _ = element_span_with_line(src, el)
+    prev_end = a - 1
+    if prev_end < 0 or src[prev_end] != "\n":
+        return None
+    line_begin = src.rfind("\n", 0, prev_end) + 1
+    line = src[line_begin:prev_end].strip()
+    if line.startswith("<!--") and line.endswith("-->") and line[4:-3].strip().startswith(marker) and line.count("<!--") == 1:
+        return line_begin, prev_end + 1
+    return None
+
+
+def remove_element_and_comment(src: str, el: Element, marker: str = "mvn-rebundle:") -> str:
+    """Remove an element together with the tool's comment line right above it, when there is one."""
+    a, b = element_span_with_line(src, el)
+    c = preceding_comment(src, el, marker)
+    if c is not None:
+        a = c[0]
+    return src[:a] + src[b:]
+
+
+def remove_exclusions(src: str, dep: Element, targets) -> Tuple[str, List[str]]:
+    """Remove the <exclusion> entries of a dependency for the given groupId:artifactId targets; an <exclusions>
+    container left empty goes too. Returns the new source and the targets actually removed."""
+    removed: List[str] = []
+    wanted = {tuple(t.split(":", 1)) for t in targets}
+    while True:
+        root = parse(src)
+        node = _locate(root, dep, src)
+        exc = node.child("exclusions") if node is not None else None
+        if exc is None:
+            break
+        hit = next((e for e in exc.children_named("exclusion")
+                    if (e.child_text(src, "groupId") or "", e.child_text(src, "artifactId") or "") in wanted), None)
+        if hit is None:
+            if not exc.children_named("exclusion"):
+                src = remove_element(src, exc)
+            break
+        removed.append("%s:%s" % (hit.child_text(src, "groupId") or "", hit.child_text(src, "artifactId") or ""))
+        src = remove_element(src, hit)
+    return src, removed
+
+
+def _locate(root: Element, dep: Element, src: str) -> Optional[Element]:
+    """The element of a re-parsed tree that stands where dep stood (same start offset after edits above it only
+    happen inside dep itself, so the start offset is stable)."""
+    stack = [root]
+    while stack:
+        el = stack.pop()
+        if el.start == dep.start and el.tag == dep.tag:
+            return el
+        stack.extend(el.children)
+    return None

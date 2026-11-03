@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bundlelib import log, split_filename  # noqa: E402
+from bundlelib import BUNDLE_CONTENTS_ATTR, fail, log, parse_contents_attr, read_manifest, split_filename  # noqa: E402
 
 
 SYNTHETIC_GROUP = "rebundle.unidentified"
@@ -116,6 +116,34 @@ class Repository:
 
     def exists(self, g: str, a: str, v: str, ext: str = "pom", classifier: Optional[str] = None) -> bool:
         return self._get(self.artifact_url(g, a, v, ext, classifier)) is not None
+
+    def versions(self, g: str, a: str) -> List[str]:
+        """Versions the artifact-level maven-metadata.xml lists, oldest first; [] when the repository has none."""
+        data = self._get("%s/%s/%s/maven-metadata.xml" % (self.repo_url, g.replace(".", "/"), a))
+        if not data:
+            return []
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError:
+            return []
+        versions = [(v.text or "").strip() for v in root.iter("version") if (v.text or "").strip()]
+        release = (root.findtext("./versioning/release") or "").strip()
+        if release and release not in versions:
+            versions.append(release)
+        return versions
+
+    def latest_version(self, g: str, a: str) -> Optional[str]:
+        """The newest release the metadata lists (<release>, else the last version that is no SNAPSHOT)."""
+        data = self._get("%s/%s/%s/maven-metadata.xml" % (self.repo_url, g.replace(".", "/"), a))
+        if data:
+            try:
+                release = (ET.fromstring(data).findtext("./versioning/release") or "").strip()
+                if release:
+                    return release
+            except ET.ParseError:
+                pass
+        releases = [v for v in self.versions(g, a) if not v.endswith("-SNAPSHOT")]
+        return releases[-1] if releases else None
 
     def search_sha1(self, sha1: str) -> List[dict]:
         hits: List[dict] = []
@@ -287,3 +315,38 @@ def identify_jar(name: str, sha1: str, manifest: Dict[str, str], repo: Optional[
                                                                 "not available" if not (repo and repo.enabled) else "differs from the repository artifact")
             return gav, src, note, [g for g, _ in unique]
     return None, "unknown", "no candidate confirmed", [dict(g, source=s) for g, s in unique]
+
+
+def resolve_bundle_ref(repo: "Repository", ref: str) -> dict:
+    """groupId:artifactId[:version] of a published bundle; without a version the newest release in the repository."""
+    parts = ref.split(":")
+    if len(parts) not in (2, 3) or not all(parts):
+        fail("a bundle is groupId:artifactId:version, or groupId:artifactId for its newest release; got '%s'" % ref)
+    gav = {"groupId": parts[0], "artifactId": parts[1]}
+    if len(parts) == 3:
+        gav["version"] = parts[2]
+        return gav
+    if repo is None or not repo.enabled:
+        fail("'%s' names no version and no repository is configured to look the newest one up" % ref)
+    version = repo.latest_version(parts[0], parts[1])
+    if not version:
+        fail("no release of %s:%s in %s (maven-metadata.xml has none)" % (parts[0], parts[1], repo.repo_url))
+    log("  %s:%s resolves to the newest release %s" % (parts[0], parts[1], version))
+    gav["version"] = version
+    return gav
+
+
+def bundle_contents(repo: "Repository", gav: dict) -> Tuple[List[dict], Dict[str, str]]:
+    """The embedded coordinates and the manifest attributes of a published bundle jar."""
+    import io
+    import zipfile
+
+    data = repo.artifact(gav["groupId"], gav["artifactId"], gav["version"])
+    if data is None:
+        fail("%s:%s:%s is not in %s" % (gav["groupId"], gav["artifactId"], gav["version"], repo.repo_url))
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        attrs = read_manifest(zf)
+    contents = parse_contents_attr(attrs.get(BUNDLE_CONTENTS_ATTR, ""))
+    if not contents:
+        fail("%s:%s:%s is not an mvn-rebundle bundle (no %s manifest attribute)" % (gav["groupId"], gav["artifactId"], gav["version"], BUNDLE_CONTENTS_ATTR))
+    return contents, attrs

@@ -20,6 +20,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bundlelib import overlaps_file_text  # noqa: E402
 from identify import SYNTHETIC_GROUP  # noqa: E402
 from bundlelib import (  # noqa: E402
     AppArtifact,
@@ -378,6 +379,19 @@ def main() -> None:
     for c in components:
         lines.append("%s  %s  %s" % (c["coordinate"], c["sha256"], c["file"]))
     (res_root / "BUNDLE-CONTENTS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # entries several components carry: which copy the bundle keeps, so that a later removal of a component
+    # knows which shadowed copy to restore and which identical copy to keep
+    coord_of = {c["file"]: c["coordinate"] for c in components}
+    overlaps = {}
+    for c in (sel.get("overlaps") or {}).get("conflicts") or []:
+        overlaps[c["path"]] = {"kept": coord_of.get(c["winner"], c["winner"]), "others": [coord_of.get(s, s) for s in c["shadowed"]], "identical": False}
+    for i in (sel.get("overlaps") or {}).get("identical") or []:
+        if isinstance(i, dict) and i.get("providers"):
+            providers = [coord_of.get(p, p) for p in i["providers"]]
+            overlaps[i["path"]] = {"kept": providers[0], "others": providers[1:], "identical": True}
+    (res_root / "BUNDLE-OVERLAPS.txt").write_text(overlaps_file_text(
+        ["Dependency bundle %s:%s:%s" % (args.group_id, args.artifact_id, args.version),
+         "Entries carried by several components; the bundle keeps the first copy in class-loading order"], overlaps), encoding="utf-8")
 
     manifest = {
         "bundle": {"groupId": args.group_id, "artifactId": args.artifact_id, "version": args.version},

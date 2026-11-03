@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Rework stage 1: fetch a published bundle, and the jars to add to it, from the repository.
+"""Change job, stage 1: fetch a published bundle, and the jars to add to it, from the repository.
 
 Downloads the bundle jar, its POM and, when the repository has one, its sources jar by coordinates (SNAPSHOT
-versions resolved through maven-metadata.xml), checks that the jar is an mvn-rebundle bundle, reads its
-manifest (contents, source, Spring Boot version, origin) and its published POM, and writes what
-rework_bundle.py needs to --meta. Every --add coordinate (groupId:artifactId:version[:classifier]) is
-downloaded the same way, jar and POM, sources when present. Basic auth uses SOURCE_USERNAME /
-SOURCE_PASSWORD, as for every other access to the repository.
+versions resolved through maven-metadata.xml; groupId:artifactId alone means the newest release), checks that
+the jar is an mvn-rebundle bundle, reads its manifest (contents, source, Spring Boot version, origin) and its
+published POM, and writes what rework_bundle.py needs to --meta. The CHANGES parameter (--changes-file) holds
+one token per line: groupId:artifactId:version[:classifier] is a jar to add, downloaded the same way (jar and
+POM, sources when present), -token names a component to remove (resolved by rework_bundle.py against the
+bundle's contents). With --adds-from-source the add tokens are not coordinates but a selection in an
+application (resolve_selection.py reads them from --adds-out); only the removals are kept here. Basic auth uses
+SOURCE_USERNAME / SOURCE_PASSWORD, as for every other access to the repository.
 """
 from __future__ import annotations
 
@@ -37,8 +40,8 @@ from bundlelib import (  # noqa: E402
     utc_now_iso,
     write_json,
 )
-from extract_source import maven_artifact_url, parse_maven_ref  # noqa: E402
-from identify import Repository  # noqa: E402
+from extract_source import maven_artifact_url  # noqa: E402
+from identify import Repository, resolve_bundle_ref  # noqa: E402
 
 
 def parse_add_token(tok: str) -> dict:
@@ -109,20 +112,20 @@ def pom_dependencies(path: Path) -> list:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--bundle", required=True, help="groupId:artifactId:version of the published bundle")
+    ap.add_argument("--bundle", required=True, help="groupId:artifactId:version of the published bundle, or groupId:artifactId for its newest release")
     ap.add_argument("--add", action="append", default=[], help="groupId:artifactId:version[:classifier] to add from the repository (repeatable)")
-    ap.add_argument("--add-file", default="", help="file with one such coordinate per line (the ADD_COORDINATES parameter)")
+    ap.add_argument("--remove", action="append", default=[], help="component to remove (passed on to rework_bundle.py; repeatable)")
+    ap.add_argument("--changes-file", default="", help="file with one token per line: a coordinate to add, or -token to remove (the CHANGES parameter)")
+    ap.add_argument("--adds-from-source", action="store_true", help="the add tokens select jars in an application instead of naming coordinates")
+    ap.add_argument("--adds-out", default="", help="with --adds-from-source: file that receives the add tokens for resolve_selection.py")
     ap.add_argument("--repo-url", required=True, help="repository the bundle and the coordinates are fetched from (Nexus group URL)")
     ap.add_argument("--out", default="work/bundle-in", help="directory for the bundle's files")
     ap.add_argument("--added-out", default="work/added", help="directory for the added coordinates' files")
     ap.add_argument("--meta", default="out/rework-bundle.json")
     args = ap.parse_args()
 
-    bundle = parse_maven_ref(args.bundle)
-    if bundle["packaging"] != "jar" or bundle.get("classifier"):
-        fail("--bundle must be groupId:artifactId:version of the bundle jar")
-    gav = {"groupId": bundle["groupId"], "artifactId": bundle["artifactId"], "version": bundle["version"]}
     repo = Repository(args.repo_url)
+    gav = resolve_bundle_ref(repo, args.bundle)
     fetcher = Fetcher(repo)
 
     log("Fetching bundle %s from %s" % (gav_str(gav), repo.repo_url))
@@ -142,8 +145,20 @@ def main() -> None:
 
     added = []
     tokens = list(args.add)
-    if args.add_file and Path(args.add_file).is_file():
-        tokens += parse_selection_text(Path(args.add_file).read_text(encoding="utf-8"))
+    removals = list(args.remove)
+    if args.changes_file and Path(args.changes_file).is_file():
+        for tok in parse_selection_text(Path(args.changes_file).read_text(encoding="utf-8")):
+            if tok.startswith("-"):
+                if len(tok) > 1:
+                    removals.append(tok[1:])
+            else:
+                tokens.append(tok)
+    source_adds = []
+    if args.adds_from_source:
+        source_adds, tokens = tokens, []
+        if args.adds_out:
+            Path(args.adds_out).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.adds_out).write_text("".join(t + "\n" for t in source_adds), encoding="utf-8")
     seen = set()
     for tok in tokens:
         g = parse_add_token(tok)
@@ -181,6 +196,9 @@ def main() -> None:
         "contents_file": parse_contents_file(contents_text),
         "pom_dependencies": pom_dependencies(pom),
         "added": added,
+        "add_tokens": source_adds,
+        "adds_from_source": args.adds_from_source,
+        "remove_tokens": removals,
         "fetched_at": utc_now_iso(),
     }
     write_json(args.meta, meta)
@@ -190,6 +208,10 @@ def main() -> None:
         (", reworked from %s" % attrs.get(BUNDLE_REWORKED_FROM_ATTR)) if attrs.get(BUNDLE_REWORKED_FROM_ATTR) else ""))
     if added:
         log("%d coordinate(s) fetched to add: %s" % (len(added), ", ".join(a["coordinate"] for a in added)))
+    if source_adds:
+        log("%d token(s) to resolve in the application: %s" % (len(source_adds), ", ".join(source_adds)))
+    if removals:
+        log("%d component(s) to remove: %s" % (len(removals), ", ".join(removals)))
     log("Metadata written to %s" % args.meta)
 
 

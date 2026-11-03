@@ -255,7 +255,10 @@ def main() -> None:
                     help="exit 1 when findings of this scope exist (default none: report only)")
     ap.add_argument("--out", default="out/equivalence.json")
     ap.add_argument("--findings-out", default="", help="findings one per line (default: <out>-findings.txt)")
+    ap.add_argument("--transition", default="", help="bundle_diff.py's transition: the old build uses the previous bundle, and the moves it describes are expected")
     args = ap.parse_args()
+    transition = read_json(args.transition) if args.transition and Path(args.transition).is_file() else {}
+    expected_out = {ga_str(g) for g in transition.get("removed") or []}
 
     old_path = args.old or (read_json(args.old_source)["local_path"] if args.old_source else None)
     new_path = args.new or (read_json(args.new_source)["local_path"] if args.new_source else None)
@@ -319,16 +322,32 @@ def main() -> None:
     new_by_key = {key(j): j for j in new_jars}
     old_by_sha = {j["sha256"]: j for j in old_jars}
     embedded_sha = bundle.get("contents_sha") or {}   # coordinate -> sha256 from BUNDLE-CONTENTS.txt
-    replaced, replaced_keys, missing_in_old, other_version = [], set(), [], []
+    # the old build may use a previous version of the bundle: what it embedded counts as present in the old build
+    old_bundles = [j for j in old_jars if j["contents_attr"] and j is not bundle and not j["project"]]
+    old_embedded = {}
+    for ob in old_bundles:
+        for g in parse_contents_attr(ob["contents_attr"]):
+            old_embedded[gav_str(g)] = {"gav": g, "sha": (ob["contents_sha"] or {}).get(gav_str(g)), "bundle": ob}
+    if old_bundles:
+        check("bundle-version-changed", True, "old build: %s; new build: %s" % (
+            ", ".join(gav_str(j["gav"]) if j["gav"] else j["name"] for j in old_bundles), gav_str(bundle["gav"]) if bundle["gav"] else bundle["name"]))
+    replaced, carried, replaced_keys, missing_in_old, other_version = [], [], set(), [], []
     for g in embedded:
         k = gav_str(g)
         match = old_by_sha.get(embedded_sha.get(k, "")) or old_by_key.get(k)
+        if match is None and k in old_embedded:
+            carried.append(k)
+            continue
         if match is None:
             # the old build may carry the coordinate at another version (the consumer moved on)
-            same_ga = [j for j in old_jars if j["gav"] and ga_str(j["gav"]) == ga_str(g) and key(j) not in replaced_keys]
+            same_ga = [j for j in old_jars if j["gav"] and ga_str(j["gav"]) == ga_str(g) and key(j) not in replaced_keys and not j["contents_attr"]]
+            prev = next((e for c, e in old_embedded.items() if ga_str(e["gav"]) == ga_str(g)), None)
             if same_ga:
                 match = same_ga[0]
                 other_version.append("%s %s in the old build, %s in the bundle" % (ga_str(g), match["gav"]["version"], g["version"]))
+            elif prev is not None:
+                carried.append(k)
+                other_version.append("%s %s in the old bundle, %s in the new one" % (ga_str(g), prev["gav"].get("version"), g["version"]))
             else:
                 missing_in_old.append(k)
         if match is not None:
@@ -339,7 +358,8 @@ def main() -> None:
         parts.append("not in the old build: " + ", ".join(missing_in_old))
     if other_version:
         parts.append("at another version in the old build: " + "; ".join(other_version))
-    check("embedded-coordinates-match-old-build", not parts, "; ".join(parts) if parts else ", ".join(replaced))
+    check("embedded-coordinates-match-old-build", not parts,
+          "; ".join(parts) if parts else ", ".join(replaced) + ((" (carried over from the old bundle: %d)" % len(carried)) if carried else ""))
 
     embedded_shas = set(embedded_sha.values())
     leftovers = [key(j) for j in new_jars if j is not bundle
@@ -347,8 +367,26 @@ def main() -> None:
     check("original-coordinates-removed", not leftovers,
           "still on the classpath next to the bundle: %s (exclusions incomplete)" % ", ".join(leftovers) if leftovers else "none of the embedded coordinates remain")
 
-    removed = sorted(set(old_by_key) - set(new_by_key) - replaced_keys)
+    removed = sorted(set(old_by_key) - set(new_by_key) - replaced_keys - {key(ob) for ob in old_bundles})
     added = sorted(set(new_by_key) - set(old_by_key) - {key(bundle)})
+    # a jar that left the bundle appears as a plain jar now: expected when its bytes are the ones the old bundle embedded
+    moved_out, moved_out_changed = [], []
+    for ak in list(added):
+        nj = new_by_key[ak]
+        prev = old_embedded.get(ak) or (next((e for e in old_embedded.values() if nj["gav"] and ga_str(e["gav"]) == ga_str(nj["gav"])), None))
+        if prev is None:
+            continue
+        added.remove(ak)
+        if prev["sha"] and prev["sha"] == nj["sha256"]:
+            moved_out.append(ak)
+        elif prev["sha"] is None and ga_str(prev["gav"]) in expected_out:
+            moved_out.append(ak)
+        else:
+            moved_out_changed.append("%s (the old bundle embedded %s)" % (ak, gav_str(prev["gav"])))
+    if moved_out:
+        info("moved-out-of-the-bundle", "%d jar(s) left the bundle and are on the classpath with the same bytes: %s" % (len(moved_out), ", ".join(moved_out)), scope=DEPS)
+    if moved_out_changed:
+        added += moved_out_changed
     # a jar removed and one added with the same groupId:artifactId is a version change; for the
     # project's own modules that is the CI version stamp of the original build
     rebuilt, version_changed = [], []

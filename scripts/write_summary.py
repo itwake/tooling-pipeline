@@ -65,14 +65,28 @@ def main() -> None:
     md = ["# Run summary", ""]
     if rework:
         v = rework["version"]
-        md += ["## Rework of `%s`" % rework["bundle"], "",
+        md += ["## Change of `%s`" % rework["bundle"], "",
                "- New coordinates: `%s` (version %s)" % (rework["new_coordinate"], "given" if v.get("source") == "parameter" else "derived"),
                "- Descends from: `%s`" % rework.get("base")]
+        src = rework.get("source") or {}
+        if src:
+            md.append("- Jars taken from the application `%s`%s%s" % (
+                src.get("ref"), (" (Spring Boot %s)" % src["spring_boot_version"]) if src.get("spring_boot_version") else "",
+                ("; already embedded, skipped: %s" % ", ".join("`%s`" % s for s in src["skipped"])) if src.get("skipped") else ""))
+            for c in src.get("conflicts") or []:
+                md.append("  - WARNING: `%s` left out (%s): the bundle embeds `%s`; name it in CHANGES to replace that version" % (c["selected"], c["reason"], c["embedded"]))
+        for r in rework.get("removed", []):
+            md.append("- removed `%s` (%s): %d entries removed%s%s%s; it is an ordinary dependency of the published POM now" % (
+                r["coordinate"], r.get("reason"), r.get("removed_entries", 0),
+                (", %d kept as identical copies of other components" % r["kept_identical"]) if r.get("kept_identical") else "",
+                (", %d restored from the components it had shadowed" % len(r["restored"])) if r.get("restored") else "",
+                (", lines trimmed in %s" % ", ".join("`%s`" % p for p in r["merged_lines"])) if r.get("merged_lines") else ""))
         for a in rework.get("added", []):
             if a.get("action") == "skip":
                 md.append("- `%s` (%s): skipped, %s" % (a["name"], a.get("origin"), a.get("reason")))
                 continue
-            line = "- `%s` (%s): %s as `%s` (%s)" % (a["name"], a.get("origin"), a.get("action"), a.get("coordinate"), a.get("gav_source"))
+            line = "- `%s` (%s): %s as `%s` (%s%s)" % (a["name"], a.get("origin"), a.get("action"), a.get("coordinate"), a.get("gav_source"),
+                                                       ("; %s" % a["selection_reason"]) if a.get("selection_reason") else "")
             rep = a.get("replaces") or {}
             if rep:
                 strip = rep.get("strip") or {}
@@ -145,8 +159,10 @@ def main() -> None:
             md.append("")
     if bundle_pom:
         new = bundle_pom.get("new") or []
-        kept = [d for d in bundle_pom.get("kept", []) if d not in new]
+        kept = [d for d in bundle_pom.get("kept", []) if d not in new and d not in (bundle_pom.get("unbundled") or [])]
         md += ["## Published POM", "", "- Kept: %s" % (", ".join(coord(d) for d in kept) or "no promoted dependencies")]
+        if bundle_pom.get("unbundled"):
+            md.append("- Taken out of the jar, declared as ordinary dependencies: " + ", ".join(coord(d) for d in bundle_pom["unbundled"]))
         if new:
             md.append("- New, promoted from the added jars' POMs (make sure the consumer has or wants them): " + ", ".join(coord(d) for d in new))
         if bundle_pom.get("pruned"):
@@ -160,6 +176,33 @@ def main() -> None:
             md.append("- Application coordinates unknown: nothing pruned")
         md.append("")
     if patch:
+        t = patch.get("transition") or {}
+        prev = (patch.get("previous") or {}).get("coordinate")
+        if prev or patch.get("unbundle"):
+            md += ["## Transition: %s -> %s" % (prev or "no bundle", "no bundle" if patch.get("unbundle") else patch.get("coordinate")), ""]
+            parts = []
+            if t.get("added"):
+                parts.append("- Added to the bundle: " + ", ".join(coord(g) for g in t["added"]))
+            if t.get("removed"):
+                parts.append("- Removed from the bundle: " + ", ".join(coord(g) for g in t["removed"]))
+            if t.get("replaced"):
+                parts.append("- Embedded at another version: " + ", ".join("`%s:%s` %s -> %s" % (r["new"].get("groupId"), r["new"].get("artifactId"), r["old"].get("version"), r["new"].get("version")) for r in t["replaced"]))
+            sb = t.get("spring_boot") or {}
+            if sb.get("from") and sb.get("to") and sb["from"] != sb["to"]:
+                parts.append("- Spring Boot %s -> %s" % (sb["from"], sb["to"]))
+            md += parts or ["- no change in the embedded coordinates"]
+            for m in patch.get("modules") or []:
+                r = m.get("restore") or {}
+                for ga, info in (r.get("restore_direct") or {}).items():
+                    md.append("- %s: declare `%s` again%s" % (m["module"], ga, (" at %s" % info["version"]) if info.get("version") else ""))
+                for direct, targets in (r.get("drop_exclusions") or {}).items():
+                    md.append("- %s: drop the exclusion of %s on `%s`" % (m["module"], ", ".join("`%s`" % x for x in targets), direct))
+                for tj in r.get("drop_test_jars") or []:
+                    md.append("- %s: drop the test jar declaration `%s:%s:%s`" % (m["module"], tj.get("groupId"), tj.get("artifactId"), tj.get("classifier")))
+                for n in r.get("notes") or []:
+                    md.append("- %s: %s" % (m["module"], n))
+            md.append("- Record of the switch (.mvn/rebundle.json): %s" % ("used" if patch.get("record_used") else "none, the undo is approximate"))
+            md.append("")
         md += ["## Consumer patch proposal", "", "See consumer-patch.md. %s" % (
             "Exact per-module change list derived from the dependency tree." if patch.get("tree_provided")
             else "No consumer dependency tree was provided; generic instructions only.")]
@@ -210,6 +253,15 @@ def main() -> None:
             md.append("- test jar declared with test scope: %s" % k)
         for k in tv.get("kept") or []:
             md.append("- test jar kept: %s" % k)
+        for r in applied.get("restored") or []:
+            md.append("- %s" % r)
+        for e in applied.get("exclusions_dropped") or []:
+            md.append("- exclusion dropped: %s" % e)
+        for d in applied.get("declarations_dropped") or []:
+            md.append("- test jar declaration dropped: %s" % d)
+        rec = applied.get("record") or {}
+        if rec:
+            md.append("- Record `%s`: %s" % (rec.get("path"), rec.get("action")))
         md.append("")
     if plugin_check:
         md += ["## Plugin dependency check: %s" % (

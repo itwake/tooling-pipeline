@@ -599,6 +599,122 @@ def main() -> None:
            derive_version("1.0.0", "1.0.0") == "1.0.0.1" and derive_version("2.1.7", "2.1") == "2.1.8" and derive_version("2.1.7", "3.0") == "2.1.7.1"
            and derive_version("1.0.0-SNAPSHOT", None) == "1.0.0-SNAPSHOT")
 
+        # ---- change job: removals, seeds, jars from an application --------------------------
+        print("[change bundle]")
+        for c in man["components"]:  # every component in the repository, so removals can fetch their jars
+            g = c["gav"]
+            fx.put_artifact(nexus_root, g["groupId"], g["artifactId"], g["version"], work / "fixture" / "libs" / Path(c["path_in_app"]).name)
+        (nexus_root / "repository" / "maven-public" / "com" / "company" / "platform" / "thirdparty-bundle" / "maven-metadata.xml").write_text(
+            '<metadata><groupId>com.company.platform</groupId><artifactId>thirdparty-bundle</artifactId><versioning><release>1.0.0.1</release>'
+            '<versions><version>1.0.0</version><version>1.0.0.1</version></versions></versioning></metadata>', encoding="utf-8")
+        run("resolve_selection.py", "--inventory", out / "inventory.json", "--select", "@com.company.platform:thirdparty-bundle:1.0.0\n-commons-io\nsnakeyaml",
+            "--repo-url", repo_url, "--out", out / "sel-seed.json", env=with_creds)
+        seed = read_json(out / "sel-seed.json")
+        seed_names = [d["name"] for d in seed["selected"]]
+        ok("a @bundle token seeds the selection with the bundle's contents, minus the exclusions, plus the named jars",
+           seed["seeds"][0]["selected"] == 9 and seed["seeds"][0]["missing"] == [] and len(seed_names) == 10
+           and "commons-io-2.16.1.jar" not in seed_names and "snakeyaml-2.2.jar" in seed_names
+           and seed["selected"][0]["reasons"][0].startswith("selected: @com.company.platform:thirdparty-bundle:1.0.0 (")
+           and any(f["code"] == "excluded-related" for f in seed["findings"]))
+        run("fetch_bundle.py", "--bundle", "com.company.platform:thirdparty-bundle", "--repo-url", repo_url, "--out", work / "ch-latest", "--meta", out / "ch-latest.json", env=with_creds)
+        ok("groupId:artifactId alone is the newest release", read_json(out / "ch-latest.json")["coordinate"] == "com.company.platform:thirdparty-bundle:1.0.0.1")
+        (work / "changes-io.txt").write_text("-commons-io\n", encoding="utf-8")
+        run("fetch_bundle.py", "--bundle", "com.company.platform:thirdparty-bundle:1.0.0", "--changes-file", work / "changes-io.txt", "--repo-url", repo_url,
+            "--out", work / "ch-in", "--meta", out / "ch-bundle.json", env=with_creds)
+        ok("CHANGES: a -token is a removal", read_json(out / "ch-bundle.json")["remove_tokens"] == ["commons-io"] and not read_json(out / "ch-bundle.json")["added"])
+        chproj = work / "change-io"
+        run("rework_bundle.py", "--bundle-meta", out / "ch-bundle.json", "--repo-url", repo_url, "--release-url", release, "--snapshot-url", snapshot, "--new-version", "1.2.0",
+            "--out", chproj, "--manifest-out", out / "ch-manifest.json", "--plan-out", out / "ch-plan.json", env=with_creds)
+        chman = read_json(out / "ch-manifest.json")
+        chplan = read_json(out / "ch-plan.json")
+        chpom = (chproj / "pom.xml").read_text(encoding="utf-8")
+        with zipfile.ZipFile(chman["inputs"][-1]["file"]) as zf:
+            ch_names = zf.namelist()
+        ok("a removed component leaves the bundle copy with its legal files and becomes a dependency of the published POM",
+           [r["coordinate"] for r in chplan["removed"]] == ["commons-io:commons-io:2.16.1"] and chplan["removed"][0]["removed_entries"] > 0
+           and chplan["removed"][0]["legal_dir"] == "META-INF/third-party/commons-io-2.16.1/" and chplan["removed"][0]["pom_in_repository"]
+           and "org/apache/commons/io/FileUtils.class" not in ch_names and not any(n.startswith("META-INF/third-party/commons-io") for n in ch_names)
+           and "commons-io:commons-io:2.16.1" not in chman["contents_attr"] and len(chman["components"]) == 9
+           and "<artifactId>commons-io</artifactId>\n      <version>2.16.1</version>" in chpom and "<include>commons-io:commons-io</include>" not in chpom
+           and chpom.count("<include>") == 1 and [i["name"] for i in chman["install"] if i.get("role") == "unbundled"] == ["commons-io-2.16.1.jar"]
+           and chman["install"][-1]["pom_file"] and chman["rework"]["removed"][0]["reason"] == "named in CHANGES")
+        ch_inputs = [Path(i["file"]) for i in chman["inputs"]]
+        ch_bundle = dict(bundle, version="1.2.0")
+        ch_good = fx.simulate_shade(chproj, ch_inputs, ch_bundle, chman["contents_attr"], source_attr, True, chproj / "target" / "thirdparty-bundle-1.2.0.jar",
+                                    boot_version="3.3.5", extra_manifest=r_extra)
+        fx.write_reduced_pom(chproj / "target" / "dependency-reduced-pom.xml", ch_bundle, [("org.yaml", "snakeyaml", "2.2"), ("commons-io", "commons-io", "2.16.1")])
+        run("finalize_bundle_pom.py", "--manifest", out / "ch-manifest.json", "--report", out / "ch-pom.json")
+        chfin = read_json(out / "ch-pom.json")
+        run("verify_bundle.py", "--manifest", out / "ch-manifest.json", "--out", out / "ch-verification.json")
+        chver = read_json(out / "ch-verification.json")
+        chchecks = {c["check"]: c for c in chver["checks"]}
+        ch_pom_path = chproj / "target" / "thirdparty-bundle-1.2.0.pom"
+        ok("the published POM declares the removed component as an ordinary dependency and the verification checks it",
+           [d["artifactId"] for d in chfin["unbundled"]] == ["commons-io"] and not chfin["new"] and not chfin["unbundled_missing"] and chver["ok"]
+           and chchecks["pom-declares-removed-components"]["status"] == "pass" and chchecks["pom-promotes-only-application-dependencies"]["status"] == "pass"
+           and "<artifactId>commons-io</artifactId>" in ch_pom_path.read_text(encoding="utf-8") and chver["rework"]["removed"] == ["commons-io:commons-io:2.16.1"])
+        stale_io = fx.simulate_shade(chproj, ch_inputs + [libs["commons-io"]], ch_bundle, chman["contents_attr"], source_attr, True, chproj / "target" / "stale-io.jar",
+                                     boot_version="3.3.5", extra_manifest=r_extra)
+        run("verify_bundle.py", "--manifest", out / "ch-manifest.json", "--bundle", stale_io, "--out", out / "ch-bv-stale.json", expect=1)
+        ok("entries of a removed component that survive the merge fail the verification",
+           any(c["check"] == "no-unexpected-entries" and c["status"] == "fail" and "FileUtils" in c["detail"] for c in read_json(out / "ch-bv-stale.json")["checks"]))
+        (work / "changes-spring.txt").write_text("-spring-core\n", encoding="utf-8")
+        run("fetch_bundle.py", "--bundle", "com.company.platform:thirdparty-bundle:1.0.0", "--changes-file", work / "changes-spring.txt", "--repo-url", repo_url,
+            "--out", work / "ch2-in", "--meta", out / "ch2-bundle.json", env=with_creds)
+        run("rework_bundle.py", "--bundle-meta", out / "ch2-bundle.json", "--repo-url", repo_url, "--new-version", "1.3.0", "--out", work / "change-spring",
+            "--manifest-out", out / "ch2-manifest.json", "--plan-out", out / "ch2-plan.json", env=with_creds)
+        ch2 = read_json(out / "ch2-plan.json")
+        ok("related components leave together: the family and the same groupId and version",
+           [r["coordinate"] for r in ch2["removed"]] == ["org.springframework:spring-core:6.1.14", "org.springframework.boot:spring-boot:3.3.5",
+                                                          "org.springframework.boot:spring-boot-starter-tomcat:3.3.5", "org.springframework:spring-jcl:6.1.14"]
+           and ch2["removed"][1]["reason"].startswith("family org.springframework") and "org.springframework" not in read_json(out / "ch2-manifest.json")["contents_attr"]
+           and any(r["merged_lines"] for r in ch2["removed"]))
+        (work / "changes-app.txt").write_text("snakeyaml\ncommons-io\nvendor-sdk\n", encoding="utf-8")
+        run("fetch_bundle.py", "--bundle", "com.company.platform:thirdparty-bundle:1.0.0", "--changes-file", work / "changes-app.txt", "--adds-from-source",
+            "--adds-out", work / "adds-app.txt", "--repo-url", repo_url, "--out", work / "ch3-in", "--meta", out / "ch3-bundle.json", env=with_creds)
+        ch3meta = read_json(out / "ch3-bundle.json")
+        ok("with a source application the add tokens are kept for the selection instead of being fetched",
+           ch3meta["add_tokens"] == ["snakeyaml", "commons-io", "vendor-sdk"] and not ch3meta["added"] and (work / "adds-app.txt").read_text(encoding="utf-8").split() == ch3meta["add_tokens"])
+        run("resolve_selection.py", "--inventory", out / "inventory.json", "--select-file", work / "adds-app.txt", "--bundle-meta", out / "ch3-bundle.json", "--out", out / "sel-app.json")
+        selapp = read_json(out / "sel-app.json")
+        ok("the selection skips what the bundle already embeds and keeps the rest",
+           [d["name"] for d in selapp["selected"]] == ["snakeyaml-2.2.jar", "vendor-sdk-2.0.0.jar"] and selapp["embedded_mode"]["skipped"] == ["commons-io:commons-io:2.16.1"]
+           and any(f["code"] == "already-embedded" for f in selapp["findings"]) and not selapp["embedded_mode"]["conflicts"])
+        run("rework_bundle.py", "--bundle-meta", out / "ch3-bundle.json", "--selection", out / "sel-app.json", "--repo-url", repo_url, "--new-version", "1.4.0",
+            "--out", work / "change-app", "--manifest-out", out / "ch3-manifest.json", "--plan-out", out / "ch3-plan.json", env=with_creds)
+        ch3 = read_json(out / "ch3-plan.json")
+        ch3man = read_json(out / "ch3-manifest.json")
+        ok("jars taken out of the application are added with their identified coordinates",
+           [(a["name"], a["action"], a["origin"], a["gav_source"]) for a in ch3["added"]] == [("snakeyaml-2.2.jar", "add", "application app.jar", "pom.properties"),
+                                                                                             ("vendor-sdk-2.0.0.jar", "add", "application app.jar", "nexus-search+sha1")]
+           and ch3man["contents_attr"].startswith("org.yaml:snakeyaml:2.2,com.vendor:vendor-sdk:2.0.0,") and len(ch3man["components"]) == 12
+           and ch3["source"]["ref"].endswith("app.jar") and ch3["source"]["skipped"] == ["commons-io:commons-io:2.16.1"]
+           and all(Path(i["file"]).is_file() for i in ch3man["install"]))
+        run("resolve_selection.py", "--inventory", out / "inventory.json", "--select", "*", "--bundle-meta", out / "ch3-bundle.json", "--out", out / "sel-all.json")
+        selall = read_json(out / "sel-all.json")
+        ok("* against a bundle selects only what the bundle lacks", len(selall["selected"]) == len(libs) - 10 and len(selall["embedded_mode"]["skipped"]) == 10)
+        (work / "changes-bad.txt").write_text("-nosuchthing\n", encoding="utf-8")
+        run("fetch_bundle.py", "--bundle", "com.company.platform:thirdparty-bundle:1.0.0", "--changes-file", work / "changes-bad.txt", "--repo-url", repo_url,
+            "--out", work / "ch4-in", "--meta", out / "ch4-bundle.json", env=with_creds)
+        text = run("rework_bundle.py", "--bundle-meta", out / "ch4-bundle.json", "--repo-url", repo_url, "--new-version", "1.9.0", "--out", work / "change-bad",
+                   "--manifest-out", out / "ch4-manifest.json", "--plan-out", out / "ch4-plan.json", env=with_creds, expect=2)
+        ok("a removal that matches no component is refused", "matches no component" in text and not (out / "ch4-manifest.json").exists())
+        run("fetch_bundle.py", "--bundle", "com.company.platform:thirdparty-bundle:1.0.0.1", "--remove", "hotfix", "--repo-url", repo_url,
+            "--out", work / "ch5-in", "--meta", out / "ch5-bundle.json", env=with_creds)
+        text = run("rework_bundle.py", "--bundle-meta", out / "ch5-bundle.json", "--repo-url", repo_url, "--out", work / "change-syn",
+                   "--manifest-out", out / "ch5-manifest.json", "--plan-out", out / "ch5-plan.json", env=with_creds, expect=2)
+        ok("a component under synthetic coordinates cannot be removed", "synthetic coordinates" in text and "rebuild the bundle with the main job" in text)
+        chsum = work / "out-change"
+        chsum.mkdir(exist_ok=True)
+        shutil.copy(out / "ch-plan.json", chsum / "rework-plan.json")
+        shutil.copy(out / "ch-pom.json", chsum / "bundle-pom.json")
+        run("write_summary.py", "--out-dir", chsum)
+        chsum_md = (chsum / "SUMMARY.md").read_text(encoding="utf-8")
+        ok("summary describes the removal and the unbundled dependency",
+           "## Change of `com.company.platform:thirdparty-bundle:1.0.0`" in chsum_md
+           and "- removed `commons-io:commons-io:2.16.1` (named in CHANGES)" in chsum_md and "it is an ordinary dependency of the published POM now" in chsum_md
+           and "- Taken out of the jar, declared as ordinary dependencies: `commons-io:commons-io:2.16.1`" in chsum_md)
+
         # ---- stage 7: consumer patch -------------------------------------------------------
         print("[consumer patch]")
         tree = work / "dependency-tree.txt"
@@ -695,6 +811,99 @@ def main() -> None:
            and any("app-batch" in w for w in read_json(out / "apply-single.json")["warnings"]))
         ok("boot plugin not declared in the checkout: warning only",
            any("spring-boot-maven-plugin is not declared" in w for w in read_json(out / "apply-single.json")["warnings"]))
+
+        # ---- the transition to a bundle that lost a coordinate, and leaving the bundle --------------
+        print("[consumer transition]")
+        record = read_json(cons / ".mvn" / "rebundle.json")
+        ok("the switch leaves a record of what it changed",
+           record["bundle"] == "com.company.platform:thirdparty-bundle:1.0.0" and list(record["modules"]["com.example:app"]["removed_direct"]) == ["commons-io:commons-io"]
+           and record["modules"]["com.example:app"]["removed_direct"]["commons-io:commons-io"]["version"] == "2.16.1"
+           and record["modules"]["com.example:app"]["exclusions_added"]["org.apache.commons:commons-text"] == ["commons-io:commons-io"]
+           and record["modules"]["com.example:app-batch"]["exclusions_added"]["com.example:app"] == ["commons-io:commons-io"]
+           and record["modules"]["com.example:app"]["bundle_exclusions"] == ["org.yaml:snakeyaml"])
+        tree_sw = work / "tree-switched.txt"
+        tree_sw.write_text(fx.SAMPLE_TREE_SWITCHED, encoding="utf-8")
+        eff = work / "effective-switched.xml"
+        eff.write_text(fx.SAMPLE_EFFECTIVE_POM_SWITCHED, encoding="utf-8")
+        text = run("bundle_diff.py", "--detect", "--bundle", "com.company.platform:thirdparty-bundle", "--effective-pom", eff, "--out", out / "current.json")
+        ok("the bundle version a project uses is read from its effective POM",
+           text.strip().splitlines()[-1] == "com.company.platform:thirdparty-bundle:1.0.0" and read_json(out / "current.json")["current"]["modules"] == ["com.example:app"])
+        text = run("bundle_diff.py", "--detect", "--bundle", "none", "--record", cons / ".mvn" / "rebundle.json", "--out", out / "current2.json")
+        ok("'none' alone names the bundle through the record", text.strip().splitlines()[-1] == "com.company.platform:thirdparty-bundle:1.0.0")
+        run("bundle_diff.py", "--previous-jar", good, "--previous-pom", target / "thirdparty-bundle-1.0.0.pom", "--bundle-jar", ch_good, "--pom", ch_pom_path, "--out", out / "transition.json")
+        tr = read_json(out / "transition.json")
+        ok("the transition between two bundles: what left, what the POM declares now",
+           tr["kind"] == "upgrade" and [gav_str(g) for g in tr["removed"]] == ["commons-io:commons-io:2.16.1"] and not tr["added"] and tr["unchanged"] == 9
+           and [d["artifactId"] for d in tr["pom_added"]] == ["commons-io"])
+        run("gen_consumer_patch.py", "--bundle-jar", ch_good, "--reduced-pom", ch_pom_path, "--previous-jar", good, "--previous-pom", target / "thirdparty-bundle-1.0.0.pom",
+            "--record", cons / ".mvn" / "rebundle.json", "--tree", tree_sw, "--out", out / "cp-transition.md", "--out-json", out / "cp-transition.json")
+        tp = read_json(out / "cp-transition.json")
+        tmods = {m["module"]: m for m in tp["modules"]}
+        ok("the proposal restores what the record says the switch took away for the coordinate that left",
+           tp["transition"]["from"] == "com.company.platform:thirdparty-bundle:1.0.0" and tp["record_used"]
+           and list(tmods["com.example:app"]["restore"]["restore_direct"]) == ["commons-io:commons-io"]
+           and tmods["com.example:app"]["restore"]["drop_exclusions"] == {"org.apache.commons:commons-text": ["commons-io:commons-io"]}
+           and tmods["com.example:app-batch"]["restore"]["drop_exclusions"] == {"com.example:app": ["commons-io:commons-io"]}
+           and not tmods["com.example:app"]["remove_direct"] and tmods["com.example:app"]["uses_bundle"]
+           and list(tmods["com.example:app"]["bundle_exclusions"]) == ["org.yaml:snakeyaml"] and "commons-io:commons-io" in tmods["com.example:app"]["promoted_kept"]
+           and "## Transition: com.company.platform:thirdparty-bundle:1.0.0 -> com.company.platform:thirdparty-bundle:1.2.0" in (out / "cp-transition.md").read_text(encoding="utf-8")
+           and any(f.startswith("[info] transition") for f in (out / "cp-transition-findings.txt").read_text(encoding="utf-8").splitlines()))
+        run("apply_consumer_patch.py", "--patch", out / "cp-transition.json", "--project", cons, "--effective-pom", eff, "--out", out / "apply-tr.json", "--diff", out / "apply-tr.diff")
+        atr = read_json(out / "apply-tr.json")
+        app_pom = (cons / "app" / "pom.xml").read_text(encoding="utf-8")
+        batch_pom = (cons / "app-batch" / "pom.xml").read_text(encoding="utf-8")
+        root_pom = (cons / "pom.xml").read_text(encoding="utf-8")
+        record = read_json(cons / ".mvn" / "rebundle.json")
+        ok("the transition restores the dependency, drops its exclusions, moves the bundle version and regenerates the Enforcer rule",
+           "<artifactId>commons-io</artifactId>\n            <version>2.16.1</version>" in app_pom and app_pom.count("<exclusion>") == 5
+           and batch_pom.count("<exclusion>") == 1 and "<version>1.2.0</version>" in root_pom.split("<dependencyManagement>")[1]
+           and "<exclude>commons-io:commons-io</exclude>" not in root_pom and "thirdparty-bundle:1.2.0" in root_pom
+           and atr["restored"] == ["com.example:app: restored dependency commons-io:commons-io 2.16.1 (the record of the switch)"]
+           and len(atr["exclusions_dropped"]) == 2 and atr["record"]["action"] == "updated" and atr["branch"] == "rebundle/thirdparty-bundle-1.2.0"
+           and record["bundle"] == "com.company.platform:thirdparty-bundle:1.2.0" and not record["modules"]["com.example:app"]["removed_direct"]
+           and "org.apache.commons:commons-text" not in record["modules"]["com.example:app"]["exclusions_added"]
+           and all(ET.fromstring(p.encode("utf-8")) is not None for p in (app_pom, batch_pom, root_pom)))
+        run("apply_consumer_patch.py", "--patch", out / "cp-transition.json", "--project", cons, "--effective-pom", eff, "--out", out / "apply-tr2.json", "--diff", out / "apply-tr2.diff")
+        ok("applying the transition twice changes nothing, the record included",
+           (out / "apply-tr2.diff").read_text(encoding="utf-8") == "" and read_json(out / "apply-tr2.json")["record"]["action"] == "unchanged")
+        old_build = fx.build_new_app(app, good, selected_jars, work / "eq-transition-old.jar")
+        new_build = fx.build_new_app(app, ch_good, selected_jars, work / "eq-transition-new.jar", extra_libs=[libs["commons-io"]])
+        write_json(out / "transition-eq.json", tp["transition"])
+        run("verify_app_equivalence.py", "--old", old_build, "--new", new_build, "--transition", out / "transition-eq.json", "--out", out / "eq-transition.json")
+        eqt = read_json(out / "eq-transition.json")
+        eqt_checks = {c["check"]: c for c in eqt["checks"]}
+        ok("an application rebuilt with the new bundle compares clean against the one built with the old bundle",
+           eqt["ok"] and not eqt["findings"] and eqt_checks["bundle-version-changed"]["status"] == "pass"
+           and eqt_checks["moved-out-of-the-bundle"]["status"] == "info" and "commons-io:commons-io:2.16.1" in eqt_checks["moved-out-of-the-bundle"]["detail"]
+           and "carried over from the old bundle: 9" in eqt_checks["embedded-coordinates-match-old-build"]["detail"]
+           and eqt_checks["dependency-set-unchanged"]["status"] == "pass" and eqt_checks["classpath-entries-identical"]["status"] == "pass")
+        new_missing = fx.build_new_app(app, ch_good, selected_jars, work / "eq-transition-missing.jar")
+        run("verify_app_equivalence.py", "--old", old_build, "--new", new_missing, "--transition", out / "transition-eq.json", "--out", out / "eq-transition-missing.json")
+        ok("a coordinate that left the bundle and is not on the classpath is a missing-entries finding",
+           any(c["check"] == "classpath-entries-identical" and c["status"] == "diff" and "FileUtils" in c["detail"] for c in read_json(out / "eq-transition-missing.json")["checks"]))
+        run("gen_consumer_patch.py", "--unbundle", "--previous-jar", ch_good, "--previous-pom", ch_pom_path, "--record", cons / ".mvn" / "rebundle.json",
+            "--out", out / "cp-unbundle.md", "--out-json", out / "cp-unbundle.json")
+        up = read_json(out / "cp-unbundle.json")
+        ok("leaving the bundle undoes every recorded change",
+           up["unbundle"] and up["tree_provided"] and not up["banned"] and up["transition"]["kind"] == "unbundle"
+           and {m["module"]: m["restore"]["drop_exclusions"] for m in up["modules"]}["com.example:app"] == {
+               "org.springframework.boot:spring-boot-starter-web": ["org.springframework.boot:spring-boot", "org.springframework:spring-core", "org.springframework:spring-jcl"]}
+           and "# Leaving com.company.platform:thirdparty-bundle:1.2.0" in (out / "cp-unbundle.md").read_text(encoding="utf-8"))
+        run("apply_consumer_patch.py", "--patch", out / "cp-unbundle.json", "--project", cons, "--effective-pom", eff, "--out", out / "apply-unbundle.json", "--diff", out / "apply-unbundle.diff")
+        au = read_json(out / "apply-unbundle.json")
+        app_pom = (cons / "app" / "pom.xml").read_text(encoding="utf-8")
+        root_pom = (cons / "pom.xml").read_text(encoding="utf-8")
+        ok("after leaving the bundle the POMs declare no bundle, no ban and the original exclusions only",
+           "thirdparty-bundle" not in app_pom and "thirdparty-bundle" not in root_pom and "thirdparty-bundle" not in (cons / "app-batch" / "pom.xml").read_text(encoding="utf-8")
+           and "ban-bundled-coordinates" not in root_pom and "enforce-versions" in root_pom and root_pom.count("<execution>") == 1
+           and app_pom.count("<exclusion>") == 1 and "spring-boot-starter-logging" in app_pom and "<artifactId>commons-io</artifactId>" in app_pom
+           and not (cons / ".mvn" / "rebundle.json").exists() and au["record"]["action"] == "deleted" and au["branch"] == "rebundle/thirdparty-bundle-removed"
+           and ET.fromstring(root_pom.encode("utf-8")) is not None)
+        run("list_consumers.py", "--bundle", "com.company.platform:thirdparty-bundle:1.2.0", "--out", out / "consumers.txt", "--json-out", out / "consumers.json")
+        run("list_consumers.py", "--bundle", "com.company.platform:other-bundle", "--out", out / "consumers-none.txt", "--json-out", out / "consumers-none.json")
+        ok("the consumers registered for a bundle are listed for the fan-out, an unknown bundle has none",
+           (out / "consumers.txt").read_text(encoding="utf-8") == "https://git.example.com/team/orders.git\tmain\ttrue\n"
+           and (out / "consumers-none.txt").read_text(encoding="utf-8") == "" and read_json(out / "consumers-none.json")["consumers"] == [])
 
         # ---- spring-boot-maven-plugin aligned to the embedded Boot version -------------------
         print("[boot plugin alignment]")
@@ -996,6 +1205,28 @@ def main() -> None:
         fx.write_reduced_pom(dup_proj / "target" / "dependency-reduced-pom.xml", dup_bundle, [])
         run("verify_bundle.py", "--manifest", out / "bundle-manifest-dup.json", "--out", out / "bv-dup.json")
         ok("bundle keeping the first copy verifies", read_json(out / "bv-dup.json")["ok"])
+        ok("the bundle records the entry two components carried and which copy it kept",
+           "com/dup/Same.class  com.example.dup:dup-x:1.0  com.example.dup:dup-y:1.0  different" in
+           (dup_proj / "src/main/resources/META-INF/third-party/BUNDLE-OVERLAPS.txt").read_text(encoding="utf-8"))
+        # removing the component whose copy won restores the shadowed copy from the other component's jar
+        fx.put_artifact(nexus_root, dup_bundle["groupId"], dup_bundle["artifactId"], "1.0.0", dup_good, (dup_proj / "target" / "dependency-reduced-pom.xml").read_bytes())
+        for key in ("dup-x", "dup-y"):
+            fx.put_artifact(nexus_root, "com.example.dup", key, "1.0", libs[key])
+        run("fetch_bundle.py", "--bundle", "com.company.platform:dup-bundle:1.0.0", "--remove", "dup-x", "--repo-url", repo_url,
+            "--out", work / "dup-in", "--meta", out / "dup-bundle.json", env=with_creds)
+        run("rework_bundle.py", "--bundle-meta", out / "dup-bundle.json", "--repo-url", repo_url, "--no-expand", "--out", work / "change-dup",
+            "--manifest-out", out / "dup-change-manifest.json", "--plan-out", out / "dup-change-plan.json", env=with_creds)
+        dup_change = read_json(out / "dup-change-plan.json")
+        with zipfile.ZipFile(read_json(out / "dup-change-manifest.json")["inputs"][-1]["file"]) as zf:
+            same_now = zf.read("com/dup/Same.class")
+            dup_overlaps = zf.namelist()
+        with zipfile.ZipFile(libs["dup-y"]) as zf:
+            same_y = zf.read("com/dup/Same.class")
+        ok("removing the winning component puts the shadowed copy back",
+           dup_change["removed"][0]["restored"].get("com/dup/Same.class") == "com.example.dup:dup-y:1.0" and len(dup_change["removed"][0]["restored"]) == 3
+           and same_now == same_y
+           and read_json(out / "dup-change-manifest.json")["contents_attr"] == "com.example.dup:dup-y:1.0"
+           and "META-INF/third-party/BUNDLE-OVERLAPS.txt" not in dup_overlaps)
         dup_bad = fx.simulate_shade(dup_proj, list(reversed(dup_jars)), dup_bundle, dup_man["contents_attr"], source_attr, False, dup_proj / "target" / "dup-bad.jar", boot_version="3.3.5")
         run("verify_bundle.py", "--manifest", out / "bundle-manifest-dup.json", "--bundle", dup_bad, "--out", out / "bv-dup-bad.json", expect=1)
         ok("bundle keeping the wrong copy is rejected", "com/dup/Same.class" in next(c["detail"] for c in read_json(out / "bv-dup-bad.json")["checks"] if c["check"] == "classes-and-resources-identical"))
@@ -1258,7 +1489,7 @@ def main() -> None:
         ok("summary written", (out / "SUMMARY.md").is_file() and "Bundle verification: passed" in summary)
         ok("summary describes the exported artifact", "## Application artifact" in summary and "- File: `app.jar`" in summary
            and "- Content: the archive as it was fetched, byte for byte" in summary)
-        ok("summary describes the rework", "## Rework of `com.company.platform:thirdparty-bundle:1.0.0`" in summary
+        ok("summary describes the change", "## Change of `com.company.platform:thirdparty-bundle:1.0.0`" in summary
            and "- New coordinates: `com.company.platform:thirdparty-bundle:1.0.0.1` (version derived)" in summary
            and "`hotfix.jar` (upload): add as `rebundle.unidentified:hotfix:" in summary and "replaces 1 entry of the bundle: `org/apache/commons/io/FileUtils.class`" in summary)
         run("gen_maven_settings.py", "--mirror-url", "https://nexus.example.com/repository/maven-public/", "--out", work / "settings.xml")

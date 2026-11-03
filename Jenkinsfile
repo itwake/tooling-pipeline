@@ -6,8 +6,10 @@
 // Everything related to a selected jar (same family, same groupId and version, declared dependencies)
 // is merged with it automatically; nothing is refused for policy reasons.
 //
-// Companion jobs: jenkins/Jenkinsfile.consumer (POM change proposal for a consuming project) and
-// jenkins/Jenkinsfile.verify (equivalence check of the application before and after the change).
+// Companion jobs: jenkins/Jenkinsfile.change (add, replace or remove jars of a published bundle),
+// jenkins/Jenkinsfile.consumer (POM change of a consuming project, started here for every project registered in
+// config/consumers.json when the bundle is published) and jenkins/Jenkinsfile.verify (equivalence check of the
+// application before and after the change).
 //
 // Agent requirements (Linux): JDK 17+, Maven 3.6+, Python 3.8+; docker (with a reachable daemon) or
 // crane for images; the aws CLI for images in ECR. Site-specific settings live in `environment`.
@@ -44,6 +46,24 @@ def withSourceCredentials(String auth, Closure body) {
     }
 }
 
+// The consumers registered for the published bundle, each started as its own consumer job build.
+def notifyConsumers() {
+    def coord = sh(returnStdout: true, script: '"$PY" -c "import json; print(json.load(open(\'out/publish.json\'))[\'coordinate\'])"').trim()
+    sh '"$PY" scripts/list_consumers.py --bundle "' + coord + '" --config config/consumers.json --out out/consumers.txt --json-out out/consumers.json'
+    def lines = fileExists('out/consumers.txt') ? readFile('out/consumers.txt').tokenize('\n').findAll { it.trim() } : []
+    if (!lines) {
+        echo "No consumer is registered for ${coord} in config/consumers.json; run ${env.CONSUMER_JOB} by hand with BUNDLE_COORDINATES=${coord}"
+        return
+    }
+    lines.each { line ->
+        def f = line.split('\t')
+        build job: env.CONSUMER_JOB, wait: false, propagate: false,
+              parameters: [string(name: 'BUNDLE_COORDINATES', value: coord), string(name: 'CONSUMER_GIT_URL', value: f[0]),
+                           string(name: 'CONSUMER_GIT_REF', value: f[1]), booleanParam(name: 'APPLY', value: f[2] == 'true')]
+        echo "Started ${env.CONSUMER_JOB} for ${f[0]} (${f[1]}, APPLY=${f[2]}) with ${coord}"
+    }
+}
+
 pipeline {
     agent any            // or: agent { label 'maven-docker' }
 
@@ -57,11 +77,13 @@ pipeline {
         string(name: 'SOURCE_REF', defaultValue: '',
                description: 'Where the application comes from: an image reference (append #/path when the application is not at DEFAULT_APP_PATH), Maven coordinates groupId:artifactId:version[:packaging[:classifier]], an http(s) URL, or a path on the agent. The kind of source and the login it needs are detected from the reference')
         text(name: 'SELECT', defaultValue: '',
-             description: 'Dependencies to merge, one per line: artifactId | groupId:artifactId | groupId:artifactId:version | * for every jar; -name excludes one. Everything related (same family, same groupId and version, declared dependencies) is added automatically. Leave empty to only list the inventory')
+             description: 'Dependencies to merge, one per line: artifactId | groupId:artifactId | groupId:artifactId:version | * for every jar; -name excludes one; @groupId:artifactId[:version] starts from the contents of a published bundle (its newest release without a version), matched by groupId:artifactId in this application. Everything related (same family, same groupId and version, declared dependencies) is added automatically. Leave empty to only list the inventory')
         string(name: 'BUNDLE_ARTIFACT_ID', defaultValue: 'thirdparty-bundle', description: 'artifactId of the bundle; the groupId is BUNDLE_GROUP_ID in the environment block')
         string(name: 'BUNDLE_VERSION', defaultValue: '1.0.0-SNAPSHOT', description: 'version of the bundle; -SNAPSHOT goes to the snapshot repository')
         booleanParam(name: 'PUBLISH', defaultValue: false,
                      description: 'Upload the verified jar, its POM and the sources jar to Nexus; false builds and verifies only')
+        booleanParam(name: 'NOTIFY_CONSUMERS', defaultValue: true,
+                     description: 'After publishing, start the consumer job for every project registered for this bundle in config/consumers.json')
     }
 
     environment {
@@ -79,6 +101,7 @@ pipeline {
         IMAGE_PLATFORM        = ''               // e.g. linux/amd64 for multi-arch images; empty = default
         IMAGE_TOOL            = 'auto'           // auto | docker | crane
         CREATE_SOURCES_JAR    = 'true'
+        CONSUMER_JOB          = 'mvn-rebundle-consumer'   // started for every consumer registered in config/consumers.json
         // -----------------------------------------------------------------------------------
         NEXUS_HOSTS = "${NEXUS_DOCKER_REGISTRY},${NEXUS_MAVEN_REPO_URL},${NEXUS_RELEASE_URL},${NEXUS_SNAPSHOT_URL}"
         MAVEN_LOCAL_REPO = "${WORKSPACE}/work/m2"   // job-local repository: components are installed here from the application's bytes
@@ -135,10 +158,15 @@ pipeline {
             stages {
                 stage('Resolve selection') {
                     steps {
-                        sh '''
-                            "$PY" scripts/resolve_selection.py --inventory out/inventory.json --select-file work/select.txt \
-                                --policy config/policy.json --out out/selection.json
-                        '''
+                        script {
+                            // the repository is read for @bundle tokens (the contents of a published bundle)
+                            withSourceCredentials('nexus') {
+                                sh '''
+                                    "$PY" scripts/resolve_selection.py --inventory out/inventory.json --select-file work/select.txt \
+                                        --policy config/policy.json --repo-url "$NEXUS_MAVEN_REPO_URL" --out out/selection.json
+                                '''
+                            }
+                        }
                     }
                 }
 
@@ -202,6 +230,15 @@ pipeline {
                                 --local-repo "$MAVEN_LOCAL_REPO" --out out/publish.json
                         '''
                     }
+                }
+            }
+        }
+
+        stage('Notify consumers') {
+            when { allOf { expression { params.PUBLISH }; expression { params.SELECT?.trim() }; expression { params.NOTIFY_CONSUMERS } } }
+            steps {
+                script {
+                    notifyConsumers()
                 }
             }
         }

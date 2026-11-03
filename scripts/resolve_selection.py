@@ -29,6 +29,7 @@ from collections import OrderedDict, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from identify import SYNTHETIC_GROUP, Repository, bundle_contents, resolve_bundle_ref, synthetic_hint  # noqa: E402
 from bundlelib import (  # noqa: E402
     AppArtifact,
     COLLAPSE_HARMLESS,
@@ -62,6 +63,9 @@ def main() -> None:
     ap.add_argument("--policy", default=str(Path(__file__).resolve().parent.parent / "config" / "policy.json"))
     ap.add_argument("--no-expand", action="store_true", help="do not add related jars automatically")
     ap.add_argument("--policy-mode", default=None, help=argparse.SUPPRESS)  # accepted for old callers, ignored
+    ap.add_argument("--repo-url", default="", help="repository that holds the bundles named by @groupId:artifactId[:version] tokens")
+    ap.add_argument("--bundle-meta", default="", help="change job: fetch_bundle.py's metadata of the bundle the selection is added to; jars it already "
+                    "embeds are skipped, other versions of them are selected only when named explicitly")
     ap.add_argument("--out", default="out/selection.json")
     args = ap.parse_args()
 
@@ -71,10 +75,12 @@ def main() -> None:
     tokens = parse_selection_text(text)
     if not tokens:
         fail("empty selection")
-    include_tokens = [t for t in tokens if not t.startswith("-")]
+    include_tokens = [t for t in tokens if not t.startswith(("-", "@"))]
     exclude_tokens = [t[1:] for t in tokens if t.startswith("-") and len(t) > 1]
-    if not include_tokens:
+    seed_tokens = [t[1:] for t in tokens if t.startswith("@") and len(t) > 1]
+    if not include_tokens and not seed_tokens:
         fail("selection contains only exclusions")
+    repo = Repository(args.repo_url) if args.repo_url else None
 
     inv = read_json(args.inventory)
     deps = inv["dependencies"]
@@ -105,6 +111,43 @@ def main() -> None:
         rec["reasons"] = [reason]
         selected[d["path_in_app"]] = rec
         return True
+
+    # ---- seeds: the contents of a published bundle, matched by groupId:artifactId in this application ----
+    seeds = []
+    for ref in seed_tokens:
+        if repo is None:
+            fail("'@%s' needs --repo-url to read the bundle's contents" % ref)
+        seed_gav = resolve_bundle_ref(repo, ref)
+        seed_contents, _ = bundle_contents(repo, seed_gav)
+        coord = gav_str(seed_gav)
+        found, missing, changed = 0, [], []
+        for g in seed_contents:
+            tok = synthetic_hint(g)["artifactId"] if g["groupId"] == SYNTHETIC_GROUP else ga_str(g)
+            matches, _ = match_token(tok, deps)
+            matches = [m for m in matches if not m.get("error")]
+            if len(matches) > 1:
+                exact = [m for m in matches if m.get("gav") and m["gav"].get("version") == g.get("version")]
+                if len(exact) == 1:
+                    matches = exact
+                else:
+                    add_finding("error", "ambiguous", "'%s' of %s matches several jars: %s" % (
+                        gav_str(g), coord, "; ".join("%s -> %s" % (m["name"], gav_str(m["gav"]) if m["gav"] else "?") for m in matches)))
+                    continue
+            if not matches:
+                missing.append(gav_str(g))
+                continue
+            d = matches[0]
+            if d["path_in_app"] in excluded:
+                continue
+            if d.get("gav") and d["gav"].get("version") != g.get("version"):
+                changed.append("%s %s -> %s" % (ga_str(g), g.get("version"), d["gav"]["version"]))
+            if select(d, "selected: @%s (%s)" % (coord, gav_str(g))):
+                found += 1
+        if missing:
+            add_finding("info", "seed-missing", "%d jar(s) of %s are not in this application and are left out: %s" % (len(missing), coord, ", ".join(missing)))
+        if changed:
+            add_finding("info", "seed-version-changed", "%d jar(s) of %s are at another version here: %s" % (len(changed), coord, "; ".join(changed)))
+        seeds.append({"bundle": coord, "contents": len(seed_contents), "selected": found, "missing": missing, "version_changed": changed})
 
     for tok in include_tokens:
         if tok in ("*", "all"):
@@ -184,6 +227,47 @@ def main() -> None:
                         if select(o, "declared dependency of %s" % rec["name"]):
                             changed = True
 
+    # ---- change job: what the bundle already embeds is skipped, another version of it replaces only when named ----
+    embedded_report = None
+    if args.bundle_meta:
+        meta = read_json(args.bundle_meta)
+        by_key, by_sha, by_hint = {}, {}, {}
+        for g in meta.get("contents") or []:
+            rec = {"coordinate": gav_str(g), "version": g.get("version"),
+                   "sha256": ((meta.get("contents_file") or {}).get(gav_str(g)) or {}).get("sha256")}
+            by_key[ga_str(g) + ((":" + g["classifier"]) if g.get("classifier") else "")] = rec
+            if rec["sha256"]:
+                by_sha[rec["sha256"]] = rec
+            if g["groupId"] == SYNTHETIC_GROUP:
+                by_hint[synthetic_hint(g)["artifactId"]] = rec
+        embedded_report = {"bundle": meta.get("coordinate"), "skipped": [], "conflicts": [], "replaces": []}
+        for path, d in list(selected.items()):
+            gav = d.get("gav")
+            rec = by_sha.get(d.get("sha256"))
+            if rec is None and gav:
+                rec = by_key.get(ga_str(gav) + ((":" + gav["classifier"]) if gav.get("classifier") else ""))
+            if rec is None and not gav and d.get("synthetic_hint"):
+                rec = by_hint.get(d["synthetic_hint"]["artifactId"])
+            if rec is None:
+                continue
+            reason = d["reasons"][0]
+            explicit = reason.startswith("selected:") and reason != "selected: *"
+            same = rec["sha256"] == d.get("sha256") or (rec["sha256"] is None and gav is not None and rec["version"] == gav.get("version"))
+            here = gav_str(gav) if gav else d["name"]
+            if same:
+                del selected[path]
+                embedded_report["skipped"].append(here)
+                if explicit:
+                    add_finding("info", "already-embedded", "%s is already in %s with the same bytes; nothing to add" % (d["name"], meta.get("coordinate")), d["name"])
+            elif explicit:
+                embedded_report["replaces"].append({"selected": here, "embedded": rec["coordinate"]})
+                add_finding("info", "replaces-embedded", "%s replaces %s, which %s embeds" % (here, rec["coordinate"], meta.get("coordinate")), d["name"])
+            else:
+                del selected[path]
+                embedded_report["conflicts"].append({"selected": here, "embedded": rec["coordinate"], "reason": reason})
+                add_finding("warn", "version-conflict", "%s (%s) is left out: %s embeds %s; name it in CHANGES to replace that version" % (
+                    here, reason, meta.get("coordinate"), rec["coordinate"]), d["name"])
+
     # ---- unidentified jars: embedded anyway, under synthetic coordinates -----------------
     for d in selected.values():
         if d.get("gav"):
@@ -262,7 +346,8 @@ def main() -> None:
                 providers = sorted((j for jars in shas.values() for j in jars), key=lambda j: (position.get(j, 10 ** 9), j))
                 conflicts.append({"path": path, "winner": providers[0], "shadowed": providers[1:]})
             elif len(next(iter(shas.values()))) > 1:
-                identical.append(path)
+                providers = sorted(next(iter(shas.values())), key=lambda j: (position.get(j, 10 ** 9), j))
+                identical.append({"path": path, "providers": providers})
         if conflicts:
             pairs = sorted({(c["winner"], s) for c in conflicts for s in c["shadowed"]})
             add_finding("warn", "overlap-resolved", "%d entries exist in several selected jars with different bytes; the bundle keeps the copy that comes first on the application's classpath, as the JVM does: %s" % (
@@ -300,6 +385,8 @@ def main() -> None:
         "excluded": sorted(set(excluded.values())),
         "findings": findings,
         "overlaps": {"conflicts": conflicts, "identical": identical},
+        "seeds": seeds,
+        "embedded_mode": embedded_report,
         "transformers": {
             "services": True,
             "append": sorted(append_present),

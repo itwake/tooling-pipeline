@@ -5,21 +5,25 @@
 #        [--path /app/app.jar] [--maven-repo-url URL] [--nexus-hosts host1,host2] [--aws-region R] [--type TYPE] \
 #        [--image-tool auto|docker|crane] [--platform linux/amd64] [--no-lookup] [--no-expand] [--no-sources] \
 #        [--mirror-url URL] [--release-url URL --snapshot-url URL --publish] [--skip-maven]
-#        (no --select: inventory only; --gav is required with --select)
+#        (no --select: inventory only; --gav is required with --select; a @g:a[:v] token in --select starts from a
+#         published bundle's contents and needs --maven-repo-url)
+#
+#   ./run-local.sh change --bundle g:a[:v] --maven-repo-url URL [--changes "g:a:v
+#        -artifactId"] [--add g:a:v[:classifier]]... [--remove TOKEN]... [--no-expand] [--add-jar X.jar]... [--ref REF [--path P]] \
+#        [--new-version V] [--no-sources] [--mirror-url URL] [--release-url URL --snapshot-url URL --publish] [--skip-maven]
+#        (adds jars to a published bundle, replaces components by newer versions or removes components, and republishes it;
+#         with --ref the add tokens select jars in that application instead of naming Nexus coordinates)
 #
 #   ./run-local.sh consumer [--manifest out/bundle-manifest.json | --bundle-jar X.jar [--reduced-pom X.pom]
-#        | --bundle g:a:v --embedded "g:a:v,g:a:v"] [--tree dependency-tree.txt] [--project DIR [--apply]]
+#        | --bundle g:a:v --embedded "g:a:v,g:a:v" | --unbundle] [--previous-jar A.jar [--previous-pom A.pom]] \
+#        [--tree dependency-tree.txt] [--effective-pom effective-pom.xml] [--project DIR [--apply]] [--record DIR/.mvn/rebundle.json] \
 #        [--plugin-tree plugin-trees.txt --plugins consumer-plugins.json]
-#        (--project with a tree: edits the consumer POMs; without --apply only the diff is produced;
-#         --plugin-tree/--plugins: build plugins, from plugin_trees.py and its reactor's dependency:tree)
+#        (--previous-jar: the bundle the project uses today, the proposal is the transition from it; --unbundle: leave it;
+#         --project with a tree: edits the consumer POMs; without --apply only the diff is produced)
 #
 #   ./run-local.sh verify --old REF --new REF [--bundle-artifact-id ID] [--fail-on dependencies|any] [--path /app/app.jar] \
 #        [--maven-repo-url URL] [--nexus-hosts host1,host2] [--aws-region R]
 #        (the comparison only reports; --fail-on makes findings of that scope exit 1)
-#
-#   ./run-local.sh rework --bundle g:a:v --maven-repo-url URL [--add-jar X.jar]... [--add g:a:v[:classifier]]... [--new-version V] \
-#        [--no-sources] [--mirror-url URL] [--release-url URL --snapshot-url URL --publish] [--skip-maven]
-#        (adds jars to a published bundle, or replaces embedded components by newer versions, and republishes it)
 #
 #   ./run-local.sh extract --ref REF [--name NAME] [--path /app/app.jar] [--maven-repo-url URL] [--nexus-hosts host1,host2] \
 #        [--aws-region R] [--type TYPE] [--image-tool auto|docker|crane] [--platform linux/amd64]
@@ -38,7 +42,7 @@ command -v "$PY" >/dev/null 2>&1 || PY=python
 mode=${1:-bundle}
 [ $# -gt 0 ] && shift
 
-usage() { sed -n '2,31p' "$0"; exit 2; }
+usage() { sed -n '2,34p' "$0"; exit 2; }
 
 extract() {  # <ref> <path> <out dir> <meta file>
     "$PY" scripts/extract_source.py --ref "$1" --path "$2" --type "$type" --nexus-hosts "$nexus_hosts" \
@@ -91,7 +95,7 @@ if [ "$mode" = "bundle" ]; then
     fi
     printf '%s\n' "$select" > work/select.txt
     "$PY" scripts/resolve_selection.py --inventory out/inventory.json --select-file work/select.txt \
-        --policy config/policy.json "${expand[@]}" --out out/selection.json
+        --policy config/policy.json --repo-url "$maven_repo_url" "${expand[@]}" --out out/selection.json
     "$PY" scripts/gen_bundle_project.py --selection out/selection.json --source out/source.json \
         --group-id "$g" --artifact-id "$a" --version "$v" --release-url "$release_url" --snapshot-url "$snapshot_url" \
         --server-id nexus --sources-jar "$sources" --out work/bundle --manifest-out out/bundle-manifest.json
@@ -115,8 +119,14 @@ if [ "$mode" = "bundle" ]; then
 
 elif [ "$mode" = "consumer" ]; then
     manifest=out/bundle-manifest.json bundle_jar="" reduced_pom="" bundle="" embedded="" tree="" project="" apply=false plugin_tree="" plugins=""
+    previous_jar="" previous_pom="" record="" effective_pom="" unbundle=false
     while [ $# -gt 0 ]; do
         case "$1" in
+            --previous-jar) previous_jar=$2; shift 2;;
+            --previous-pom) previous_pom=$2; shift 2;;
+            --record) record=$2; shift 2;;
+            --effective-pom) effective_pom=$2; shift 2;;
+            --unbundle) unbundle=true; shift;;
             --manifest) manifest=$2; shift 2;;
             --bundle-jar) bundle_jar=$2; shift 2;;
             --reduced-pom) reduced_pom=$2; shift 2;;
@@ -136,7 +146,17 @@ elif [ "$mode" = "consumer" ]; then
     [ -n "$plugin_tree" ] && args+=(--plugin-tree "$plugin_tree")
     [ -n "$plugins" ] && args+=(--plugins "$plugins")
     [ -n "$reduced_pom" ] && args+=(--reduced-pom "$reduced_pom")
-    if [ -n "$bundle_jar" ]; then
+    [ -n "$previous_jar" ] && args+=(--previous-jar "$previous_jar")
+    [ -n "$previous_pom" ] && args+=(--previous-pom "$previous_pom")
+    [ -z "$record" ] && [ -n "$project" ] && record="$project/.mvn/rebundle.json"
+    [ -n "$record" ] && args+=(--record "$record")
+    apply_args=()
+    [ -n "$record" ] && apply_args+=(--record "$record")
+    [ -n "$effective_pom" ] && apply_args+=(--effective-pom "$effective_pom")
+    if [ "$unbundle" = true ]; then
+        [ -n "$previous_jar" ] || { echo "--unbundle needs --previous-jar (the bundle the project leaves)"; exit 2; }
+        "$PY" scripts/gen_consumer_patch.py --unbundle "${args[@]}" --out out/consumer-patch.md --out-json out/consumer-patch.json
+    elif [ -n "$bundle_jar" ]; then
         "$PY" scripts/gen_consumer_patch.py --bundle-jar "$bundle_jar" "${args[@]}" --out out/consumer-patch.md --out-json out/consumer-patch.json
     elif [ -n "$bundle" ]; then
         "$PY" scripts/gen_consumer_patch.py --bundle "$bundle" --embedded "$embedded" "${args[@]}" --out out/consumer-patch.md --out-json out/consumer-patch.json
@@ -147,7 +167,7 @@ elif [ "$mode" = "consumer" ]; then
     if [ -n "$project" ]; then
         dry=(--dry-run)
         [ "$apply" = true ] && dry=()
-        "$PY" scripts/apply_consumer_patch.py --patch out/consumer-patch.json --project "$project" "${dry[@]}" \
+        "$PY" scripts/apply_consumer_patch.py --patch out/consumer-patch.json --project "$project" "${dry[@]}" "${apply_args[@]}" \
             --out out/consumer-apply.json --diff out/consumer-apply.diff
         echo "diff in out/consumer-apply.diff$([ "$apply" = true ] || echo ' (dry run: pass --apply to edit the POMs)')"
     fi
@@ -180,15 +200,26 @@ elif [ "$mode" = "verify" ]; then
     "$PY" scripts/write_summary.py --out-dir out
     echo "done: see out/SUMMARY.md"
 
-elif [ "$mode" = "rework" ]; then
+elif [ "$mode" = "change" ] || [ "$mode" = "rework" ]; then
     bundle="" maven_repo_url="" new_version="" sources=true mirror_url="" release_url="" snapshot_url="" publish=false skip_maven=false
-    add_jars=() adds=()
+    ref="" path=/app/app.jar type=auto image_tool=auto platform="" aws_region="" nexus_hosts="" changes=""
+    add_jars=() adds=() removes=() expand=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --bundle) bundle=$2; shift 2;;
             --maven-repo-url) maven_repo_url=$2; shift 2;;
+            --changes) changes=$2; shift 2;;
             --add-jar) add_jars+=(--add-jar "$2"); shift 2;;
             --add) adds+=(--add "$2"); shift 2;;
+            --remove) removes+=(--remove "$2"); shift 2;;
+            --no-expand) expand=(--no-expand); shift;;
+            --ref) ref=$2; shift 2;;
+            --path) path=$2; shift 2;;
+            --type) type=$2; shift 2;;
+            --image-tool) image_tool=$2; shift 2;;
+            --platform) platform=$2; shift 2;;
+            --aws-region) aws_region=$2; shift 2;;
+            --nexus-hosts) nexus_hosts=$2; shift 2;;
             --new-version) new_version=$2; shift 2;;
             --no-sources) sources=false; shift;;
             --mirror-url) mirror_url=$2; shift 2;;
@@ -202,11 +233,25 @@ elif [ "$mode" = "rework" ]; then
     [ -n "$bundle" ] && [ -n "$maven_repo_url" ] || usage
     rm -rf work out && mkdir -p work out
     "$PY" scripts/gen_maven_settings.py --server-id nexus --mirror-url "$mirror_url" --out work/settings.xml
-    "$PY" scripts/fetch_bundle.py --bundle "$bundle" "${adds[@]}" --repo-url "$maven_repo_url" \
-        --out work/bundle-in --added-out work/added --meta out/rework-bundle.json
-    "$PY" scripts/rework_bundle.py --bundle-meta out/rework-bundle.json "${add_jars[@]}" --new-version "$new_version" \
+    printf '%s\n' "$changes" > work/changes.txt
+    from_source=()
+    [ -n "$ref" ] && from_source=(--adds-from-source --adds-out work/adds.txt)
+    "$PY" scripts/fetch_bundle.py --bundle "$bundle" "${adds[@]}" "${removes[@]}" "${from_source[@]}" --changes-file work/changes.txt \
+        --repo-url "$maven_repo_url" --out work/bundle-in --added-out work/added --meta out/rework-bundle.json
+    selection=()
+    if [ -n "$ref" ]; then
+        # the jars to add come out of an application, taken and identified like the main job does
+        extract "$ref" "$path" work/app out/source.json
+        "$PY" scripts/inspect_app.py --source out/source.json --repo-url "$maven_repo_url" --out out/inventory.json
+        if [ -s work/adds.txt ]; then
+            "$PY" scripts/resolve_selection.py --inventory out/inventory.json --select-file work/adds.txt \
+                --bundle-meta out/rework-bundle.json --policy config/policy.json --out out/selection.json
+            selection=(--selection out/selection.json)
+        fi
+    fi
+    "$PY" scripts/rework_bundle.py --bundle-meta out/rework-bundle.json "${add_jars[@]}" "${selection[@]}" "${expand[@]}" --new-version "$new_version" \
         --repo-url "$maven_repo_url" --release-url "$release_url" --snapshot-url "$snapshot_url" --server-id nexus \
-        --sources-jar "$sources" --out work/rework --manifest-out out/bundle-manifest.json --plan-out out/rework-plan.json
+        --sources-jar "$sources" --policy config/policy.json --out work/rework --manifest-out out/bundle-manifest.json --plan-out out/rework-plan.json
     if [ "$skip_maven" = false ]; then
         local_repo="$PWD/work/m2"   # job-local repository: the inputs are installed here from the fetched bytes
         "$PY" scripts/install_components.py --manifest out/bundle-manifest.json --settings work/settings.xml \
